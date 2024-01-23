@@ -119,12 +119,14 @@ enum {
 	I860 = 7,		/* Intel i860 */
 	MIPS = 8,		/* Mips R2000 */
 	S370 = 9,		/* Amdhal	*/
+	MIPSR4K = 10,		/* Mips R4000 */
 	SPARC64 = 18,		/* Sun SPARC v9 */
 	POWER = 20,		/* PowerPC */
 	POWER64 = 21,		/* PowerPC64 */
 	ARM = 40,		/* ARM */
 	AMD64 = 62,		/* Amd64 */
 	ARM64 = 183,		/* ARM64 */
+	RISCV = 243,	/* RISC-V */
 
 	NO_VERSION = 0,		/* version, ident[VERSION] */
 	CURRENT = 1,

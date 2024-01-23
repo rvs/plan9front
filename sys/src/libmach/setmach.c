@@ -16,10 +16,10 @@ struct machtab
 	Machdata	*machdata;		/* machine functions */
 };
 
-extern	Mach		mmips, msparc, m68020, mi386, mamd64,
-			marm, marm64, mmips2be, mmips2le, mpower, mpower64, msparc64;
-extern	Machdata	mipsmach, mipsmachle, sparcmach, m68020mach, i386mach,
-			armmach, arm64mach, mipsmach2le, powermach, sparc64mach;
+extern	Mach		mmips, msparc, m68020, mi386, mamd64, mriscv, mriscv64,
+			marm, mmips2be, mmips2le, mpower, mpower64, malpha, msparc64;
+extern	Machdata	mipsmach, mipsmachle, sparcmach, m68020mach, i386mach, riscvmach, riscv64mach,
+			armmach, mipsmach2le, powermach, alphamach, sparc64mach;
 
 /*
  *	machine selection table.  machines with native disassemblers should
@@ -40,13 +40,13 @@ Machtab	machines[] =
 		A68020,
 		&m68020,
 		&m68020mach,	},
-	{	"spim2",			/*plan 9 mips2 little endian*/
+	{	"mips2LE",			/*plan 9 mips2 little endian*/
 		FMIPS2LE,
 		0,
 		AMIPS,
 		&mmips2le,
 		&mipsmach2le, 	},
-	{	"spim",				/*plan 9 mips little endian*/
+	{	"mipsLE",				/*plan 9 mips little endian*/
 		FMIPSLE,
 		0,
 		AMIPS,
@@ -106,12 +106,6 @@ Machtab	machines[] =
 		AARM,
 		&marm,
 		&armmach,	},
-	{	"arm64",			/*ARM64*/
-		FARM64,
-		FARM64B,
-		AARM64,
-		&marm64,
-		&arm64mach,	},
 	{	"power",			/*PowerPC*/
 		FPOWER,
 		FPOWERB,
@@ -124,12 +118,30 @@ Machtab	machines[] =
 		APOWER64,
 		&mpower64,
 		&powermach,	},
+	{	"alpha",			/*Alpha*/
+		FALPHA,
+		FALPHAB,
+		AALPHA,
+		&malpha,
+		&alphamach,	},
 	{	"sparc64",			/*plan 9 sparc64 */
 		FSPARC64,
 		FSPARCB,			/* XXX? */
 		ASPARC64,
 		&msparc64,
 		&sparc64mach,	},
+	{	"riscv",
+		FRISCV,
+		FRISCVB,
+		ARISCV,
+		&mriscv,
+		&riscvmach,	},
+	{	"riscv64",
+		FRISCV64,
+		FRISCV64B,
+		ARISCV64,
+		&mriscv64,
+		&riscv64mach,	},
 	{	0		},		/*the terminator*/
 };
 

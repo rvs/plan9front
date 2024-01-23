@@ -66,10 +66,11 @@ extern	Mach	m68020;
 extern	Mach	mi386;
 extern	Mach	mamd64;
 extern	Mach	marm;
-extern	Mach	mthumb;
-extern	Mach	marm64;
 extern	Mach	mpower;
 extern	Mach	mpower64;
+extern	Mach	malpha;
+extern	Mach	mriscv;
+extern	Mach	mriscv64;
 
 ExecTable exectab[] =
 {
@@ -235,19 +236,67 @@ ExecTable exectab[] =
 		sizeof(Exec),
 		leswal,
 		armdotout },
-	{ R_MAGIC,			/* Arm64 7.out and boot image */
-		"arm64 plan 9 executable",
-		"arm64 plan 9 dlm",
-		FARM64,
+	{ L_MAGIC,			/* alpha 7.out */
+		"alpha plan 9 executable",
+		"alpha plan 9 dlm",
+		FALPHA,
 		1,
-		&marm64,
-		sizeof(Exec)+8,
+		&malpha,
+		sizeof(Exec),
+		beswal,
+		common },
+	{ 0x0700e0c3,			/* alpha boot image */
+		"alpha plan 9 boot image",
 		nil,
-		commonllp64 },
+		FALPHA,
+		0,
+		&malpha,
+		sizeof(Exec),
+		beswal,
+		common },
+	{ Z_MAGIC,			/* riscv i.out */
+		"riscv executable",
+		nil,
+		FRISCV,
+		0,
+		&mriscv,
+		sizeof(Exec),
+		beswal,
+		common },
+	{ Y_MAGIC,			/* riscv j.out */
+		"riscv64 executable",
+		nil,
+		FRISCV64,
+		0,
+		&mriscv64,
+		sizeof(Exec),
+		beswal,
+		common },
 	{ 0 },
 };
 
 Mach	*mach = &mi386;			/* Global current machine table */
+
+static ExecTable*
+couldbe4k(ExecTable *mp)
+{
+	Dir *d;
+	ExecTable *f;
+
+	if((d=dirstat("/proc/1/regs")) == nil)
+		return mp;
+	if(d->length < 32*8){		/* R3000 */
+		free(d);
+		return mp;
+	}
+	free(d);
+	for (f = exectab; f->magic; f++)
+		if(f->magic == M_MAGIC) {
+			f->name = "mips plan 9 executable on mips2 kernel";
+			return f;
+		}
+	return mp;
+}
 
 int
 crackhdr(int fd, Fhdr *fp)
@@ -282,6 +331,9 @@ crackhdr(int fd, Fhdr *fp)
 			if(mp->magic != (magic & ~DYN_MAGIC))
 				continue;
 
+			if(mp->magic == V_MAGIC)
+				mp = couldbe4k(mp);
+
 			if ((magic & DYN_MAGIC) && mp->dlmname != nil)
 				fp->name = mp->dlmname;
 			else
@@ -304,14 +356,8 @@ crackhdr(int fd, Fhdr *fp)
 		seek(fd, mp->hsize, 0);		/* seek to end of header */
 		break;
 	}
-	switch(mp->magic){
-	case E_MAGIC:
-		thumbpctab(fd, fp);
-		break;
-	case 0:
+	if(mp->magic == 0)
 		werrstr("unknown header type");
-		break;
-	}
 	return ret;
 }
 
@@ -348,9 +394,6 @@ adotout(int fd, Fhdr *fp, ExecHdr *hp)
 static void
 commonboot(Fhdr *fp)
 {
-	/* arm needs to check for both arm and thumb */
-	if(fp->type == FARM && (fp->entry & mthumb.ktmask))
-		goto FTHUM;
 	if (!(fp->entry & mach->ktmask))
 		return;
 
@@ -365,19 +408,18 @@ commonboot(Fhdr *fp)
 		fp->name = "386 plan 9 boot image";
 		fp->dataddr = _round(fp->txtaddr+fp->txtsz, mach->pgsize);
 		break;
-	FTHUM:
 	case FARM:
 		fp->type = FARMB;
 		fp->txtaddr = (u32int)fp->entry;
 		fp->name = "ARM plan 9 boot image";
 		fp->dataddr = _round(fp->txtaddr+fp->txtsz, mach->pgsize);
 		return;
-	case FARM64:
-		fp->type = FARM64B;
-		fp->txtaddr = fp->entry;
-		fp->name = "arm64 plan 9 boot image";
-		fp->dataddr = _round(fp->txtaddr+fp->txtsz, mach->pgsize);
-		return;
+	case FALPHA:
+		fp->type = FALPHAB;
+		fp->txtaddr = (u32int)fp->entry;
+		fp->name = "alpha plan 9 boot image";
+		fp->dataddr = fp->txtaddr+fp->txtsz;
+		break;
 	case FPOWER:
 		fp->type = FPOWERB;
 		fp->txtaddr = (u32int)fp->entry;
@@ -395,6 +437,18 @@ commonboot(Fhdr *fp)
 		fp->txtaddr = fp->entry;
 		fp->name = "power64 plan 9 boot image";
 		fp->dataddr = fp->txtaddr+fp->txtsz;
+		break;
+	case FRISCV:
+		fp->type = FRISCVB;
+		fp->txtaddr = mach->kbase;
+		fp->name = "riscv plan 9 boot image";
+		fp->dataddr = _round(fp->txtaddr+fp->txtsz, mach->pgsize);
+		break;
+	case FRISCV64:
+		fp->type = FRISCV64B;
+		fp->txtaddr = mach->kbase | (u32int)fp->entry;
+		fp->name = "riscv64 plan 9 boot image";
+		fp->dataddr = _round(fp->txtaddr+fp->txtsz, mach->pgsize);
 		break;
 	default:
 		return;
@@ -605,6 +659,11 @@ elf64dotout(int fd, Fhdr *fp, ExecHdr *hp)
 		fp->type = FPOWER64;
 		fp->name = "power64 ELF64 executable";
 		break;
+	case RISCV:
+		mach = &mriscv64;
+		fp->type = FRISCV64;
+		fp->name = "RISC-V ELF64 executable";
+		break;
 	}
 
 	if(ep->phentsize != sizeof(P64hdr)) {
@@ -711,13 +770,8 @@ elf32dotout(int fd, Fhdr *fp, ExecHdr *hp)
 		break;
 	case MIPS:
 		mach = &mmips;
-		if(ep->ident[DATA] == ELFDATA2LSB){
-			fp->type = FMIPSLE;
-			fp->name = "mips le ELF32 executable";
-		} else {
-			fp->type = FMIPS;
-			fp->name = "mips be ELF32 executable";
-		}
+		fp->type = FMIPS;
+		fp->name = "mips ELF32 executable";
 		break;
 	case SPARC64:
 		mach = &msparc64;
@@ -743,6 +797,11 @@ elf32dotout(int fd, Fhdr *fp, ExecHdr *hp)
 		mach = &marm;
 		fp->type = FARM;
 		fp->name = "arm ELF32 executable";
+		break;
+	case RISCV:
+		mach = &mriscv;
+		fp->type = FRISCV;
+		fp->name = "RISC-V ELF32 executable";
 		break;
 	default:
 		return 0;
@@ -827,7 +886,7 @@ elfdotout(int fd, Fhdr *fp, ExecHdr *hp)
 	else if(ep->ident[CLASS] == ELFCLASS64)
 		return elf64dotout(fd, fp, hp);
 
-	werrstr("bad ELF class - not 32 bit");
+	werrstr("bad ELF class - not 32- nor 64-bit");
 	return 0;
 }
 

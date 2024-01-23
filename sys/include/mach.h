@@ -11,13 +11,13 @@
  *		i386,
  *		amd64,
  *		sparc,
- *		sparc64,
  *		mips2 (R4000)
  *		arm
  *		powerpc,
  *		powerpc64
- *		alpha
  *		arm64
+ *		riscv
+ *		riscv64
  */
 enum
 {
@@ -32,12 +32,14 @@ enum
 	M29000,			/* retired */
 	MARM,
 	MPOWER,
-	MALPHA,
+	MALPHA,			/* retired */
 	NMIPS,
-	MSPARC64,
+	MSPARC64,		/* retired */
 	MAMD64,
 	MPOWER64,
 	MARM64,
+	MRISCV,
+	MRISCV64,
 				/* types of executables */
 	FNONE = 0,		/* unidentified */
 	FMIPS,			/* v.out */
@@ -59,16 +61,20 @@ enum
 	FPOWER,			/* q.out */
 	FPOWERB,		/* power pc bootable */
 	FMIPS2LE,		/* 0.out */
-	FALPHA,			/* 7.out */
-	FALPHAB,		/* DEC Alpha bootable */
+	FALPHA,			/* retired */
+	FALPHAB,		/* retired DEC Alpha bootable */
 	FMIPSLE,		/* 3k little endian */
-	FSPARC64,		/* u.out */
+	FSPARC64,		/* retired */
 	FAMD64,			/* 6.out */
 	FAMD64B,		/* 6.out bootable */
 	FPOWER64,		/* 9.out */
 	FPOWER64B,		/* 9.out bootable */
 	FARM64,			/* arm64 */
 	FARM64B,		/* arm64 bootable */
+	FRISCV,			/* riscv */
+	FRISCVB,		/* riscv bootable */
+	FRISCV64,		/* riscv64 */
+	FRISCV64B,		/* riscv64 bootable */
 
 	ANONE = 0,		/* dissembler types */
 	AMIPS,
@@ -82,11 +88,13 @@ enum
 	A29000,			/* retired */
 	AARM,
 	APOWER,
-	AALPHA,
-	ASPARC64,
+	AALPHA,			/* retired */
+	ASPARC64,		/* retired */
 	AAMD64,
 	APOWER64,
 	AARM64,
+	ARISCV,
+	ARISCV64,
 				/* object file types */
 	Obj68020 = 0,		/* .2 */
 	ObjSparc,		/* .k */
@@ -99,12 +107,14 @@ enum
 	ObjArm,			/* .5 */
 	ObjPower,		/* .q */
 	ObjMips2le,		/* .0 */
-	ObjAlpha,		/* .7 */
-	ObjSparc64,		/* .u */
+	ObjAlpha,		/* retired */
+	ObjSparc64,		/* retired */
 	ObjAmd64,		/* .6 */
 	ObjSpim,		/* .0 */
 	ObjPower64,		/* .9 */
 	ObjArm64,		/* .4? */
+	ObjRiscv,		/* .i */
+	ObjRiscv64,		/* .j */
 	Maxobjtype,
 
 	CNONE  = 0,		/* symbol table classes */
@@ -130,7 +140,6 @@ struct Map {
 	struct segment {		/* per-segment map */
 		char	*name;		/* the segment name */
 		int	fd;		/* file descriptor */
-		long	(*read)(int, void *, long, vlong);
 		int	inuse;		/* in use - not in use */
 		int	cache;		/* should cache reads? */
 		uvlong	b;		/* base */
@@ -320,6 +329,4 @@ int		syminit(int, Fhdr*);
 int		symoff(char*, int, uvlong, int);
 void		textseg(uvlong, Fhdr*);
 int		textsym(Symbol*, int);
-void		thumbpctab(int, Fhdr*);
-int		thumbpclookup(uvlong);
 void		unusemap(Map*, int);
