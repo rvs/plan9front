@@ -61,20 +61,17 @@ struct	Fcall
 } Fcall;
 
 
-#define	GBIT8(p)	(((uchar*)(p))[0])
-#define	GBIT16(p)	(((uchar*)(p))[0]|(((uchar*)(p))[1]<<8))
-#define	GBIT32(p)	(((uchar*)(p))[0]|(((uchar*)(p))[1]<<8)|\
-				(((uchar*)(p))[2]<<16)|(((uchar*)(p))[3]<<24))
-#define	GBIT64(p)	((u32int)(((uchar*)(p))[0]|(((uchar*)(p))[1]<<8)|\
-				(((uchar*)(p))[2]<<16)|(((uchar*)(p))[3]<<24)) |\
-			((uvlong)(((uchar*)(p))[4]|(((uchar*)(p))[5]<<8)|\
-				(((uchar*)(p))[6]<<16)|(((uchar*)(p))[7]<<24)) << 32))
+#define	GBIT8(p)	((p)[0])
+#define	GBIT16(p)	((p)[0]|((p)[1]<<8))
+#define	GBIT32(p)	((p)[0]|((p)[1]<<8)|((p)[2]<<16)|((p)[3]<<24))
+#define	GBIT64(p)	((u32int)((p)[0]|((p)[1]<<8)|((p)[2]<<16)|((p)[3]<<24)) |\
+				((vlong)((p)[4]|((p)[5]<<8)|((p)[6]<<16)|((p)[7]<<24)) << 32))
 
-#define	PBIT8(p,v)	do{(p)[0]=(v);}while(0)
-#define	PBIT16(p,v)	do{(p)[0]=(v);(p)[1]=(v)>>8;}while(0)
-#define	PBIT32(p,v)	do{(p)[0]=(v);(p)[1]=(v)>>8;(p)[2]=(v)>>16;(p)[3]=(v)>>24;}while(0)
-#define	PBIT64(p,v)	do{(p)[0]=(v);(p)[1]=(v)>>8;(p)[2]=(v)>>16;(p)[3]=(v)>>24;\
-			   (p)[4]=(v)>>32;(p)[5]=(v)>>40;(p)[6]=(v)>>48;(p)[7]=(v)>>56;}while(0)
+#define	PBIT8(p,v)	(p)[0]=(v)
+#define	PBIT16(p,v)	(p)[0]=(v);(p)[1]=(v)>>8
+#define	PBIT32(p,v)	(p)[0]=(v);(p)[1]=(v)>>8;(p)[2]=(v)>>16;(p)[3]=(v)>>24
+#define	PBIT64(p,v)	(p)[0]=(v);(p)[1]=(v)>>8;(p)[2]=(v)>>16;(p)[3]=(v)>>24;\
+			(p)[4]=(v)>>32;(p)[5]=(v)>>40;(p)[6]=(v)>>48;(p)[7]=(v)>>56
 
 #define	BIT8SZ		1
 #define	BIT16SZ		2
@@ -84,11 +81,17 @@ struct	Fcall
 
 /* STATFIXLEN includes leading 16-bit count */
 /* The count, however, excludes itself; total size is BIT16SZ+count */
-#define STATFIXLEN	(BIT16SZ+QIDSZ+5*BIT16SZ+4*BIT32SZ+1*BIT64SZ)	/* amount of fixed length data in a stat buffer */
+/* amount of fixed length data in a stat buffer */
+#define STATFIXLEN	(BIT16SZ+QIDSZ+5*BIT16SZ+4*BIT32SZ+1*BIT64SZ)
 
 #define	NOTAG		(ushort)~0U	/* Dummy tag */
 #define	NOFID		(u32int)~0U	/* Dummy fid */
 #define	IOHDRSZ		24	/* ample room for Twrite/Rread header (iounit) */
+#ifdef notdef				/* maybe some day */
+#define MAXFDATA	(16*1024)
+#define MAXRPC		(MAXFDATA + IOHDRSZ)
+#define IOOPTIM		(16*1024)	/* MAXRPC - IOHDRSZ */
+#endif
 
 enum
 {

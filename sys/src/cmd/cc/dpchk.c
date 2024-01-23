@@ -165,7 +165,7 @@ arginit(void)
 
 	argflag('*', Fstar);
 	argflag('l', Fl);
-	argflag('z', ewidth[TVLONG]==ewidth[TIND] ? Fvl : Fl);
+	argflag('z', ewidth[TVLONG]==ewidth[TIND] && 0? Fvl: Fl);
 
 	argflag('o', Fverb);
 	flagbits['x'] = flagbits['o'];
@@ -230,8 +230,10 @@ cktype:
 	e = t + sizeof(fmtbuf)-1;
 	for(;;) {
 		r = getr();
-		if(r == ' ' || r == '\n')
+		if(r == ' ' || r == '\n') {
+			*t = 0;		/* don't leave fmtbuf unterminated */
 			goto bad;
+		}
 		if(r == '"')
 			break;
 		if(t >= e)

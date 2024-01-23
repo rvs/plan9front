@@ -21,8 +21,6 @@
 #include "io.h"
 #include "ureg.h"
 #include "../port/error.h"
-#include "../port/sd.h"
-#include <libsec.h>
 
 enum
 {
@@ -34,11 +32,9 @@ enum
 	Fclear,			/* start over */
 	Fdel,			/* delete a configure device */
 	Fdisk,			/* set default tree and sector sz*/
-	Fcrypt,			/* encrypted device */
 
 	Sectorsz = 1,
 	Blksize	= 8*1024,	/* for Finter only */
-	Cryptsectsz = 512,	/* for Fcrypt only */
 
 	Incr = 5,		/* Increments for the dev array */
 
@@ -69,7 +65,6 @@ enum
 typedef struct Inner Inner;
 typedef struct Fsdev Fsdev;
 typedef struct Tree Tree;
-typedef struct Key Key;
 
 struct Inner
 {
@@ -89,8 +84,8 @@ struct Fsdev
 	vlong	size;		/* min(inner[X].isize) */
 	vlong	start;		/* start address (for Fpart) */
 	uint	ndevs;		/* number of inner devices */
+	int	perm;		/* minimum of inner device perms */
 	Inner	*inner[Ndevs];	/* inner devices */
-	Key	*key;		/* crypt key */
 };
 
 struct Tree
@@ -99,10 +94,6 @@ struct Tree
 	Fsdev	**devs;		/* devices in dir. */
 	uint	ndevs;		/* number of devices */
 	uint	nadevs;		/* number of allocated devices in devs */
-};
-
-struct Key {
-	AESstate tweak, ecb;
 };
 
 #define dprint if(debug)print
@@ -114,12 +105,16 @@ static Tree fstree;		/* The main "fs" tree. Never goes away */
 static Tree *trees[Ntrees];	/* internal representation of config */
 static int ntrees;		/* max number of trees */
 static int qidvers;
+
 static char *disk;		/* default tree name used */
 static char *source;		/* default inner device used */
 static int sectorsz = Sectorsz;	/* default sector size */
-static char *confstr;		/* textual configuration */
+
+static char confstr[Maxconf];	/* textual configuration */
 
 static int debug;
+
+static char cfgstr[] = "fsdev:\n";
 
 static Qid tqid = {Qtop, 0, QTDIR};
 static Qid cqid = {Qctl, 0, 0};
@@ -129,7 +124,6 @@ static char* tnames[] = {
 	[Fcat]		"cat",
 	[Finter]	"inter",
 	[Fpart]		"part",
-	[Fcrypt]	"crypt",
 };
 
 static Cmdtab configs[] = {
@@ -140,7 +134,6 @@ static Cmdtab configs[] = {
 	Fclear,	"clear",	1,
 	Fdel,	"del",		2,
 	Fdisk,	"disk",		0,
-	Fcrypt,	"crypt",	0,
 };
 
 static char Egone[] = "device is gone";		/* file has been removed */
@@ -166,7 +159,6 @@ seprintdev(char *s, char *e, Fsdev *mp)
 	case Fmirror:
 	case Fcat:
 	case Finter:
-	case Fcrypt:
 		s = strecpy(s, e, "\n");
 		break;
 	case Fpart:
@@ -176,36 +168,6 @@ seprintdev(char *s, char *e, Fsdev *mp)
 		panic("#k: seprintdev bug");
 	}
 	return s;
-}
-
-static char*
-seprintconf(char *s, char *e)
-{
-	int	i, j;
-	Tree	*t;
-
-	*s = 0;
-	for(i = 0; i < ntrees; i++){
-		t = trees[i];
-		if(t != nil)
-			for(j = 0; j < t->nadevs; j++)
-				if(t->devs[j] != nil)
-					s = seprintdev(s, e, t->devs[j]);
-	}
-	return s;
-}
-
-/* called with lck w */
-static void
-setconfstr(void)
-{
-	char *s;
-
-	s = confstr;
-	if(s == nil)
-		s = smalloc(Maxconf);
-	seprintconf(s, s+Maxconf);
-	confstr = s;
 }
 
 static vlong
@@ -278,7 +240,7 @@ treealloc(char *name)
 		return nil;
 	t = trees[i] = mallocz(sizeof(Tree), 1);
 	if(t == nil)
-		error(Enomem);
+		return nil;
 	if(i == ntrees)
 		ntrees++;
 	kstrdup(&t->name, name);
@@ -340,10 +302,10 @@ deltree(Tree *t)
 	for(i = 0; i < ntrees; i++)
 		if(trees[i] == t){
 			if(i > 0){		/* "fs" never goes away */
+				trees[i] = nil;
 				free(t->name);
 				free(t->devs);
 				free(t);
-				trees[i] = nil;
 			}
 			return;
 		}
@@ -379,7 +341,6 @@ mdeldev(Fsdev *mp)
 		}
 	wunlock(&lck);
 
-	secfree(mp->key);
 	free(mp->name);
 	for(i = 0; i < mp->ndevs; i++){
 		in = mp->inner[i];
@@ -388,6 +349,8 @@ mdeldev(Fsdev *mp)
 		free(in->iname);
 		free(in);
 	}
+	if(debug)
+		memset(mp, 9, sizeof *mp);	/* poison */
 	free(mp);
 }
 
@@ -433,8 +396,6 @@ Again:
 			}
 		}
 	}
-	if(some)
-		setconfstr();
 	wunlock(&lck);
 	if(some == 0 && alltrees == 0)
 		error(Enonexist);
@@ -475,11 +436,6 @@ setdsize(Fsdev* mp, vlong *ilen)
 					mp->size, inlen - mp->start);
 				mp->size = inlen - mp->start;
 			}
-			break;
-		case Fcrypt:
-			if(mp->start > inlen)
-				error("crypt starts after device end");
-			mp->size = (inlen - mp->start) & ~((vlong)Cryptsectsz-1);
 			break;
 		}
 	}
@@ -525,10 +481,6 @@ parseconfig(char *a, long n, Cmdbuf **cbp, Cmdtab **ctp)
 		if(cb->nf != 4 && (cb->nf != 3 || source == nil))
 			error("ctl usage: part new [file] off len");
 		break;
-	case Fcrypt:
-		if(cb->nf != 3)
-			error("ctl usage: crypt newname device keyhex");
-		break;
 	}
 }
 
@@ -553,6 +505,23 @@ parsename(char *name, char *disk, char **tree, char **dev)
 	validname(*dev, 0);
 }
 
+static int
+getattrs(Chan *c, vlong *lenp, int *permp)
+{
+	uchar	buf[128];	/* old DIRLEN plus a little should be plenty */
+	Dir	d;
+	long	l;
+
+	*lenp = 0;
+	*permp = 0;
+	l = devtab[c->type]->stat(c, buf, sizeof buf);
+	if (l >= 0 && convM2D(buf, l, &d, nil) > 0) {
+		*lenp = d.length;
+		*permp = d.mode & 0777;
+	}
+	return l;
+}
+
 /*
  * Process a single line of configuration,
  * often of the form "cmd newname idev0 idev1".
@@ -565,11 +534,10 @@ static void
 mconfig(char* a, long n)
 {
 	int	i;
+	int	*iperm;
 	vlong	size, start;
 	vlong	*ilen;
 	char	*tname, *dname, *fakef[4];
-	uchar	key[2*256/8];
-	int	keylen;
 	Chan	**idev;
 	Cmdbuf	*cb;
 	Cmdtab	*ct;
@@ -578,11 +546,7 @@ mconfig(char* a, long n)
 	Tree	*t;
 
 	/* ignore comments & empty lines */
-	if (n < 1 || *a == '\0' || *a == '#' || *a == '\n')
-		return;
-
-	/* ignore historical config signature */
-	if (n >= 6 && memcmp(a, "fsdev:", 6) == 0)
+	if (*a == '\0' || *a == '#' || *a == '\n')
 		return;
 
 	dprint("mconfig\n");
@@ -590,7 +554,9 @@ mconfig(char* a, long n)
 	start = 0;
 	mp = nil;
 	cb = nil;
-	keylen = 0;
+	idev = nil;
+	ilen = nil;
+	iperm = nil;
 
 	if(waserror()){
 		free(cb);
@@ -619,22 +585,6 @@ mconfig(char* a, long n)
 		free(cb);
 		mdelctl("*", "*");		/* del everything */
 		return;
-	case Fcrypt:
-		if(cb->nf >= 4) {
-			start = strtoul(cb->f[3], 0, 0);
-			cb->nf = 3;
-		} else
-			start = 64*1024;	/* cryptsetup header */
-		keylen = dec16(key, sizeof(key), cb->f[2], strlen(cb->f[2]));
-		switch(keylen){
-		default:
-			error("bad hexkey");
-		case 2*128/8:
-		case 2*256/8:
-			break;
-		}
-		cb->nf -= 1;
-		break;
 	case Fpart:
 		if(cb->nf == 3){
 			/*
@@ -672,8 +622,6 @@ mconfig(char* a, long n)
 	 */
 	poperror();
 	rlock(&lck);
-	idev = smalloc(sizeof(Chan*) * Ndevs);
-	ilen = smalloc(sizeof(vlong) * Ndevs);
 	if(waserror()){
 		runlock(&lck);
 Fail:
@@ -684,17 +632,17 @@ Fail:
 			mdeldev(mp);
 		free(idev);
 		free(ilen);
+		free(iperm);
 		free(cb);
 		nexterror();
 	}
+	/* record names, lengths and perms of all named files */
+	idev = smalloc(sizeof(Chan*) * Ndevs);
+	ilen = smalloc(sizeof(vlong) * Ndevs);
+	iperm = smalloc(sizeof(int) * Ndevs);
 	for(i = 1; i < cb->nf; i++){
-		Dir *dir;
-
 		idev[i-1] = namec(cb->f[i], Aopen, ORDWR, 0);
-
-		dir = dirchanstat(idev[i-1]);
-		ilen[i-1] = dir->length;
-		free(dir);
+		getattrs(idev[i-1], &ilen[i-1], &iperm[i-1]);
 	}
 	poperror();
 	runlock(&lck);
@@ -711,11 +659,10 @@ Fail:
 	t = lookuptree(tname);
 	if(t != nil)
 		validdevname(t, dname);
-	else{
+	else
 		t = treealloc(tname);
-		if(t == nil)
-			error("no more trees");
-	}
+	if(t == nil)
+		error("no more trees");
 	mp = devalloc(t, dname);
 	if(mp == nil){
 		if(t->ndevs == 0)	/* it was created for us */
@@ -723,19 +670,13 @@ Fail:
 		error(Enomem);
 	}
 
+	/* construct mp from iname, idev and iperm arrays */
 	mp->type = ct->index;
 	if(mp->type == Fpart){
 		mp->start = start * sectorsz;
 		mp->size = size * sectorsz;
 	}
-	if(mp->type == Fcrypt) {
-		Key *k = secalloc(sizeof(Key));
-		setupAESstate(&k->tweak, &key[0], keylen/2, nil);
-		setupAESstate(&k->ecb, &key[keylen/2], keylen/2, nil);
-		memset(key, 0, sizeof(key));
-		mp->key = k;
-		mp->start = start;
-	}
+	mp->perm = 0666;
 	for(i = 1; i < cb->nf; i++){
 		inprv = mp->inner[i-1] = mallocz(sizeof(Inner), 1);
 		if(inprv == nil)
@@ -744,44 +685,37 @@ Fail:
 		kstrdup(&inprv->iname, cb->f[i]);
 		inprv->idev = idev[i-1];
 		idev[i-1] = nil;
+		/* use the most restrictive of the inner permissions */
+		mp->perm &= iperm[i-1];
 	}
 	setdsize(mp, ilen);
 
-	setconfstr();
-	wunlock(&lck);
 	poperror();
+	wunlock(&lck);
 	free(idev);
 	free(ilen);
+	free(iperm);
 	free(cb);
 }
 
 static void
 rdconf(void)
 {
+	int mustrd;
 	char *c, *e, *p, *s;
 	Chan *cc;
-	int mustrd;
+	static int configed;
 
 	/* only read config file once */
-	if (confstr != nil)
+	if (configed)
 		return;
-
-	wlock(&lck);
-	if (confstr != nil) {
-		wunlock(&lck);
-		return;	/* already done */
-	}
-
-	/* add the std "fs" tree */
-	if(ntrees == 0){
-		fstree.name = "fs";
-		trees[ntrees++] = &fstree;
-	}
-
-	setconfstr();
-	wunlock(&lck);
+	configed = 1;
 
 	dprint("rdconf\n");
+	/* add the std "fs" tree */
+	trees[0] = &fstree;
+	ntrees++;
+	fstree.name = "fs";
 
 	/* identify the config file */
 	s = getconf("fsconfig");
@@ -791,26 +725,31 @@ rdconf(void)
 	} else
 		mustrd = 1;
 
-	c = smalloc(Maxconf+1);
-	if(waserror()){
-		free(c);
-		if(!mustrd)
+	/* read it */
+	cc = nil;
+	c = nil;
+	if (waserror()){
+		if (cc != nil)
+			cclose(cc);
+		if (c)
+			free(c);
+		if (!mustrd)
 			return;
 		nexterror();
 	}
-
-	/* read it */
 	cc = namec(s, Aopen, OREAD, 0);
-	if(waserror()){
-		cclose(cc);
-		nexterror();
-	}
-	devtab[cc->type]->read(cc, c, Maxconf, 0);
+	devtab[cc->type]->read(cc, confstr, sizeof confstr, 0);
 	cclose(cc);
-	poperror();
+	cc = nil;
+
+	/* validate, copy and erase config; mconfig will repopulate confstr */
+	if (strncmp(confstr, cfgstr, sizeof cfgstr - 1) != 0)
+		error("bad #k config, first line must be: 'fsdev:\\n'");
+	kstrdup(&c, confstr + sizeof cfgstr - 1);
+	memset(confstr, 0, sizeof confstr);
 
 	/* process config copy one line at a time */
-	for (p = c; *p != '\0'; p = e){
+	for (p = c; p != nil && *p != '\0'; p = e){
 		e = strchr(p, '\n');
 		if (e == nil)
 			e = p + strlen(p);
@@ -818,9 +757,8 @@ rdconf(void)
 			e++;
 		mconfig(p, e - p);
 	}
-
-	free(c);
-	poperror();	/* c */
+	USED(cc);		/* until now, can be used in waserror clause */
+	poperror();
 }
 
 static int
@@ -836,7 +774,7 @@ mgen(Chan *c, char*, Dirtab*, int, int i, Dir *dp)
 	qid.vers = 0;
 	if(c->qid.path == Qtop){
 		if(i == DEVDOTDOT){
-			devdir(c, tqid, "#k", 0, eve, 0775, dp);
+			devdir(c, tqid, "#k", 0, eve, DMDIR|0775, dp);
 			return 1;
 		}
 		t = gettree(i, Optional);
@@ -845,7 +783,7 @@ mgen(Chan *c, char*, Dirtab*, int, int i, Dir *dp)
 			return -1;
 		}
 		qid.path = mkpath(i, Qdir);
-		devdir(c, qid, t->name, 0, eve, 0775, dp);
+		devdir(c, qid, t->name, 0, eve, DMDIR|0775, dp);
 		return 1;
 	}
 
@@ -857,7 +795,7 @@ mgen(Chan *c, char*, Dirtab*, int, int i, Dir *dp)
 	}
 	if((c->qid.type & QTDIR) != 0){
 		if(i == DEVDOTDOT){
-			devdir(c, tqid, "#k", 0, eve, 0775, dp);
+			devdir(c, tqid, "#k", 0, eve, DMDIR|0775, dp);
 			return 1;
 		}
 		if(treeno == 0){
@@ -876,13 +814,13 @@ mgen(Chan *c, char*, Dirtab*, int, int i, Dir *dp)
 		qid.type = QTFILE;
 		qid.vers = mp->vers;
 		qid.path = mkpath(treeno, Qfirst+i);
-		devdir(c, qid, mp->name, mp->size, eve, 0664, dp);
+		devdir(c, qid, mp->name, mp->size, eve, mp->perm, dp);
 		return 1;
 	}
 
 	if(i == DEVDOTDOT){
 		qid.path = mkpath(treeno, Qdir);
-		devdir(c, qid, t->name, 0, eve, 0775, dp);
+		devdir(c, qid, t->name, 0, eve, DMDIR|0775, dp);
 		return 1;
 	}
 	dprint("no\n");
@@ -934,7 +872,7 @@ mstat(Chan *c, uchar *db, int n)
 	memset(&d, 0, sizeof d);
 	switch(p){
 	case Qtop:
-		devdir(c, tqid, "#k", 0, eve, 0775, &d);
+		devdir(c, tqid, "#k", 0, eve, DMDIR|0775, &d);
 		break;
 	case Qctl:
 		devdir(c, cqid, "ctl", 0, eve, 0664, &d);
@@ -942,12 +880,12 @@ mstat(Chan *c, uchar *db, int n)
 	default:
 		t = gettree(path2treeno(p), Mustexist);
 		if(c->qid.type & QTDIR)
-			devdir(c, c->qid, t->name, 0, eve, 0775, &d);
+			devdir(c, c->qid, t->name, 0, eve, DMDIR|0775, &d);
 		else{
 			mp = getdev(t, path2devno(p) - Qfirst, Mustexist);
 			q = c->qid;
 			q.vers = mp->vers;
-			devdir(c, q, mp->name, mp->size, eve, 0664, &d);
+			devdir(c, q, mp->name, mp->size, eve, mp->perm, &d);
 		}
 	}
 	n = convD2M(&d, db, n);
@@ -977,6 +915,7 @@ mopen(Chan *c, int omode)
 		mp = path2dev(q);
 		if(mp->gone)
 			error(Egone);
+		devpermcheck(eve, mp->perm, omode);
 		incref(mp);
 		poperror();
 		runlock(&lck);
@@ -986,7 +925,7 @@ mopen(Chan *c, int omode)
 	 * but only for its children. Don't use devopen here.
 	 */
 	c->offset = 0;
-	c->mode = openmode(omode);
+	c->mode = openmode(omode & ~OTRUNC);
 	c->flag |= COPEN;
 	return c;
 }
@@ -1048,50 +987,6 @@ io(Fsdev *mp, Inner *in, int isread, void *a, long l, vlong off)
 		wl = devtab[mc->type]->write(mc, a, l, off);
 	poperror();
 	return wl;
-}
-
-static long
-cryptio(Fsdev *mp, int isread, uchar *a, long n, vlong off)
-{
-	long l, m, o, nb;
-	uchar *b;
-
-	if((((ulong)off|n) & (Cryptsectsz-1)))
-		error(Ebadarg);
-	if(isread){
-		l = io(mp, mp->inner[0], Isread, a, n, off);
-		if(l > 0){
-			l &= ~(Cryptsectsz-1);
-			for(o=0; o<l; o+=Cryptsectsz)
-				aes_xts_decrypt(&mp->key->tweak, &mp->key->ecb,
-					off+o, a+o, a+o, Cryptsectsz);
-		}
-		return l;
-	}
-	nb = n < SDmaxio ? n : SDmaxio;
-	while((b = sdmalloc(nb)) == nil){
-		if(!waserror()){
-			resrcwait("no memory for cryptio");
-			poperror();
-		}
-	}
-	if(waserror()) {
-		sdfree(b);
-		nexterror();
-	}
-	for(l = 0; (m = n - l) > 0; l += m){
-		if(m > nb) m = nb;
-		for(o=0; o<m; o+=Cryptsectsz)
-			aes_xts_encrypt(&mp->key->tweak, &mp->key->ecb,
-				off+o, a+o, b+o, Cryptsectsz);
-		if(io(mp, mp->inner[0], Iswrite, b, m, off) != m)
-			error(Eio);
-		off += m;
-		a += m;
-	}
-	sdfree(b);
-	poperror();
-	return l;
 }
 
 /* NB: a transfer could span multiple inner devices */
@@ -1163,6 +1058,23 @@ interio(Fsdev *mp, int isread, void *a, long n, vlong off)
 	return res;
 }
 
+static char*
+seprintconf(char *s, char *e)
+{
+	int	i, j;
+	Tree	*t;
+
+	*s = 0;
+	for(i = 0; i < ntrees; i++){
+		t = trees[i];
+		if(t != nil)
+			for(j = 0; j < t->nadevs; j++)
+				if(t->devs[j] != nil)
+					s = seprintdev(s, e, t->devs[j]);
+	}
+	return s;
+}
+
 static long
 mread(Chan *c, void *a, long n, vlong off)
 {
@@ -1183,6 +1095,7 @@ mread(Chan *c, void *a, long n, vlong off)
 		goto Done;
 	}
 	if(c->qid.path == Qctl){
+		seprintconf(confstr, confstr + sizeof(confstr));
 		res = readstr((long)off, a, n, confstr);
 		goto Done;
 	}
@@ -1245,9 +1158,6 @@ mread(Chan *c, void *a, long n, vlong off)
 			print("#k/%s: byte %,lld count %ld: retry read OK "
 				"from mirror: %s\n", mp->name, off, n,
 				(up && up->errstr? up->errstr: ""));
-		break;
-	case Fcrypt:
-		res = cryptio(mp, Isread, a, n, mp->start + off);
 		break;
 	}
 Done:
@@ -1343,9 +1253,6 @@ mwrite(Chan *c, void *a, long n, vlong off)
 				"to mirror: %s\n", mp->name, off, n,
 				(up && up->errstr? up->errstr: ""));
 
-		break;
-	case Fcrypt:
-		res = cryptio(mp, Iswrite, a, n, mp->start + off);
 		break;
 	}
 Done:

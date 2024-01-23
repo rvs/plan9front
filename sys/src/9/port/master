@@ -1,0 +1,46 @@
+# do not edit; automatically generated
+
+$	pnp
+/	root
+D	ssl
+F	flash
+I	ip
+K	kprof
+M	mnt
+P	arch
+S	sd
+X	loopback
+a	tls
+c	cons
+d	dup
+e	env
+g	segment
+i	draw
+k	fs
+l	ether
+m	mouse
+p	proc
+r	fakertc
+r	rtc
+r	rtc3231
+s	srv
+t	uart
+u	usb
+v	vga
+w	wd
+|	pipe
+¤	cap
+Ι	kbin
+κ	kbmap
+π	spi
+☹	bios
+
+α	local use
+β	local use
+γ	local use
+δ	local use
+ε	local use
+ζ	local use
+η	local use
+θ	local use
+ι	local use

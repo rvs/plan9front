@@ -11,7 +11,6 @@ enum
 {
 	Hashlen=	SHA1dlen,
 	Maxhash=	256,
-	Timeout=	60,	/* seconds */
 };
 
 /*
@@ -22,11 +21,11 @@ typedef struct Caphash	Caphash;
 struct Caphash
 {
 	Caphash	*next;
-	ulong	ticks;
-	char	hash[Hashlen];
+	char		hash[Hashlen];
+	ulong		ticks;
 };
 
-static struct
+struct
 {
 	QLock;
 	Caphash	*first;
@@ -105,19 +104,19 @@ capopen(Chan *c, int omode)
 	return c;
 }
 
-static void
-trimcaps(void)
+/*
+static char*
+hashstr(uchar *hash)
 {
-	Caphash *t;
+	static char buf[2*Hashlen+1];
+	int i;
 
-	while((t = capalloc.first) != nil){
-		if(capalloc.nhash < Maxhash && TK2SEC(MACHP(0)->ticks - t->ticks) < Timeout)
-			break;
-		capalloc.nhash--;
-		capalloc.first = t->next;
-		secfree(t);
-	}
+	for(i = 0; i < Hashlen; i++)
+		seprint(buf+2*i, &buf[sizeof buf], "%2.2ux", hash[i]);
+	buf[2*Hashlen] = 0;
+	return buf;
 }
+ */
 
 static Caphash*
 remcap(uchar *hash)
@@ -126,13 +125,10 @@ remcap(uchar *hash)
 
 	qlock(&capalloc);
 
-	/* timeout old caps */
-	trimcaps();
-
 	/* find the matching capability */
 	for(l = &capalloc.first; *l != nil;){
 		t = *l;
-		if(tsmemcmp(hash, t->hash, Hashlen) == 0)
+		if(memcmp(hash, t->hash, Hashlen) == 0)
 			break;
 		l = &t->next;
 	}
@@ -150,17 +146,24 @@ remcap(uchar *hash)
 static void
 addcap(uchar *hash)
 {
-	Caphash *p, **l;
+	Caphash *p, *t, **l;
 
-	p = secalloc(sizeof *p);
+	p = smalloc(sizeof *p);
 	memmove(p->hash, hash, Hashlen);
 	p->next = nil;
-	p->ticks = MACHP(0)->ticks;
+	p->ticks = m->ticks;
 
 	qlock(&capalloc);
 
-	/* make room for one extra */
-	trimcaps();
+	/* trim extras */
+	while(capalloc.nhash >= Maxhash){
+		t = capalloc.first;
+		if(t == nil)
+			panic("addcap");
+		capalloc.first = t->next;
+		free(t);
+		capalloc.nhash--;
+	}
 
 	/* add new one */
 	for(l = &capalloc.first; *l != nil; l = &(*l)->next)
@@ -210,14 +213,13 @@ capwrite(Chan *c, void *va, long n, vlong)
 		break;
 
 	case Quse:
-		if((ulong)n >= 1024)
-			error(Etoobig);
 		/* copy key to avoid a fault in hmac_xx */
-		cp = secalloc(n+1);
+		cp = nil;
 		if(waserror()){
-			secfree(cp);
+			free(cp);
 			nexterror();
 		}
+		cp = smalloc(n+1);
 		memmove(cp, va, n);
 		cp[n] = 0;
 
@@ -229,6 +231,12 @@ capwrite(Chan *c, void *va, long n, vlong)
 
 		hmac_sha1((uchar*)from, strlen(from), (uchar*)key, strlen(key), hash, nil);
 
+		p = remcap(hash);
+		if(p == nil){
+			snprint(err, sizeof err, "invalid capability %s@%s", from, key);
+			error(err);
+		}
+
 		/* if a from user is supplied, make sure it matches */
 		to = strchr(from, '@');
 		if(to == nil){
@@ -239,16 +247,12 @@ capwrite(Chan *c, void *va, long n, vlong)
 				error("capability must match user");
 		}
 
-		p = remcap(hash);
-		if(p == nil){
-			snprint(err, sizeof err, "invalid capability %s@%s", from, key);
-			error(err);
-		}
-		secfree(p);
+		/* set user id */
+		kstrdup(&up->user, to);
+		up->basepri = PriNormal;
 
-		procsetuser(to);
-
-		secfree(cp);
+		free(p);
+		free(cp);
 		poperror();
 		break;
 
@@ -256,7 +260,6 @@ capwrite(Chan *c, void *va, long n, vlong)
 		error(Eperm);
 		break;
 	}
-	memset(hash, 0, Hashlen);
 
 	return n;
 }

@@ -1,37 +1,43 @@
 dev
 	root
 	cons
-	swap
 	env
 	pipe
 	proc
 	mnt
 	srv
-	shr
 	dup
 	arch
+	ssl
 	tls
 	cap
 	fs
-	bridge	log
-	ip	arp chandial ip ipv6 ipaux iproute netlog nullmedium pktmedium inferno
-	draw	screen swcursor
+	ip		arp chandial ip ipv6 ipaux iproute netlog nullmedium pktmedium
+	draw	screen
 	mouse	mouse
-	uart	gpio
+	kbmap
+	kbin	kbd latin1
+	uart
 	gpio	gpio
-	i2c
+	spi		spi
+	i2c		i2c
+
+	fakertc
+#	rtc3231		i2c
+	ether	netif
 	sd
 	usb
+	aoe
 
 link
 	archbcm
-	usbdwc
-	ethermedium
 	loopbackmedium
-	netdevmedium
-	emmc
-#	i2cbcm		devi2c
-	i2cgpio		devi2c gpio
+	ethermedium
+	sdhost
+	usbdwc
+	etherusb
+	ether4330 emmc
+	pitft
 
 ip
 	tcp
@@ -39,23 +45,28 @@ ip
 	ipifc
 	icmp
 	icmp6
-	igmp
 	ipmux
 
 misc
 	armv6
-	uartmini
+	trap
+	uartmini	gpio
 	sdmmc	emmc
+	sdaoe	sdscsi
 	dma
 	vcore
 	vfp3	coproc
-	irq
 
 port
 	int cpuserver = 0;
 
+boot boot #S/sdM0/
+	local
+	tcp
+
 bootdir
-	/$objtype/bin/paqfs
-	/$objtype/bin/auth/factotum
-	bootfs.paq
-	boot
+	boot$CONF.out	boot
+	/arm/bin/ip/ipconfig
+	/arm/bin/auth/factotum
+	/arm/bin/fossil/fossil
+	/arm/bin/usb/usbd

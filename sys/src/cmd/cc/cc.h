@@ -5,7 +5,9 @@
 
 #pragma	lib	"../cc/cc.a$O"
 
-#include "../cc/compat.h"
+#ifndef	EXTERN
+#define EXTERN	extern
+#endif
 
 typedef	struct	Node	Node;
 typedef	struct	Sym	Sym;
@@ -18,21 +20,24 @@ typedef	struct	Term	Term;
 typedef	struct	Init	Init;
 typedef	struct	Bits	Bits;
 
+typedef	Rune	TRune;	/* target system type */
+
 #define	NHUNK		50000L
-#define	BUFSIZ		IOUNIT
+#define	BUFSIZ		(16*1024)
 #define	NSYMB		1500
 #define	NHASH		1024
 #define	STRINGSZ	200
 #define	HISTSZ		20
 #define YYMAXDEPTH	1500
 #define	NTERM		10
-#define	MAXALIGN	7
+#define	MAXALIGN	7		/* sizeof(uvlong) - 1 */
 
-#define	SIGN(n)		(1ULL<<(n-1))
+#define	SIGN(n)		(1ULL<<((n)-1))
 #define	MASK(n)		(SIGN(n)|(SIGN(n)-1))
 
 #define	BITS	5
-#define	NVAR	(BITS*sizeof(ulong)*8)
+#define BI2LONG (sizeof(ulong)*8)
+#define	NVAR	(BITS*BI2LONG)
 struct	Bits
 {
 	ulong	b[BITS];
@@ -49,7 +54,7 @@ struct	Node
 	double	fconst;		/* fp constant */
 	vlong	vconst;		/* non fp const */
 	char*	cstring;	/* character string */
-	Rune*	rstring;	/* rune string */
+	TRune*	rstring;	/* rune string */
 
 	Sym*	sym;
 	Type*	type;
@@ -143,8 +148,6 @@ EXTERN struct
 	int	c;
 } fi;
 
-#define	GETC()	((--fi.c < 0)? filbuf(): (*fi.p++ & 0xff))
-
 struct	Io
 {
 	Io*	link;
@@ -182,6 +185,13 @@ enum
 	Aarg2,
 	Aaut3,
 	NALIGN,
+};
+
+enum				/* also in ../{8a,0a}.h */
+{
+	Plan9	= 1<<0,
+	Unix	= 1<<1,
+	Windows	= 1<<2,
 };
 
 enum
@@ -266,7 +276,6 @@ enum
 	OPROTO,
 	OREGISTER,
 	ORETURN,
-	OROL,
 	OSET,
 	OSIGN,
 	OSIZE,
@@ -285,6 +294,7 @@ enum
 	OELEM,
 
 	OTST,		/* used in some compilers */
+	OROL,
 	OINDEX,
 	OFAS,
 	OREGPAIR,
@@ -327,12 +337,16 @@ enum
 	TVOLATILE,
 	TUNSIGNED,
 	TSIGNED,
-	TNORET,
+	TFILE,
 	TOLD,
 	NALLTYPES,
-
-	TRUNE	= sizeof(Rune)==4? TUINT: TUSHORT,
 };
+
+/*
+ * adapt size of Rune to target system's size, also type of L""[0].
+ */
+#define TRUNE (sizeof(TRune)==4? TUINT: TUSHORT)
+
 enum
 {
 	CXXX,
@@ -349,15 +363,16 @@ enum
 	CEXREG,
 	NCTYPES,
 };
+/* garbage words; should match gnamesinit[] in sub.c */
 enum
 {
 	GXXX		= 0,
 	GCONSTNT	= 1<<0,
 	GVOLATILE	= 1<<1,
-	GNORET		= 1<<2,
-	NGTYPES		= 1<<4,
+//	GNORETURN	= 1<<2,			/* future */
+	NGTYPES		= 1<<3,
 
-	GINCOMPLETE	= 1<<3,
+	GINCOMPLETE	= 1<<7,
 };
 enum
 {
@@ -380,6 +395,7 @@ enum
 	BSTRUCT		= 1L<<TSTRUCT,
 	BUNION		= 1L<<TUNION,
 	BENUM		= 1L<<TENUM,
+	BFILE		= 1L<<TFILE,
 	BDOT		= 1L<<TDOT,
 	BCONSTNT	= 1L<<TCONSTNT,
 	BVOLATILE	= 1L<<TVOLATILE,
@@ -391,7 +407,6 @@ enum
 	BTYPEDEF	= 1L<<TTYPEDEF,
 	BTYPESTR	= 1L<<TTYPESTR,
 	BREGISTER	= 1L<<TREGISTER,
-	BNORET		= 1L<<TNORET,
 
 	BINTEGER	= BCHAR|BUCHAR|BSHORT|BUSHORT|BINT|BUINT|
 				BLONG|BULONG|BVLONG|BUVLONG,
@@ -400,7 +415,7 @@ enum
 /* these can be overloaded with complex types */
 
 	BCLASS		= BAUTO|BEXTERN|BSTATIC|BTYPEDEF|BTYPESTR|BREGISTER,
-	BGARB		= BCONSTNT|BVOLATILE|BNORET
+	BGARB		= BCONSTNT|BVOLATILE,
 };
 
 struct	Funct
@@ -428,10 +443,12 @@ EXTERN	long	firstbit;
 EXTERN	Sym*	firstarg;
 EXTERN	Type*	firstargtype;
 EXTERN	Decl*	firstdcl;
-EXTERN	int	fperror;
+// EXTERN	int	fperror;
+EXTERN	int	fpused;
 EXTERN	Sym*	hash[NHASH];
 EXTERN	int	hasdoubled;
-EXTERN	char*	include[20];
+EXTERN	char*	hunk;
+EXTERN	char**	include;
 EXTERN	Io*	iofree;
 EXTERN	Io*	ionext;
 EXTERN	Io*	iostack;
@@ -442,8 +459,10 @@ EXTERN	long	lastfield;
 EXTERN	Type*	lasttype;
 EXTERN	long	lineno;
 EXTERN	long	nearln;
+EXTERN	int	maxinclude;
 EXTERN	int	nerrors;
 EXTERN	int	newflag;
+EXTERN	long	nhunk;
 EXTERN	int	ninclude;
 EXTERN	Node*	nodproto;
 EXTERN	Node*	nodcast;
@@ -463,7 +482,7 @@ EXTERN	Type*	tufield;
 EXTERN	int	thechar;
 EXTERN	char*	thestring;
 EXTERN	Type*	thisfn;
-EXTERN	Node*	thisfnnode;
+EXTERN	long	thunk;
 EXTERN	Type*	types[NTYPE];
 EXTERN	Type*	fntypes[NTYPE];
 EXTERN	Node*	initlist;
@@ -514,6 +533,21 @@ extern	ulong	thash3;
 extern	ulong	thash[];
 
 /*
+ *	compat.c/unix.c/windows.c
+ */
+int	mywait(int*);
+int	mycreat(char*, int);
+int	systemtype(int);
+int	pathchar(void);
+int	myaccess(char*);
+char*	mygetwd(char*, int);
+int	myexec(char*, char*[]);
+int	mydup(int, int);
+int	myfork(void);
+int	mypipe(int*);
+void*	mysbrk(ulong);
+
+/*
  *	parser
  */
 int	yyparse(void);
@@ -522,6 +556,8 @@ int	mpatov(char*, vlong*);
 /*
  *	lex.c
  */
+void*	allocn(void*, long, long);
+void*	alloc(long);
 void	cinit(void);
 int	compile(char*, char**, int);
 void	errorexit(void);
@@ -558,7 +594,7 @@ void	linehist(char*, int);
 void	macdef(void);
 void	macprag(void);
 void	macend(void);
-int	macexpand(Sym*, char*, int);
+void	macexpand(Sym*, char*);
 void	macif(int);
 void	macinc(void);
 void	maclin(void);
@@ -584,7 +620,6 @@ Type*	dotag(Sym*, int, int);
 void	edecl(int, Type*, Sym*);
 Type*	fnproto(Node*);
 Type*	fnproto1(Node*);
-void	fndecls(int);
 void	markdcl(void);
 Type*	paramconv(Type*, int);
 void	pdecl(int, Type*, Sym*);
@@ -642,6 +677,7 @@ int	castucom(Node*);
 int	deadheads(Node*);
 Type*	dotsearch(Sym*, Type*, Node*, long*);
 long	dotoffset(Type*, Type*, Node*);
+void	gethunk(void);
 Node*	invert(Node*);
 int	bitno(long);
 void	makedot(Node*, Type*, long);
@@ -666,7 +702,6 @@ Type*	copytyp(Type*);
 void	typeext(Type*, Node*);
 void	typeext1(Type*, Node*);
 int	side(Node*);
-int	zpconst(Node*);
 int	vconst(Node*);
 int	log2(uvlong);
 int	vlog(Node*);
@@ -721,8 +756,7 @@ void	gclean(void);
 void	gextern(Sym*, Node*, long, long);
 void	ginit(void);
 long	outstring(char*, long);
-long	outlstring(Rune*, long);
-void	sextern(Sym*, Node*, long, long);
+long	outlstring(TRune*, long);
 void	xcom(Node*);
 long	exreg(Type*);
 long	align(long, Type*, int);

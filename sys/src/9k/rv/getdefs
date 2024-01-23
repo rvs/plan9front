@@ -1,0 +1,7 @@
+#!/bin/rc
+if (! test -e /env/ARCH || ! test -s /env/ARCH)
+	ARCH=''			# avoid null list with $ARCH
+if (test -r ./$ARCH/defs)
+	cat ./$ARCH/defs
+if not
+	echo

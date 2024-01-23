@@ -1,3 +1,4 @@
+/* this is file layout, so can't tolerate bogus padding */
 typedef	struct	Exec	Exec;
 struct	Exec
 {
@@ -11,13 +12,16 @@ struct	Exec
 	long	pcsz;		/* size of pc/line number table */
 };
 
-#define HDR_MAGIC	0x00008000		/* header expansion */
+/* bits in magic */
+/* note that HDR_MAGIC triggers certain behaviours for 64 bits in libmach */
+#define HDR_MAGIC	0x00008000	/* header expansion for 64 bits */
+#define	DYN_MAGIC	0x80000000	/* dynamically-loadable module (dlm) */
 
 #define	_MAGIC(f, b)	((f)|((((4*(b))+0)*(b))+7))
 #define	A_MAGIC		_MAGIC(0, 8)		/* 68020 (retired) */
 #define	I_MAGIC		_MAGIC(0, 11)		/* intel 386 */
 #define	J_MAGIC		_MAGIC(0, 12)		/* intel 960 (retired) */
-#define	K_MAGIC		_MAGIC(0, 13)		/* sparc */
+#define	K_MAGIC		_MAGIC(0, 13)		/* sparc (retired) */
 #define	V_MAGIC		_MAGIC(0, 16)		/* mips 3000 BE */
 #define	X_MAGIC		_MAGIC(0, 17)		/* att dsp 3210 (retired) */
 #define	M_MAGIC		_MAGIC(0, 18)		/* mips 4000 BE */
@@ -33,11 +37,10 @@ struct	Exec
 #define	R_MAGIC		_MAGIC(HDR_MAGIC, 28)	/* arm64 */
 #define	Z_MAGIC		_MAGIC(0, 29)		/* riscv */
 #define	Y_MAGIC		_MAGIC(0, 30)		/* riscv64 */
+#define	B_MAGIC		_MAGIC(HDR_MAGIC, 30)	/* riscv64 */
 
 #define	MIN_MAGIC	8
-#define	MAX_MAGIC	30			/* <= 90 */
-
-#define	DYN_MAGIC	0x80000000		/* dlm */
+#define	MAX_MAGIC	36			/* <= 90 */
 
 typedef	struct	Sym	Sym;
 struct	Sym

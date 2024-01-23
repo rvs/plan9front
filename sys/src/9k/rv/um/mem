@@ -1,0 +1,18 @@
+acpi claims memory at
+ 0x80200000 - 0xfe6e2fff
+with magic acpi garbage after that, followed by
+memory
+0x100000000 - 0x47fffffff
+
+reserved
+ 0x80000000 - 0x8007ffff
+ 0x80004000 - 0xfc0d2000	normal memory, except ... acpi reclaim
+ 0x80200000 - 0x815fffff		- 22M
+ 0x87ef6000 - 0x87f0a000	acpi reclaim memory (0x14000 bytes): acpi
+				tables, reusable as normal memory
+ 0x87f00000 - 0x87f05fff	127M - 
+ 0xdb0a2000 - 0xdc709fff
+0x46ffe1d40 - 0x47dfe253f	17.75G - 
+
+linux uses
+ 0x80200000 - 0x27fffffff

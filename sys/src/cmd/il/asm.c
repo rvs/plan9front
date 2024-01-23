@@ -1,4 +1,7 @@
 #include	"l.h"
+#define Sym Aoutsym
+#include	<a.out.h>
+#undef Sym
 
 long	OFFSET;
 
@@ -132,9 +135,8 @@ asmb(void)
 	case 1:
 		break;
 	case 2:
-		/* XXX expanded header needed? */
-		t = thechar == 'j' ? 30 : 29;
-		lput(((((4*t)+0)*t)+7));	/* magic */
+		t = thechar == 'j'? (debug['X']? B_MAGIC: Y_MAGIC): Z_MAGIC;
+		lput(t);
 		lput(textsize);			/* sizes */
 		lput(datsize);
 		lput(bsssize);
@@ -142,10 +144,12 @@ asmb(void)
 		lput(entryvalue());		/* va of entry */
 		lput(0L);
 		lput(lcsize);
+		if (t & HDR_MAGIC)
+			llput(entryvalue());	/* va of entry */
 		break;
 	case 5:
 		if(thechar == 'j')
-			elf64(243, ELFDATA2LSB, 0, nil);		/* 243 is RISCV */
+			elf64(243, ELFDATA2LSB, 0, nil); /* 243 is RISCV */
 		else
 			elf32(243, ELFDATA2LSB, 0, nil);
 	}
@@ -807,7 +811,7 @@ asmout(Prog *p, Optab *o, int aflag)
 			if(v != vv || (v&~0x7FF) == 0x7FFFF800)
 				diag("address out of range\n%P", p);
 		}else
-				v += INITDAT + BIG;
+			v += INITDAT + BIG;
 		if(v & 0x800)
 			v += 0x1000;
 		o1 = thechar == 'j' ? OP_UP(REGTMP, v) : OP_U(REGTMP, v);
@@ -857,17 +861,18 @@ asmout(Prog *p, Optab *o, int aflag)
 		break;
 
 	case 17:	/* fcvt S,D */
-		v = 7;	/* dynamic rounding mode */
+		v = 7;			/* dynamic rounding mode */
 		if(o->a3 == C_REG)	/* convert to int? */
-			v = 1;	/* round towards zero */
+			v = 1;		/* round towards zero */
 		o1 = OP_RF(p->from.reg, o->func3, p->to.reg, v);
 		break;
 
-	case 18:	/* lui L1, T; jal [r,]L0(T) */
+	case 18:	/* lui/auipc L1, T; jal [r,]L0(T) */
+		/* p->cond->pc == p->pc here; pc is current instruction */
 		if(p->cond == P)
 			v = 0;
 		else
-			v = p->cond->pc;
+			v = p->cond->pc - (pc + INITTEXT);
 		if(thechar == 'j'){
 			vv = v + INITTEXT;
 			v = (long)vv;
@@ -875,6 +880,7 @@ asmout(Prog *p, Optab *o, int aflag)
 				diag("branch out of range\n%P", p);
 		}else
 			v += INITTEXT;
+		/* if low immediate offset looks negative, skip to next page */
 		if(v & 0x800)
 			v += 0x1000;
 		o1 = thechar == 'j' ? OP_UP(REGTMP, v) : OP_U(REGTMP, v);
@@ -892,7 +898,8 @@ asmout(Prog *p, Optab *o, int aflag)
 			vv = regoff(&p->from) + instoffx - (pc + INITTEXT);
 			v = (long)vv;
 			if(v != vv || (v&~0x7FF) == 0x7FFFF800)
-				diag("address %llux out of range\n%P", regoff(&p->from) + instoffx, p);
+				diag("address %llux out of range\n%P",
+					regoff(&p->from) + instoffx, p);
 		}else{
 			v = regoff(&p->from) + instoffx;
 		}

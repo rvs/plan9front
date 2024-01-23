@@ -16,36 +16,46 @@ listinit(void)
 int
 Bconv(Fmt *fp)
 {
+	char str[STRINGSZ], ss[STRINGSZ], *s;
 	Bits bits;
 	int i;
 
+	str[0] = 0;
 	bits = va_arg(fp->args, Bits);
 	while(bany(&bits)) {
 		i = bnum(bits);
-		bits.b[i/32] &= ~(1L << (i%32));
-		if(var[i].sym == S)
-			fmtprint(fp, "$%lld ", var[i].offset);
-		else
-			fmtprint(fp, "%s ", var[i].sym->name);
+		if(str[0])
+			strcat(str, " ");
+		if(var[i].sym == S) {
+			sprint(ss, "$%lld", var[i].offset);
+			s = ss;
+		} else
+			s = var[i].sym->name;
+		if(strlen(str) + strlen(s) + 1 >= STRINGSZ)
+			break;
+		strcat(str, s);
+		bits.b[i/BI2LONG] &= ~(1L << (i%BI2LONG));
 	}
-	return 0;
+	return fmtstrcpy(fp, str);
 }
 
 int
 Pconv(Fmt *fp)
 {
+	char str[STRINGSZ];
 	Prog *p;
 
 	p = va_arg(fp->args, Prog*);
 	if(p->as == ADATA)
-		return fmtprint(fp, "	%A	%D/%d,%D",
+		sprint(str, "	%A	%D/%d,%D",
 			p->as, &p->from, p->from.scale, &p->to);
 	else if(p->as == ATEXT)
-		return fmtprint(fp, "	%A	%D,%d,%D",
+		sprint(str, "	%A	%D,%d,%D",
 			p->as, &p->from, p->from.scale, &p->to);
 	else
-		return fmtprint(fp, "	%A	%D,%D",
+		sprint(str, "	%A	%D,%D",
 			p->as, &p->from, &p->to);
+	return fmtstrcpy(fp, str);
 }
 
 int
@@ -60,7 +70,7 @@ Aconv(Fmt *fp)
 int
 Dconv(Fmt *fp)
 {
-	char str[40];
+	char str[40], s[20];
 	Adr *a;
 	int i;
 
@@ -68,18 +78,18 @@ Dconv(Fmt *fp)
 	i = a->type;
 	if(i >= D_INDIR) {
 		if(a->offset)
-			snprint(str, sizeof str, "%lld(%R)", a->offset, i-D_INDIR);
+			sprint(str, "%lld(%R)", a->offset, i-D_INDIR);
 		else
-			snprint(str, sizeof str, "(%R)", i-D_INDIR);
+			sprint(str, "(%R)", i-D_INDIR);
 		goto brk;
 	}
 	switch(i) {
 
 	default:
 		if(a->offset)
-			snprint(str, sizeof str, "$%lld,%R", a->offset, i);
+			sprint(str, "$%lld,%R", a->offset, i);
 		else
-			snprint(str, sizeof str, "%R", i);
+			sprint(str, "%R", i);
 		break;
 
 	case D_NONE:
@@ -87,51 +97,54 @@ Dconv(Fmt *fp)
 		break;
 
 	case D_BRANCH:
-		snprint(str, sizeof str, "%lld(PC)", a->offset-pc);
+		sprint(str, "%lld(PC)", a->offset-pc);
 		break;
 
 	case D_EXTERN:
-		snprint(str, sizeof str, "%s+%lld(SB)", a->sym->name, a->offset);
+		sprint(str, "%s+%lld(SB)", a->sym->name, a->offset);
 		break;
 
 	case D_STATIC:
-		snprint(str, sizeof str, "%s<>+%lld(SB)", a->sym->name, a->offset);
+		sprint(str, "%s<>+%lld(SB)", a->sym->name,
+			a->offset);
 		break;
 
 	case D_AUTO:
-		snprint(str, sizeof str, "%s+%lld(SP)", a->sym->name, a->offset);
+		sprint(str, "%s+%lld(SP)", a->sym->name, a->offset);
 		break;
 
 	case D_PARAM:
 		if(a->sym)
-			snprint(str, sizeof str, "%s+%lld(FP)", a->sym->name, a->offset);
+			sprint(str, "%s+%lld(FP)", a->sym->name, a->offset);
 		else
-			snprint(str, sizeof str, "%lld(FP)", a->offset);
+			sprint(str, "%lld(FP)", a->offset);
 		break;
 
 	case D_CONST:
-		snprint(str, sizeof str, "$%lld", a->offset);
+		sprint(str, "$%lld", a->offset);
 		break;
 
 	case D_FCONST:
-		snprint(str, sizeof str, "$(%.17e)", a->dval);
+		sprint(str, "$(%.17e)", a->dval);
 		break;
 
 	case D_SCONST:
-		snprint(str, sizeof str, "$\"%S\"", a->sval);
+		sprint(str, "$\"%S\"", a->sval);
 		break;
 
 	case D_ADDR:
 		a->type = a->index;
 		a->index = D_NONE;
-		snprint(str, sizeof str, "$%D", a);
+		sprint(str, "$%D", a);
 		a->index = a->type;
 		a->type = D_ADDR;
 		goto conv;
 	}
 brk:
-	if(a->index != D_NONE) 
-		return fmtprint(fp, "%s(%R*%d)", str, (int)a->index, (int)a->scale);
+	if(a->index != D_NONE) {
+		sprint(s, "(%R*%d)", (int)a->index, (int)a->scale);
+		strcat(str, s);
+	}
 conv:
 	return fmtstrcpy(fp, str);
 }
@@ -266,13 +279,16 @@ char*	regstr[] =
 int
 Rconv(Fmt *fp)
 {
+	char str[20];
 	int r;
 
 	r = va_arg(fp->args, int);
 	if(r >= D_AL && r <= D_NONE)
-		return fmtprint(fp, "%s", regstr[r-D_AL]);
+		sprint(str, "%s", regstr[r-D_AL]);
 	else
-		return fmtprint(fp, "gok(%d)", r);
+		sprint(str, "gok(%d)", r);
+
+	return fmtstrcpy(fp, str);
 }
 
 int

@@ -25,7 +25,6 @@ typedef struct Tqueue	Tqueue;
 typedef struct Thread	Thread;
 typedef struct Execargs	Execargs;
 typedef struct Proc		Proc;
-typedef struct Iocall	Iocall;
 
 /* must match list in sched.c */
 typedef enum
@@ -47,6 +46,13 @@ typedef enum
 enum
 {
 	RENDHASH = 13,
+	Printsize = 2048,
+	NPRIV = 8,
+	/*
+	 * stack sizes are difficult to estimate; watch for a stack pointer
+	 * in yellow zone (lowest addresses of stack), indicating an overflow.
+	 */
+	Stackyellow = 64*sizeof(uintptr),
 };
 
 struct Rgrp
@@ -90,7 +96,7 @@ struct Thread
 	Chanstate	chan;		/* which channel operation is current */
 	Alt		*alt;		/* pointer to current alt structure (debugging) */
 
-	void*		udata;		/* User per-thread data pointer */
+	void*		udata[NPRIV];	/* User per-thread data pointer */
 };
 
 struct Execargs
@@ -119,15 +125,22 @@ struct Proc
 	Tqueue		ready;			/* Runnable threads */
 	Lock		readylock;
 
+	char		printbuf[Printsize];
+	int		blocked;		/* In a rendezvous */
 	int		pending;		/* delayed note pending */
+	int		nonotes;		/*  delay notes */
+	uint		nextID;			/* ID of most recently created thread */
 	Proc		*next;			/* linked list of Procs */
 
+	void		*arg;			/* passed between shared and unshared stk */
+	char		str[ERRMAX];		/* used by threadexits to avoid malloc */
+
+	void*		wdata;			/* Lib(worker) per-proc data pointer */
 	void*		udata;			/* User per-proc data pointer */
 	char		threadint;		/* tag for threadexitsall() */
 };
 
-struct Pqueue		/* Proc queue */
-{
+struct Pqueue {		/* Proc queue */
 	Lock		lock;
 	Proc		*head;
 	Proc		**tail;
@@ -135,20 +148,18 @@ struct Pqueue		/* Proc queue */
 
 struct Ioproc
 {
-	QLock;
-	int		intr;
-	int		ctl;
-	Channel		*c, *creply;
+	int	tid;
+	Channel	*c, *creply;
+	int	inuse;
+	long	(*op)(va_list*);
+	va_list	arg;
+	long	ret;
+	char	err[ERRMAX];
+	Ioproc	*next;
 };
 
-struct Iocall
-{
-	long		(*op)(va_list*);
-	va_list		arg;
-	long		ret;
-	char		err[ERRMAX];
-};
-
+void	_freeproc(Proc*);
+void	_freethread(Thread*);
 Proc*	_newproc(void(*)(void*), void*, uint, char*, int, int);
 int	_procsplhi(void);
 void	_procsplx(int);
@@ -157,22 +168,23 @@ int	_schedexec(Execargs*);
 void	_schedexecwait(void);
 void	_schedexit(Proc*);
 int	_schedfork(Proc*);
-void	_schedinit(void);
+void	_schedinit(void*);
+void	_systhreadinit(void);
 void	_threadassert(char*);
 void	_threadbreakrendez(void);
-void	_threadprint(char*, ...);
+void	_threaddebug(ulong, char*, ...);
 void	_threadexitsall(char*);
 void	_threadflagrendez(Thread*);
+Proc*	_threadgetproc(void);
+void	_threadsetproc(Proc*);
 void	_threadinitstack(Thread*, void(*)(void*), void*);
-void*	_threadmalloc(long, int);
+void*	_threadmalloc(uintptr, int);
 void	_threadnote(void*, char*);
 void	_threadready(Thread*);
 void*	_threadrendezvous(void*, void*);
+void	_threadsignal(void);
 void	_threadsysfatal(char*, va_list);
-
-Proc	**_threadprocp;
-#define	_threadgetproc()	(*_threadprocp)
-#define	_threadsetproc(p)	(*_threadprocp = (p))
+void**	_workerdata(void);
 
 extern int			_threaddebuglevel;
 extern char*		_threadexitsallstatus;
@@ -187,8 +199,5 @@ extern Rgrp		_threadrgrp;
 /* #define DBGKILL	(1 << 19) */
 #define DBGNOTE	(1 << 20)
 #define DBGEXEC	(1 << 21)
-
-#pragma	varargck argpos _threadprint 1
-#define	_threaddebug(flag, ...)	if((_threaddebuglevel&(flag))==0){}else _threadprint(__VA_ARGS__)
 
 #define ioproc_arg(io, type)	(va_arg((io)->arg, type))

@@ -10,14 +10,12 @@
  */
 #define	BY2PG		(4*KiB)			/* bytes per page */
 #define	PGSHIFT		12			/* log(BY2PG) */
-#define	PGROUND(s)	ROUND(s, BY2PG)
-#define	ROUND(s, sz)	(((s)+(sz-1))&~(sz-1))
 
 #define	MAXMACH		4			/* max # cpus system can run */
 #define	MACHSIZE	BY2PG
 #define L1SIZE		(4 * BY2PG)
 
-#define KSTACK		(8*KiB)
+#define KSTKSIZE	(8*KiB)
 #define STACKALIGN(sp)	((sp) & ~3)		/* bug: assure with alloc */
 
 /*
@@ -38,31 +36,39 @@
  */
 
 #define	KSEG0		0x80000000		/* kernel segment */
-/* mask to check segment; good for 1GB dram */
-#define	KSEGM		0xC0000000
+/* mask to check segment; good for 2GB dram */
+#define	KSEGM		0x80000000
 #define	KZERO		KSEG0			/* kernel address space */
 #define CONFADDR	(KZERO+0x100)		/* unparsed plan9.ini */
-#define	REBOOTADDR	(0x1c00)		/* reboot code - physical address */
 #define	MACHADDR	(KZERO+0x2000)		/* Mach structure */
 #define	L2		(KZERO+0x3000)		/* L2 ptes for vectors etc */
 #define	VCBUFFER	(KZERO+0x3400)		/* videocore mailbox buffer */
 #define	FIQSTKTOP	(KZERO+0x4000)		/* FIQ stack */
 #define	L1		(KZERO+0x4000)		/* tt ptes: 16KiB aligned */
 #define	KTZERO		(KZERO+0x8000)		/* kernel text start */
-#define VIRTIO		(0x7E000000)		/* i/o registers */
-#define	ARMLOCAL	(0x7F000000)		/* armv7 only */
+#define	VIRTPCI		0xFD000000		/* pcie address space (pi4 only) */
+#define VIRTIO		0xFE000000		/* i/o registers */
+#define	IOSIZE		(10*MiB)
+#define	ARMLOCAL	(VIRTIO+IOSIZE)		/* armv7 only */
 #define	VGPIO		(ARMLOCAL+MiB)		/* virtual gpio for pi3 ACT LED */
-#define	FRAMEBUFFER	0xC0000000		/* video framebuffer */
+#define	FRAMEBUFFER	(VGPIO+MiB)		/* video framebuffer */
 
 #define	UZERO		0			/* user segment */
 #define	UTZERO		(UZERO+BY2PG)		/* user text start */
+#define UTROUND(t)	ROUNDUP((t), BY2PG)
 #define	USTKTOP		0x40000000		/* user segment end +1 */
 #define	USTKSIZE	(8*1024*1024)		/* user stack size */
+#define	TSTKTOP		(USTKTOP-USTKSIZE)	/* sysexec temporary stack */
+#define	TSTKSIZ	 	256
+
+/* address at which to copy and execute rebootcode */
+#define	REBOOTADDR	(KZERO+0x1800)
 
 /*
  * Legacy...
  */
 #define BLOCKALIGN	64			/* only used in allocb.c */
+#define KSTACK		KSTKSIZE
 
 /*
  * Sizes
@@ -70,6 +76,7 @@
 #define BI2BY		8			/* bits per byte */
 #define BY2SE		4
 #define BY2WD		4
+#define BI2WD		32
 #define BY2V		8			/* only used in xalloc.c */
 
 #define	PTEMAPMEM	(1024*1024)
@@ -79,15 +86,13 @@
 #define	PPN(x)		((x)&~(BY2PG-1))
 
 /*
- * These bits are completely artificial.
  * With a little work these move to port.
  */
 #define	PTEVALID	(1<<0)
 #define	PTERONLY	0
 #define	PTEWRITE	(1<<1)
-#define	PTECACHED	0
 #define	PTEUNCACHED	(1<<2)
-#define	PTENOEXEC	(1<<4)
+#define PTEKERNEL	(1<<3)
 
 /*
  * Physical machine information from here on.
@@ -95,6 +100,3 @@
  *	BUS  addresses as seen from the videocore gpu.
  */
 #define	PHYSDRAM	0
-
-#define MIN(a, b)	((a) < (b)? (a): (b))
-#define MAX(a, b)	((a) > (b)? (a): (b))

@@ -27,7 +27,7 @@ codgen(Node *n, Node *nn)
 	sp = p;
 
 	if(typecmplx[thisfn->link->etype]) {
-		if(nodret == Z) {
+		if(nodret == nil) {
 			nodret = new(ONAME, Z, Z);
 			nodret->sym = slookup(".ret");
 			nodret->class = CPARAM;
@@ -165,22 +165,6 @@ loop:
 		cgen(n, Z);
 		break;
 
-	case OFUNC:
-		complex(n);
-		cgen(n, Z);
-		if(n->type == nil || (n->type->garb & GNORET) == 0)
-			break;
-
-		canreach = 0;
-		warnreach = !suppress;
-		/* existing assumption that branches are at least two jumps */
-		scc = pc;
-		gbranch(OGOTO);
-		patch(p, pc);
-		gbranch(OGOTO);
-		patch(p, scc);
-		break;
-
 	case OLIST:
 	case OCOMMA:
 		gen(n->left);
@@ -304,7 +288,7 @@ loop:
 		if(l->type == T)
 			break;
 		if(!typeswitch[l->type->etype]) {
-			diag(n, "switch expression must be integer");
+			diag(n, "switch expression must be integer (not vlong)");
 			break;
 		}
 
@@ -589,8 +573,8 @@ bcomplex(Node *n, Node *c)
 	}
 	if(c != Z && n->op == OCONST && deadheads(c))
 		return 1;
-	/* this is not quite right yet, so ignore it for now */
-	if(0 && newvlongcode && typev[n->type->etype] && machcap(Z)) {
+	if(newvlongcode && typev[n->type->etype] && machcap(Z)) {
+		nod = znode;
 		b = &nod;
 		b->op = ONE;
 		b->left = n;
@@ -598,7 +582,8 @@ bcomplex(Node *n, Node *c)
 		*b->right = *nodconst(0);
 		b->right->type = n->type;
 		b->type = types[TLONG];
-		cgen(b, Z);
+		xcom(b);
+		boolgen(b, 1, Z);
 		return 0;
 	}
 	bool64(n);

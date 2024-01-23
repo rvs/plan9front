@@ -142,7 +142,7 @@ loop:
 		return;
 	if(p->as == ATEXT)
 		curtext = p;
-	if(p->as == AJMP || p->as == AJMPF)
+	if(p->as == AJMP)
 	if((q = p->pcond) != P) {
 		p->mark = 1;
 		p = q;
@@ -233,7 +233,7 @@ loop:
 	if(a != ACALL) {
 		q = brchain(p->link);
 		if(q != P && q->mark)
-		if(a != ALOOP && a != ATEXT) {
+		if(a != ALOOP) {
 			p->as = relinv(a);
 			p->link = p->pcond;
 			p->pcond = q;
@@ -273,6 +273,7 @@ relinv(int a)
 	case AJOS:	return AJOC;
 	case AJOC:	return AJOS;
 	}
+	/* this results in a suicide by nil deref at the end of span() */
 	diag("unknown relation: %s in %s", anames[a], TNAME);
 	return a;
 }
@@ -319,7 +320,7 @@ patch(void)
 	for(p = firstp; p != P; p = p->link) {
 		if(p->as == ATEXT)
 			curtext = p;
-		if(p->as == ACALL || p->as == ARET || p->as == AJMPF) {
+		if(p->as == ACALL || p->as == ARET) {
 			s = p->to.sym;
 			if(s) {
 				if(debug['c'])
@@ -507,10 +508,8 @@ dostkoff(void)
 		if(p->as == ATEXT) {
 			curtext = p;
 			autoffset = p->to.offset;
-			if(autoffset < 0) {
+			if(autoffset < 0)
 				autoffset = 0;
-				p->to.offset = 0;
-			}
 			if(autoffset) {
 				p = appendp(p);
 				p->as = AADJSP;

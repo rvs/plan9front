@@ -1,3 +1,6 @@
+#pragma	src	"/sys/src/libip"
+#pragma	lib	"libip.a"
+
 typedef struct	Conv	Conv;
 typedef struct	Fragment4 Fragment4;
 typedef struct	Fragment6 Fragment6;
@@ -15,18 +18,16 @@ typedef struct	Ipmulti	Ipmulti;
 typedef struct	Ipifc	Ipifc;
 typedef struct	Iphash	Iphash;
 typedef struct	Ipht	Ipht;
-typedef struct	Ndb	Ndb;
 typedef struct	Netlog	Netlog;
 typedef struct	Medium	Medium;
 typedef struct	Proto	Proto;
 typedef struct	Arpent	Arpent;
 typedef struct	Arp Arp;
 typedef struct	Route	Route;
-typedef struct	Routehint Routehint;
-typedef struct	Translation Translation;
 
 typedef struct	Routerparams	Routerparams;
-typedef struct 	Hostparams	Hostparams;
+typedef struct	Hostparams	Hostparams;
+typedef struct	v6router	v6router;
 typedef struct	v6params	v6params;
 
 #pragma incomplete Arp
@@ -39,9 +40,9 @@ enum
 {
 	Addrlen=	64,
 	Maxproto=	20,
-	Maxincall=	10,
+	Maxincall=	64,	/* max. conn.s in listen q not accepted yet */
 	Nchans=		1024,
-	MAClen=		8,		/* longest mac address */
+	MAClen=		16,		/* longest mac address */
 
 	MAXTTL=		255,
 	DFLTTOS=	0,
@@ -54,15 +55,13 @@ enum
 	/* ip versions */
 	V4=		4,
 	V6=		6,
-	IP_VER4= 	0x40,
+	IP_VER4=	0x40,
 	IP_VER6=	0x60,
 	IP_HLEN4=	5,		/* v4: Header length in words */
 	IP_DF=		0x4000,		/* v4: Don't fragment */
 	IP_MF=		0x2000,		/* v4: More fragments */
-	IP_FO=		0x1fff,		/* v4: Fragment offset */
-	IP4HDR=		IP_HLEN4<<2,	/* sizeof(Ip4hdr) */
+	IP4HDR=		20,		/* sizeof(Ip4hdr) */
 	IP_MAX=		64*1024,	/* Max. Internet packet size, v4 & v6 */
-	v4MINTU=	68,		/* The minimum MTU for IPv4 is 68 bytes */
 
 	/* 2^Lroot trees in the root table */
 	Lroot=		10,
@@ -109,26 +108,28 @@ struct Fragment4
 {
 	Block*	blist;
 	Fragment4*	next;
-	ulong 	src;
-	ulong 	dst;
+	ulong	src;
+	ulong	dst;
 	ushort	id;
-	ulong 	age;
+	ulong	age;
 };
 
 struct Fragment6
 {
 	Block*	blist;
 	Fragment6*	next;
-	uchar 	src[IPaddrlen];
-	uchar 	dst[IPaddrlen];
+	uchar	src[IPaddrlen];
+	uchar	dst[IPaddrlen];
 	uint	id;
-	ulong 	age;
+	ulong	age;
 };
 
+/* this is packet layout, so can't tolerate bogus padding */
 struct Ipfrag
 {
 	ushort	foff;
 	ushort	flen;
+
 	uchar	payload[];
 };
 
@@ -153,6 +154,7 @@ struct IP
 };
 
 /* on the wire packet header */
+/* this is packet layout, so can't tolerate bogus padding */
 struct Ip4hdr
 {
 	uchar	vihl;		/* Version and header length */
@@ -160,90 +162,12 @@ struct Ip4hdr
 	uchar	length[2];	/* packet length */
 	uchar	id[2];		/* ip->identification */
 	uchar	frag[2];	/* Fragment information */
-	uchar	ttl;      	/* Time to live */
+	uchar	ttl;		/* Time to live */
 	uchar	proto;		/* Protocol */
 	uchar	cksum[2];	/* Header checksum */
 	uchar	src[4];		/* IP source */
 	uchar	dst[4];		/* IP destination */
 };
-
-/*
- *  cache for route and arp table lookups.
- *  one per Conv so conversations with a
- *  fixed target can avoid the per packet
- *  lookup overhead.
- */ 
-struct Routehint
-{
-	Route	*r;			/* last route used */
-	ulong	rgen;			/* routetable generation for *r */
-	Arpent	*a;			/* last arp entry used */
-};
-
-/*
- *  hash table for 2 ip addresses + 2 ports
- */
-enum
-{
-	Nipht=		521,	/* convenient prime */
-
-	IPmatchexact=	0,	/* match on 4 tuple */
-	IPmatchany,		/* *!* */
-	IPmatchport,		/* *!port */
-	IPmatchaddr,		/* addr!* */
-	IPmatchpa,		/* addr!port */
-};
-
-struct Iphash
-{
-	Iphash	*nextiphash;
-
-	uchar	trans;			/* 0 = conv, 1 = foward, 2 = backward */
-	uchar	match;
-	ushort	lport;			/* local port number */
-	ushort	rport;			/* remote port number */
-	uchar	laddr[IPaddrlen];	/* local IP address */
-	uchar	raddr[IPaddrlen];	/* remote IP address */
-};
-
-struct Ipht
-{
-	Lock;
-	Iphash	*tab[Nipht];
-};
-
-void iphtadd(Ipht*, Iphash*);
-void iphtrem(Ipht*, Iphash*);
-Iphash *iphtlook(Ipht *ht, uchar *sa, ushort sp, uchar *da, ushort dp);
-
-/*
- * NAT entry.
- *
- * This holds the 5 tuple as two Iphashes.
- * The "forward" hash matches the the packets from
- * the source that need to be translated and
- * "backward" matches the packets coming back
- * from the destination.
- */
-struct Translation
-{
-	Translation *next;
-	Translation **link;
-
-	ulong	time;
-
-	Iphash	forward;
-#define iphforward(h) ((Translation*)((char*)(h) - (char*)&((Translation*)0)->forward))
-
-	Iphash	backward;
-#define iphbackward(h) ((Translation*)((char*)(h) - (char*)&((Translation*)0)->backward))
-
-	/* used for forwarding to the source */
-	Routehint;
-};
-
-Translation *transforward(Proto *p, Ipht *ht, uchar *sa, int sp, uchar *da, int dp, Route *r);
-Translation *transbackward(Proto *p, Iphash *iph);
 
 /*
  *  one per conversation directory
@@ -255,15 +179,16 @@ struct Conv
 	int	x;			/* conversation index */
 	Proto*	p;
 
+	int	restricted;		/* remote port is restricted */
 	uint	ttl;			/* max time to live */
 	uint	tos;			/* type of service */
+	int	ignoreadvice;		/* don't terminate connection on icmp errors */
 
-	uchar	restricted;		/* remote port is restricted */
-	uchar	ignoreadvice;		/* don't terminate connection on icmp errors */
 	uchar	ipversion;
-
-	Iphash;
-#define iphconv(h) ((Conv*)((char*)(h) - (char*)&((Conv*)0)->Iphash))
+	uchar	laddr[IPaddrlen];	/* local IP address */
+	uchar	raddr[IPaddrlen];	/* remote IP address */
+	ushort	lport;			/* local port number */
+	ushort	rport;			/* remote port number */
 
 	char	*owner;			/* protections */
 	int	perm;
@@ -271,8 +196,11 @@ struct Conv
 	int	length;
 	int	state;
 
+	int	maxfragsize;		/* If set, used for fragmentation */
+
 	/* udp specific */
 	int	headers;		/* data src/dst headers in udp */
+	int	reliable;		/* true if reliable udp */
 
 	Conv*	incall;			/* calls waiting to be listened for */
 	Conv*	next;
@@ -283,6 +211,7 @@ struct Conv
 	Queue*	sq;			/* snooping queue */
 	Ref	snoopers;		/* number of processes with snoop open */
 
+	QLock	car;
 	Rendez	cr;
 	char	cerr[ERRMAX];
 
@@ -293,7 +222,8 @@ struct Conv
 
 	void*	ptcl;			/* protocol specific stuff */
 
-	Routehint;
+	Route	*r;			/* last route used */
+	ulong	rgen;			/* routetable generation for *r */
 };
 
 struct Medium
@@ -302,20 +232,30 @@ struct Medium
 	int	hsize;		/* medium header size */
 	int	mintu;		/* default min mtu */
 	int	maxtu;		/* default max mtu */
-	int	maclen;		/* mac address length  */
+	int	maclen;		/* mac address length */
 	void	(*bind)(Ipifc*, int, char**);
 	void	(*unbind)(Ipifc*);
-	void	(*bwrite)(Ipifc *ifc, Block *b, int version, uchar *ip, Routehint *rh);
+	void	(*bwrite)(Ipifc *ifc, Block *b, int version, uchar *ip);
 
 	/* for arming interfaces to receive multicast */
 	void	(*addmulti)(Ipifc *ifc, uchar *a, uchar *ia);
-	void	(*delmulti)(Ipifc *ifc, uchar *a, uchar *ia);
+	void	(*remmulti)(Ipifc *ifc, uchar *a, uchar *ia);
 
 	/* process packets written to 'data' */
 	void	(*pktin)(Fs *f, Ipifc *ifc, Block *bp);
 
+	/* routes for router boards */
+	void	(*addroute)(Ipifc *ifc, int, uchar*, uchar*, uchar*, int);
+	void	(*remroute)(Ipifc *ifc, int, uchar*, uchar*);
+	void	(*flushroutes)(Ipifc *ifc);
+
+	/* for routing multicast groups */
+	void	(*joinmulti)(Ipifc *ifc, uchar *a, uchar *ia);
+	void	(*leavemulti)(Ipifc *ifc, uchar *a, uchar *ia);
+
 	/* address resolution */
-	void	(*areg)(Fs *f, Ipifc *ifc, Iplifc *lifc, uchar *ip);
+	void	(*ares)(Fs*, int, uchar*, uchar*, int, int);	/* resolve */
+	void	(*areg)(Ipifc*, uchar*);			/* register */
 
 	/* v6 address generation */
 	void	(*pref2addr)(uchar *pref, uchar *ea);
@@ -330,13 +270,12 @@ struct Iplifc
 	uchar	mask[IPaddrlen];
 	uchar	remote[IPaddrlen];
 	uchar	net[IPaddrlen];
-	uchar	type;		/* route type */
 	uchar	tentative;	/* =1 => v6 dup disc on, =0 => confirmed unique */
 	uchar	onlink;		/* =1 => onlink, =0 offlink. */
 	uchar	autoflag;	/* v6 autonomous flag */
-	ulong 	validlt;	/* v6 valid lifetime */
-	ulong 	preflt;		/* v6 preferred lifetime */
-	ulong	origint;	/* time when addr was added */
+	long	validlt;	/* v6 valid lifetime */
+	long	preflt;		/* v6 preferred lifetime */
+	long	origint;	/* time when addr was added */
 	Iplink	*link;		/* addresses linked to this lifc */
 	Iplifc	*next;
 };
@@ -347,9 +286,9 @@ struct Iplink
 	Ipself	*self;
 	Iplifc	*lifc;
 	Iplink	*selflink;	/* next link for this local address */
-	Iplink	*lifclink;	/* next link for this lifc */
-	Iplink	*next;		/* free list */
+	Iplink	*lifclink;	/* next link for this ifc */
 	ulong	expire;
+	Iplink	*next;		/* free list */
 	int	ref;
 };
 
@@ -359,7 +298,7 @@ struct Iplink
 struct Routerparams {
 	int	mflag;		/* flag: managed address configuration */
 	int	oflag;		/* flag: other stateful configuration */
-	int 	maxraint;	/* max. router adv interval (ms) */
+	int	maxraint;	/* max. router adv interval (ms) */
 	int	minraint;	/* min. router adv interval (ms) */
 	int	linkmtu;	/* mtu options */
 	int	reachtime;	/* reachable time */
@@ -378,14 +317,19 @@ struct Ipifc
 
 	Conv	*conv;		/* link to its conversation structure */
 	char	dev[64];	/* device we're attached to */
-	Medium	*m;		/* Media pointer */
+	Medium	*medium;	/* Media pointer */
 	int	maxtu;		/* Maximum transfer unit */
+	int	mintu;		/* Minumum tranfer unit */
+	int	mbps;		/* megabits per second */
 	void	*arg;		/* medium specific */
+	int	reassemble;	/* reassemble IP packets before forwarding */
 
-	uchar	reflect;	/* allow forwarded packets to go out the same interface */
-	uchar	reassemble;	/* reassemble IP packets before forwarding to this interface */
-	
+	/* these are used so that we can unbind on the fly */
+	Lock	idlock;
 	uchar	ifcid;		/* incremented each 'bind/unbind/add/remove' */
+	int	ref;		/* number of proc's using this ipifc */
+	Rendez	wait;		/* where unbinder waits for ref == 0 */
+	int	unbinding;
 
 	uchar	mac[MAClen];	/* MAC address */
 
@@ -398,12 +342,6 @@ struct Ipifc
 	uchar	recvra6;	/* flag: recv router advs on this ifc */
 	Routerparams rp;	/* router parameters as in RFC 2461, pp.40—43.
 					used only if node is router */
-
-	int	speed;		/* link speed in bits per second */
-	int	delay;		/* burst delay in ms */
-	int	burst;		/* burst delay in bytes */
-	int	load;		/* bytes in flight */
-	ulong	ticks;
 };
 
 /*
@@ -415,6 +353,34 @@ struct Ipmulti
 	uchar	ia[IPaddrlen];
 	Ipmulti	*next;
 };
+
+/*
+ *  hash table for 2 ip addresses + 2 ports
+ */
+enum
+{
+	Nipht=		521,	/* convenient prime */
+
+	IPmatchexact=	0,	/* match on 4 tuple */
+	IPmatchany,		/* *!* */
+	IPmatchport,		/* *!port */
+	IPmatchaddr,		/* addr!* */
+	IPmatchpa,		/* addr!port */
+};
+struct Iphash
+{
+	Iphash	*next;
+	Conv	*c;
+	int	match;
+};
+struct Ipht
+{
+	Lock;
+	Iphash	*tab[Nipht];
+};
+void iphtadd(Ipht*, Conv*);
+void iphtrem(Ipht*, Conv*);
+Conv* iphtlook(Ipht *ht, uchar *sa, ushort sp, uchar *da, ushort dp);
 
 /*
  *  one per multiplexed protocol
@@ -434,7 +400,7 @@ struct Proto
 	void		(*close)(Conv*);
 	void		(*rcv)(Proto*, Ipifc*, Block*);
 	char*		(*ctl)(Conv*, char**, int);
-	void		(*advise)(Proto*, Block*, Ipifc*, char*);
+	void		(*advise)(Proto*, Block*, char*);
 	int		(*stats)(Proto*, char*, int);
 	int		(*local)(Conv*, char*, int);
 	int		(*remote)(Conv*, char*, int);
@@ -449,23 +415,9 @@ struct Proto
 	Qid		qid;		/* qid for protocol directory */
 	ushort		nextrport;
 
-	/* network address translation */
-	Translation*	translations;
-	Block*		(*forward)(Proto*, Block*, Route*);
-
 	void		*priv;
 };
 
-int unusedlport(Proto *p);
-
-struct Ndb
-{
-	QLock;
-	char	*buf;
-	int	len;
-	int	vers;
-	long	mtime;
-};
 
 /*
  *  one per IP protocol stack
@@ -478,7 +430,7 @@ struct Fs
 	int	np;
 	Proto*	p[Maxproto+1];		/* list of supported protocols */
 	Proto*	t2p[256];		/* vector of all protocols */
-	Proto*	ipifc;			/* kludge for findipifc */
+	Proto*	ipifc;			/* kludge for ipifcremroute & ipifcaddroute */
 	Proto*	ipmux;			/* kludge for finding an ip multiplexor */
 
 	IP	*ip;
@@ -492,13 +444,28 @@ struct Fs
 
 	Netlog	*alog;
 
-	Ndb	ndb;			/* an ndb entry for this interface */
+	char	ndb[1024];		/* an ndb entry for this interface */
+	int	ndbvers;
+	long	ndbmtime;
+};
+
+/* one per default router known to host */
+struct v6router {
+	uchar	inuse;
+	Ipifc	*ifc;
+	int	ifcid;
+	uchar	routeraddr[IPaddrlen];
+	long	ltorigin;
+	Routerparams	rp;
 };
 
 struct v6params
 {
 	Routerparams	rp;		/* v6 params, one copy per node now */
 	Hostparams	hp;
+	v6router	v6rlist[3];	/* max 3 default routers, currently */
+	int		cdrouter;	/* uses only v6rlist[cdrouter] if */
+					/* cdrouter >= 0. */
 };
 
 
@@ -523,11 +490,9 @@ enum
 	Logip=		1<<1,
 	Logtcp=		1<<2,
 	Logfs=		1<<3,
-	Logil=		1<<4,
 	Logicmp=	1<<5,
 	Logudp=		1<<6,
 	Logcompress=	1<<7,
-	Logilmsg=	1<<8,
 	Loggre=		1<<9,
 	Logppp=		1<<10,
 	Logtcprxmt=	1<<11,
@@ -538,7 +503,6 @@ enum
 	Logrudpmsg=	1<<16,
 	Logesp=		1<<17,
 	Logtcpwin=	1<<18,
-	Logtrans=	1<<19,
 };
 
 void	netloginit(Fs*);
@@ -559,11 +523,13 @@ void	ifclogclose(Fs*, Chan*);
  *  iproute.c
  */
 typedef	struct RouteTree RouteTree;
+typedef struct Routewalk Routewalk;
 typedef struct V4route V4route;
 typedef struct V6route V6route;
 
 enum
 {
+
 	/* type bits */
 	Rv4=		(1<<0),		/* this is a version 4 route */
 	Rifc=		(1<<1),		/* this route is a directly connected interface */
@@ -572,20 +538,27 @@ enum
 	Rbcast=		(1<<4),		/* a broadcast self address */
 	Rmulti=		(1<<5),		/* a multicast self address */
 	Rproxy=		(1<<6),		/* this route should be proxied */
-	Rtrans=		(1<<7),		/* this route translates source address (NAT) */
+};
 
-	Rsrc=		(1<<8),		/* source specific route */
+struct Routewalk
+{
+	int	o;
+	int	h;
+	char*	p;
+	char*	e;
+	void*	state;
+	void	(*walk)(Route*, Routewalk*);
 };
 
 struct	RouteTree
 {
-	Route	*mid;
-	Route	*left;
-	Route	*right;
-	Ipifc	*ifc;
-	uchar	ifcid;		/* must match ifc->ifcid */
+	Route*	right;
+	Route*	left;
+	Route*	mid;
 	uchar	depth;
-	ushort	type;
+	uchar	type;
+	uchar	ifcid;		/* must match ifc->id */
+	Ipifc	*ifc;
 	char	tag[4];
 	int	ref;
 };
@@ -594,10 +567,6 @@ struct V4route
 {
 	ulong	address;
 	ulong	endaddress;
-
-	ulong	source;
-	ulong	endsource;
-
 	uchar	gate[IPv4addrlen];
 };
 
@@ -605,10 +574,6 @@ struct V6route
 {
 	ulong	address[IPllen];
 	ulong	endaddress[IPllen];
-
-	ulong	source[IPllen];
-	ulong	endsource[IPllen];
-
 	uchar	gate[IPaddrlen];
 };
 
@@ -621,17 +586,17 @@ struct Route
 		V4route v4;
 	};
 };
-
-extern void	addroute(Fs *f, uchar *a, uchar *mask, uchar *s, uchar *smask, uchar *gate, int type, Ipifc *ifc, char *tag);
-extern void	delroute(Fs *f, uchar *a, uchar *mask, uchar *s, uchar *smask, uchar *gate, int type, Ipifc *ifc, char *tag);
-extern Route*	v4lookup(Fs *f, uchar *a, uchar *s, Routehint *rh);
-extern Route*	v6lookup(Fs *f, uchar *a, uchar *s, Routehint *rh);
-extern Route*	v4source(Fs *f, uchar *a, uchar *s);
-extern Route*	v6source(Fs *f, uchar *a, uchar *s);
+extern void	v4addroute(Fs *f, char *tag, uchar *a, uchar *mask, uchar *gate, int type);
+extern void	v6addroute(Fs *f, char *tag, uchar *a, uchar *mask, uchar *gate, int type);
+extern void	v4delroute(Fs *f, uchar *a, uchar *mask, int dolock);
+extern void	v6delroute(Fs *f, uchar *a, uchar *mask, int dolock);
+extern Route*	v4lookup(Fs *f, uchar *a, Conv *c);
+extern Route*	v6lookup(Fs *f, uchar *a, Conv *c);
 extern long	routeread(Fs *f, char*, ulong, int);
 extern long	routewrite(Fs *f, Chan*, char*, int);
-extern void	flushrouteifc(Fs *f, Ipifc *ifc);
-extern void	routetype(int type, char p[8]);
+extern void	routetype(int, char*);
+extern void	ipwalkroutes(Fs*, Routewalk*);
+extern void	convroute(Route*, uchar*, uchar*, uchar*, char*, int*);
 
 /*
  *  devip.c
@@ -656,37 +621,35 @@ struct Arpent
 {
 	uchar	ip[IPaddrlen];
 	uchar	mac[MAClen];
-	Arpent	*hash;
-	Arpent	*nextrxt;		/* re-transmit chain */
-	Block	*hold;
-	Block	*last;
-	Ipifc	*ifc;
-	uchar	ifcid;			/* must match ifc->ifcid */
+	Medium	*type;			/* media type */
+	Arpent*	hash;
+	Block*	hold;
+	Block*	last;
+	uint	ctime;			/* time entry was created or refreshed */
+	uint	utime;			/* time entry was last used */
 	uchar	state;
-	uchar	rxtsrem;		/* re-tranmissions remaining */
-	ulong	ctime;			/* time entry was created or refreshed */
-	ulong	utime;			/* time entry was last used */
+	Arpent	*nextrxt;		/* re-transmit chain */
+	uint	rtime;			/* time for next retransmission */
+	uchar	rxtsrem;
+	Ipifc	*ifc;
+	uchar	ifcid;			/* must match ifc->id */
 };
 
 extern void	arpinit(Fs*);
 extern int	arpread(Arp*, char*, ulong, int);
 extern int	arpwrite(Fs*, char*, int);
-extern Arpent*	arpget(Arp*, Block *bp, int version, Ipifc *ifc, uchar *ip, uchar *mac, Routehint *rh);
+extern Arpent*	arpget(Arp*, Block *bp, int version, Ipifc *ifc, uchar *ip, uchar *h);
 extern void	arprelease(Arp*, Arpent *a);
-extern void	arpcontinue(Arp*, Arpent *a);
-extern Block*	arpresolve(Arp*, Arpent *a, uchar *mac, Routehint *rh);
-extern int	arpenter(Fs*, int version, uchar *ip, uchar *mac, int maclen, uchar *ia, Ipifc *ifc, int refresh);
-extern int	arpforme(Fs*, int version, uchar *targ, uchar *src, Ipifc *ifc);
-extern void	ndpsendsol(Fs*, Arpent*);
+extern Block*	arpresolve(Arp*, Arpent *a, Medium *type, uchar *mac);
+extern void	arpenter(Fs*, int version, uchar *ip, uchar *mac, int len, int norefresh);
 
 /*
  * ipaux.c
  */
 
-extern int	parseether(uchar*, char*);
+extern int	myetheraddr(uchar*, char*);
 extern vlong	parseip(uchar*, char*);
-extern vlong	parseipmask(uchar*, char*, int);
-extern vlong	parseipandmask(uchar*, uchar*, char*, char*);
+extern vlong	parseipmask(uchar*, char*);
 extern char*	v4parseip(uchar*, char*);
 extern void	maskip(uchar *from, uchar *mask, uchar *to);
 extern int	parsemac(uchar *to, char *from, int len);
@@ -695,13 +658,9 @@ extern int	isv4(uchar*);
 extern void	v4tov6(uchar *v6, uchar *v4);
 extern int	v6tov4(uchar *v4, uchar *v6);
 extern int	eipfmt(Fmt*);
-extern int	ipismulticast(uchar *ip);
-extern int	convipvers(Conv *c);
-extern void	hnputs_csum(void *p, ushort v, uchar *pcsum);
 
 #define	ipmove(x, y) memmove(x, y, IPaddrlen)
 #define	ipcmp(x, y) ( (x)[IPaddrlen-1] != (y)[IPaddrlen-1] || memcmp(x, y, IPaddrlen) )
-#define	isv4mcast(ip4)	((ip4)[0] >= 0xe0 && (ip4)[0] < 0xf0)
 
 extern uchar IPv4bcast[IPaddrlen];
 extern uchar IPv4bcastobs[IPaddrlen];
@@ -711,7 +670,7 @@ extern uchar IPnoaddr[IPaddrlen];
 extern uchar v4prefix[IPaddrlen];
 extern uchar IPallbits[IPaddrlen];
 
-#define	NOW	TK2MS(MACHP(0)->ticks)
+#define	NOW	TK2MS(sys->ticks)
 
 /*
  *  media
@@ -725,61 +684,48 @@ extern Medium	pktmedium;
  */
 extern Medium*	ipfindmedium(char *name);
 extern void	addipmedium(Medium *med);
-extern void	ipifcoput(Ipifc *ifc, Block *bp, int version, uchar *ip, Routehint *rh);
 extern int	ipforme(Fs*, uchar *addr);
-extern Ipifc*	findipifc(Fs*, uchar *local, uchar *remote, int type);
-extern Ipifc*	findipifcstr(Fs *f, char *s);
+extern int	iptentative(Fs*, uchar *addr);
+extern int	ipisbm(uchar *);
+extern int	ipismulticast(uchar *);
+extern Ipifc*	findipifc(Fs*, uchar *remote, int type);
 extern void	findlocalip(Fs*, uchar *local, uchar *remote);
-extern int	ipv4local(Ipifc *ifc, uchar *local, int prefixlen, uchar *remote);
-extern int	ipv6local(Ipifc *ifc, uchar *local, int prefixlen, uchar *remote);
+extern int	ipv4local(Ipifc *ifc, uchar *addr);
+extern int	ipv6local(Ipifc *ifc, uchar *addr);
+extern int	ipv6anylocal(Ipifc *ifc, uchar *addr);
 extern Iplifc*	iplocalonifc(Ipifc *ifc, uchar *ip);
-extern Iplifc*	ipremoteonifc(Ipifc *ifc, uchar *ip);
-extern Ipmulti*	ipifcgetmulti(Fs *f, Ipifc *ifc, uchar *ma);
+extern int	ipproxyifc(Fs *f, Ipifc *ifc, uchar *ip);
+extern int	ipismulticast(uchar *ip);
+extern int	ipisbooting(void);
+extern int	ipifccheckin(Ipifc *ifc, Medium *med);
+extern void	ipifccheckout(Ipifc *ifc);
+extern int	ipifcgrab(Ipifc *ifc);
+extern void	ipifcaddroute(Fs*, int, uchar*, uchar*, uchar*, int);
+extern void	ipifcremroute(Fs*, int, uchar*, uchar*);
+extern void	ipifcremmulti(Conv *c, uchar *ma, uchar *ia);
 extern void	ipifcaddmulti(Conv *c, uchar *ma, uchar *ia);
-extern void	ipifcdelmulti(Conv *c, uchar *ma, uchar *ia);
+extern char*	ipifcrem(Ipifc *ifc, char **argv, int argc);
 extern char*	ipifcadd(Ipifc *ifc, char **argv, int argc, int tentative, Iplifc *lifcp);
-extern char*	ipifcdel(Ipifc *ifc, char **argv, int argc);
 extern long	ipselftabread(Fs*, char *a, ulong offset, int n);
 extern char*	ipifcadd6(Ipifc *ifc, char**argv, int argc);
-extern char*	ipifcdel6(Ipifc *ifc, char**argv, int argc);
-extern char*	mediumunbindifc(Ipifc *ifc);
-
 /*
  *  ip.c
  */
 extern void	iprouting(Fs*, int);
-extern void	icmpnohost(Fs*, Ipifc*, Block*, Routehint*);
-extern void	icmpnoconv(Fs*, Ipifc*, Block*);
-extern void	icmpcantfrag(Fs*, Ipifc*, Block*, int);
-extern void	icmpttlexceeded(Fs*, Ipifc*, Block*);
-extern void	icmpproxyadvice(Fs*, Ipifc*, Block*, uchar*);
-
+extern void	icmpnoconv(Fs*, Block*);
+extern void	icmpcantfrag(Fs*, Block*, int);
+extern void	icmpttlexceeded(Fs*, uchar*, Block*);
 extern ushort	ipcsum(uchar*);
 extern void	ipiput4(Fs*, Ipifc*, Block*);
 extern void	ipiput6(Fs*, Ipifc*, Block*);
-extern int	ipoput4(Fs*, Block*, Ipifc*, int, int, Routehint*);
-extern int	ipoput6(Fs*, Block*, Ipifc*, int, int, Routehint*);
+extern int	ipoput4(Fs*, Block*, int, int, int, Conv*);
+extern int	ipoput6(Fs*, Block*, int, int, int, Conv*);
 extern int	ipstats(Fs*, char*, int);
 extern ushort	ptclbsum(uchar*, int);
 extern ushort	ptclcsum(Block*, int, int);
 extern void	ip_init(Fs*);
-extern void	ip_init_6(Fs*);
-
-/*
- *  tcp.c
- */
-extern void	tcpmssclamp(uchar*, int, int);
-
-/*
- * bootp.c
- */
-extern int	bootpread(char*, ulong, int);
-
-/*
- *  resolving inferno/plan9 differences
- */
-char*		commonuser(void);
-char*		commonerror(void);
+extern void	update_mtucache(uchar*, ulong);
+extern ulong	restrict_mtu(uchar*, ulong);
 
 /*
  * chandial.c
@@ -789,4 +735,4 @@ extern Chan*	chandial(char*, char*, char*, Chan**);
 /*
  *  global to all of the stack
  */
-extern void	(*multicastreportfn)(Fs*, Ipifc*, uchar*, uchar*, int);
+extern void	(*igmpreportfn)(Ipifc*, uchar*);

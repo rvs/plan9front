@@ -24,19 +24,55 @@ setkernur(Ureg* ureg, Proc* p)
 {
 	ureg->pc = p->sched.pc;
 	ureg->sp = p->sched.sp+4;
-	ureg->r14 = (uintptr)sched;
+	ureg->r14 = PTR2UINT(sched);
 }
 
 /*
- * called in sysfile.c
+ * called in syscallfmt.c, sysfile.c, sysproc.c
  */
 void
-evenaddr(uintptr addr)
+validalign(uintptr addr, unsigned align)
 {
-	if(addr & 3){
-		postnote(up, 1, "sys: odd address", NDebug);
-		error(Ebadarg);
-	}
+	/*
+	 * Plan 9 is a 32-bit O/S, and the hardware it runs on
+	 * does not usually have instructions which move 64-bit
+	 * quantities directly, synthesizing the operations
+	 * with 32-bit move instructions. Therefore, the compiler
+	 * (and hardware) usually only enforce 32-bit alignment,
+	 * if at all.
+	 *
+	 * Take this out if the architecture warrants it.
+	 */
+	if(align == sizeof(vlong))
+		align = sizeof(long);
+
+	/*
+	 * Check align is a power of 2, then addr alignment.
+	 */
+	if((align != 0 && !(align & (align-1))) && !(addr & (align-1)))
+		return;
+	postnote(up, 1, "sys: odd address", NDebug);
+	error(Ebadarg);
+	/*NOTREACHED*/
+}
+
+/* go to user space */
+void
+kexit(Ureg*)
+{
+	uvlong t;
+	Tos *tos;
+
+	/* precise time accounting, kernel exit */
+	tos = (Tos*)(USTKTOP-sizeof(Tos));
+	cycles(&t);
+	tos->kcycles += t - up->kentry;
+	tos->pcycles = up->pcycles;
+	tos->cyclefreq = m->cpuhz;
+	tos->pid = up->pid;
+
+	/* make visible immediately to user proc */
+	cachedwbinvse(tos, sizeof *tos);
 }
 
 /*
@@ -55,9 +91,18 @@ userpc(void)
 void
 setregisters(Ureg* ureg, char* pureg, char* uva, int n)
 {
-	ulong v = ureg->psr;
-	memmove(pureg, uva, n);
-	ureg->psr = ureg->psr & ~(PsrMask|PsrDfiq|PsrDirq) | v & (PsrMask|PsrDfiq|PsrDirq);
+	USED(ureg, pureg, uva, n);
+}
+
+/*
+ *  this is the body for all kproc's
+ */
+static void
+linkproc(void)
+{
+	spllo();
+	up->kpfun(up->kparg);
+	pexit("kproc exiting", 0);
 }
 
 /*
@@ -65,10 +110,13 @@ setregisters(Ureg* ureg, char* pureg, char* uva, int n)
  *  dependent because of the starting stack location
  */
 void
-kprocchild(Proc *p, void (*entry)(void))
+kprocchild(Proc *p, void (*func)(void*), void *arg)
 {
-	p->sched.pc = (uintptr)entry;
-	p->sched.sp = (uintptr)p;
+	p->sched.pc = PTR2UINT(linkproc);
+	p->sched.sp = PTR2UINT(p->kstack+KSTACK);
+
+	p->kpfun = func;
+	p->kparg = arg;
 }
 
 /*
@@ -95,21 +143,19 @@ procsetup(Proc* p)
 	fpusysprocsetup(p);
 }
 
-void
-procfork(Proc* p)
-{
-	fpuprocfork(p);
-}
-
 /*
  *  Save the mach dependent part of the process state.
  */
 void
 procsave(Proc* p)
 {
+	uvlong t;
+
+	cycles(&t);
+	p->pcycles += t;
+
 // TODO: save and restore VFPv3 FP state once 5[cal] know the new registers.
 	fpuprocsave(p);
-
 	/*
 	 * Prevent the following scenario:
 	 *	pX sleeps on cpuA, leaving its page tables in mmul1
@@ -128,6 +174,13 @@ procsave(Proc* p)
 void
 procrestore(Proc* p)
 {
+	uvlong t;
+
+	if(p->kp)
+		return;
+	cycles(&t);
+	p->pcycles -= t;
+
 	fpuprocrestore(p);
 }
 
@@ -135,18 +188,4 @@ int
 userureg(Ureg* ureg)
 {
 	return (ureg->psr & PsrMask) == PsrMusr;
-}
-
-int
-cas32(void* addr, u32int old, u32int new)
-{
-	int r, s;
-
-	s = splhi();
-	if(r = (*(u32int*)addr == old))
-		*(u32int*)addr = new;
-	splx(s);
-	if (r)
-		coherence();
-	return r;
 }

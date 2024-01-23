@@ -28,6 +28,7 @@ enum {
 
 	Localctl	= 0x00,
 	Prescaler	= 0x08,
+	Localintpending	= 0x60,
 
 	SystimerFreq	= 1*Mhz,
 	MaxPeriod	= SystimerFreq / HZ,
@@ -88,6 +89,7 @@ clockintr(Ureg *ureg, void *)
 		panic("cpu%d: unexpected system timer interrupt", m->machno);
 	tn = (Systimers*)SYSTIMERS;
 	/* dismiss interrupt */
+	tn->c3 = tn->clo - 1;
 	tn->cs = 1<<3;
 	timerintr(ureg, 0);
 }
@@ -97,6 +99,7 @@ localclockintr(Ureg *ureg, void *)
 {
 	if(m->machno == 0)
 		panic("cpu0: Unexpected local generic timer interrupt");
+	cpwrtimerphysctl(Imask|Enable);
 	timerintr(ureg, 0);
 }
 
@@ -107,6 +110,10 @@ clockshutdown(void)
 
 	tm = (Armtimer*)ARMTIMER;
 	tm->ctl = 0;
+	if(cpuserver)
+		wdogfeed();
+	else
+		wdogoff();
 }
 
 void
@@ -114,22 +121,18 @@ clockinit(void)
 {
 	Systimers *tn;
 	Armtimer *tm;
-	ulong t0, t1, tstart, tend;
+	u32int t0, t1, tstart, tend;
 
-	if(((cprdsc(0, CpID, CpIDfeat, 1) >> 16) & 0xF) != 0) {
+	if(((cprdfeat1() >> 16) & 0xF) != 0) {
 		/* generic timer supported */
-		cpwrsc(0, CpTIMER, CpTIMERphys, CpTIMERphysval, ~0);
 		if(m->machno == 0){
-			cpwrsc(0, CpTIMER, CpTIMERphys, CpTIMERphysctl, Imask);
-
-			/* input clock is 19.2Mhz crystal */
+			/* input clock is 19.2MHz or 54MHz crystal */
 			*(ulong*)(ARMLOCAL + Localctl) = 0;
-			/* divide by (2^31/Prescaler) */
-			*(ulong*)(ARMLOCAL + Prescaler) = (((uvlong)SystimerFreq<<31)/19200000)&~1UL;
-		} else {
-			cpwrsc(0, CpTIMER, CpTIMERphys, CpTIMERphysctl, Enable);
-			intrenable(IRQcntpns, localclockintr, nil, BUSUNKNOWN, "clock");
+			/* divide by (2^31/Prescaler) for 1Mhz */
+			*(ulong*)(ARMLOCAL + Prescaler) =
+				(((uvlong)SystimerFreq<<31)/soc.oscfreq)&~1ULL;
 		}
+		cpwrtimerphysctl(Imask);
 	}
 
 	tn = (Systimers*)SYSTIMERS;
@@ -137,7 +140,7 @@ clockinit(void)
 	do{
 		t0 = lcycles();
 	}while(tn->clo == tstart);
-	tend = tstart + (SystimerFreq/100);
+	tend = tstart + 10000;
 	do{
 		t1 = lcycles();
 	}while(tn->clo != tend);
@@ -145,15 +148,14 @@ clockinit(void)
 	m->cpuhz = 100 * t1;
 	m->cpumhz = (m->cpuhz + Mhz/2 - 1) / Mhz;
 	m->cyclefreq = m->cpuhz;
-
 	if(m->machno == 0){
 		tn->c3 = tn->clo - 1;
-		intrenable(IRQtimer3, clockintr, nil, BUSUNKNOWN, "clock");
-
 		tm = (Armtimer*)ARMTIMER;
 		tm->load = 0;
 		tm->ctl = TmrPrescale1|CntEnable|CntWidth32;
-	}
+		intrenable(IRQtimer3, clockintr, nil, 0, "clock");
+	}else
+		intrenable(IRQcntpns, localclockintr, nil, 0, "clock");
 }
 
 void
@@ -169,9 +171,10 @@ timerset(uvlong next)
 		period = MinPeriod;
 	else if(period > MaxPeriod)
 		period = MaxPeriod;
-	if(m->machno)
-		cpwrsc(0, CpTIMER, CpTIMERphys, CpTIMERphysval, period);
-	else{
+	if(m->machno > 0){
+		cpwrtimerphysval(period);
+		cpwrtimerphysctl(Enable);
+	}else{
 		tn = (Systimers*)SYSTIMERS;
 		tn->c3 = tn->clo + period;
 	}
@@ -231,10 +234,14 @@ ulong
 void
 microdelay(int n)
 {
-	ulong now;
+	Systimers *tn;
+	u32int now, diff;
 
-	now = µs();
-	while(µs() - now < n);
+	diff = n + 1;
+	tn = (Systimers*)SYSTIMERS;
+	now = tn->clo;
+	while(tn->clo - now < diff)
+		;
 }
 
 void

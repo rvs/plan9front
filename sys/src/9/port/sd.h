@@ -1,11 +1,12 @@
 /*
  * Storage Device.
+ * SCSI is the canonical model.
  */
+#include <diskcmd.h>
+
 typedef struct SDev SDev;
-typedef struct SDfile SDfile;
 typedef struct SDifc SDifc;
 typedef struct SDio SDio;
-typedef struct SDiocmd SDiocmd;
 typedef struct SDpart SDpart;
 typedef struct SDperm SDperm;
 typedef struct SDreq SDreq;
@@ -25,20 +26,11 @@ struct SDpart {
 	ulong	vers;
 };
 
-typedef long SDrw(SDunit*, Chan*, void*, long, vlong);
-struct SDfile {
-	SDperm;
-	SDrw	*r;
-	SDrw	*w;
-};
-
 struct SDunit {
 	SDev*	dev;
 	int	subno;
 	uchar	inquiry[255];		/* format follows SCSI spec */
 	uchar	sense[18];		/* format follows SCSI spec */
-	uchar	rsense[18];		/* support seperate rq sense and inline return */
-	uchar	haversense;
 	SDperm;
 
 	QLock	ctl;
@@ -54,8 +46,6 @@ struct SDunit {
 	int	state;
 	SDreq*	req;
 	SDperm	rawperm;
-	SDfile	efile[5];
-	int	nefile;
 };
 
 /*
@@ -73,7 +63,7 @@ struct SDev {
 	int	enabled;
 	int	nunit;			/* Number of units */
 	QLock	unitlock;		/* `Loading' of units */
-	char*	unitflg;		/* Unit flags */
+	int*	unitflg;		/* Unit flags */
 	SDunit**unit;
 };
 
@@ -81,13 +71,14 @@ struct SDifc {
 	char*	name;
 
 	SDev*	(*pnp)(void);
+	SDev*	(*legacy)(int, int);
 	int	(*enable)(SDev*);
 	int	(*disable)(SDev*);
 
 	int	(*verify)(SDunit*);
 	int	(*online)(SDunit*);
 	int	(*rio)(SDreq*);
-	char*	(*rctl)(SDunit*, char*, char*);
+	int	(*rctl)(SDunit*, char*, int);
 	int	(*wctl)(SDunit*, Cmdbuf*);
 
 	long	(*bio)(SDunit*, int, int, void*, long, uvlong);
@@ -95,16 +86,13 @@ struct SDifc {
 	void	(*clear)(SDev*);
 	char*	(*rtopctl)(SDev*, char*, char*);
 	int	(*wtopctl)(SDev*, Cmdbuf*);
-	int	(*ataio)(SDreq*);
 };
 
-struct SDreq {
+struct SDreq {			/* nominally a scsi i/o request */
 	SDunit*	unit;
 	int	lun;
-	char	write;
-	char	proto;
-	char	ataproto;
-	uchar	cmd[0x20];
+	int	write;
+	uchar	cmd[16];
 	int	clen;
 	void*	data;
 	int	dlen;
@@ -113,12 +101,25 @@ struct SDreq {
 
 	int	status;
 	long	rlen;
-	uchar	sense[32];
+	uchar	sense[256];
 };
 
 enum {
 	SDnosense	= 0x00000001,
 	SDvalidsense	= 0x00010000,
+
+	SDinq0periphqual= 0xe0,
+	SDinq0periphtype= 0x1f,
+	SDinq1removable	= 0x80,
+
+	/* periphtype values */
+	SDperdisk	= 0,	/* Direct access (disk) */
+	SDpertape	= 1,	/* Sequential eg, tape */
+	SDperpr		= 2,	/* Printer */
+	SDperworm	= 4,	/* Worm */
+	SDpercd		= 5,	/* CD-ROM */
+	SDpermo		= 7,	/* rewriteable MO */
+	SDperjuke	= 8,	/* medium-changer */
 };
 
 enum {
@@ -133,88 +134,51 @@ enum {
 	SDcheck		= 0x02,		/* check condition */
 	SDbusy		= 0x08,		/* busy */
 
+	SDmedchanged	= 2,		/* from online() */
+
 	SDmaxio		= 2048*1024,
 	SDnpart		= 16,
-
-	SDread	= 0,
-	SDwrite,
-
-	SData		= 1,
-	SDcdb		= 2,
 };
 
 /*
- * Avoid extra copying by making sd buffers page-aligned for DMA.
+ * Allow the default #defines for sdmalloc & sdfree to be overridden by
+ * system-specific versions.  This can be used to avoid extra copying
+ * by making sure sd buffers are cache-aligned (some ARM systems) or
+ * page-aligned (xen) for DMA.
  */
-#define sdmalloc(n)	mallocalign(n, BY2PG, 0, 0)
+#ifndef sdmalloc
+#define sdmalloc(n)	malloc(n)
 #define sdfree(p)	free(p)
-
+#endif
 
 /*
  * mmc/sd/sdio host controller interface
  */
-
-struct SDiocmd {
-	uchar	index;
-	uchar	resp;	/* 0 = none, 1 = R1, 2 = R2, 3 = R3 ... */
-	uchar	busy;
-	uchar	data;	/* 1 = read, 2 = write, 3 = multi read, 4 = multi write */
-
-	char	*name;
-};
-
-/* Commands */
-extern SDiocmd GO_IDLE_STATE;
-extern SDiocmd SEND_OP_COND;
-extern SDiocmd ALL_SEND_CID;
-extern SDiocmd SET_RELATIVE_ADDR;
-extern SDiocmd SEND_RELATIVE_ADDR;
-extern SDiocmd SWITCH;
-extern SDiocmd SWITCH_FUNC;
-extern SDiocmd SELECT_CARD;
-extern SDiocmd SEND_EXT_CSD;
-extern SDiocmd SD_SEND_IF_COND;
-extern SDiocmd SEND_CSD;
-extern SDiocmd STOP_TRANSMISSION;
-extern SDiocmd SEND_STATUS;
-extern SDiocmd SET_BLOCKLEN;
-extern SDiocmd READ_SINGLE_BLOCK;
-extern SDiocmd READ_MULTIPLE_BLOCK;
-extern SDiocmd WRITE_SINGLE_BLOCK;
-extern SDiocmd WRITE_MULTIPLE_BLOCK;
-
-/* prefix for following app-specific commands */
-extern SDiocmd APP_CMD;
-extern SDiocmd SD_SET_BUS_WIDTH;
-extern SDiocmd SD_SEND_OP_COND;
-
 struct SDio {
 	char	*name;
-	int	(*init)(SDio*);
-	void	(*enable)(SDio*);
-	int	(*inquiry)(SDio*, char*, int);
-	int	(*cmd)(SDio*, SDiocmd*, u32int, u32int*);
-	void	(*iosetup)(SDio*, int, void*, int, int);
-	void	(*io)(SDio*, int, uchar*, int);
-	void	(*bus)(SDio*, int, int);
-	void	(*led)(SDio*, int);
-	int	(*cardintr)(SDio*, int);
-	char	nomultiwrite;	/* quirk for usdhc */
-	void	*aux;
+	int	(*init)(void);
+	void	(*enable)(void);
+	int	(*inquiry)(char*, int);
+	int	(*cmd)(ulong, ulong, ulong*);
+	void	(*iosetup)(int, void*, int, int);
+	void	(*io)(int, uchar*, int);
+	void	(*disable)(void);
 };
 
-extern void addmmcio(SDio *io);
-extern SDio* annexsdio(char*);
+extern SDio sdio;
 
 /* devsd.c */
 extern void sdadddevs(SDev*);
+extern void sdaddconf(SDunit*);
+extern void sdaddallconfs(void (*f)(SDunit*));
+extern void sdaddpart(SDunit*, char*, uvlong, uvlong);
 extern int sdsetsense(SDreq*, int, int, int, int);
-extern int sdfakescsi(SDreq*);
-extern int sdfakescsirw(SDreq*, uvlong*, int*, int*);
-extern int sdaddfile(SDunit*, char*, int, char*, SDrw*, SDrw*);
-extern void* sdannexctlr(char*, SDifc*);
+extern int sdmodesense(SDreq*, uchar*, void*, int);
+extern int sdfakescsi(SDreq*, void*, int);
 
 /* sdscsi.c */
 extern int scsiverify(SDunit*);
 extern int scsionline(SDunit*);
 extern long scsibio(SDunit*, int, int, void*, long, uvlong);
+extern SDev* scsiid(SDev*, SDifc*);
+extern void scsilbacount(uchar *, int, uvlong*, ulong*);

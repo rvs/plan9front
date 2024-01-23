@@ -281,6 +281,20 @@ isstruct(Node *a, Type *t)
 	return 0;
 }
 
+static int
+isnameoffset(Node *n, Type *t)
+{
+	if(!sametype(n->type, t))
+		return 0;
+	while(n->op == OCAST)
+		n = n->left;
+	if(n->op != OADD)
+		return 0;
+	return n->left->op == OADDR && n->left->left->op == ONAME &&
+		n->right->op == OCONST &&
+		sametype(n->left->type, n->right->type);
+}
+
 Node*
 init1(Sym *s, Type *t, long o, int exflag)
 {
@@ -373,35 +387,37 @@ init1(Sym *s, Type *t, long o, int exflag)
 			goto gext;
 		}
 		if(t->etype == TIND) {
-			if(a->op == OCAST)
+			while(a->op == OCAST) {
 				warn(a, "CAST in initialization ignored");
-			if(!sametype(t, a->type))
+				a = a->left;
+			}
+			if(!sametype(t, a->type)) {
 				diag(a, "initialization of incompatible pointers: %s\n%T and %T",
 					s->name, t, a->type);
+			}
+			switch(a->op) {
+			case OADDR:
+				a = a->left;
+				break;
+			case ONAME:
+			case OIND:
+				diag(a, "initializer is not a constant: %s", s->name);
+				return Z;
+			}
+			goto gext;
 		}
 
+		if(isnameoffset(a, t))
+			goto gext;
 		while(a->op == OCAST)
 			a = a->left;
-
-		switch(a->op) {
-		case OADDR:
-			if(t->etype != TIND)
-				warn(a, "initialize pointer to an integer: %s", s->name);
+		if(a->op == OADDR) {
+			warn(a, "initialize pointer to an integer: %s", s->name);
 			a = a->left;
-			break;
-		case OADD:
-			/*
-			 * Constants will be folded before this point, which just leaves offsets
-			 * from names.
-			 */
-			l = a->left;
-			r = a->right;
-			if(l->op == OADDR && r->op == OCONST || r->op == OADDR && l->op == OCONST)
-				break;
-		default:
-			diag(a, "initializer is not a constant: %s", s->name);
-			return Z;
+			goto gext;
 		}
+		diag(a, "initializer is not a constant: %s", s->name);
+		return Z;
 
 	gext:
 		gextern(s, a, o, t->width);
@@ -732,32 +748,6 @@ loop:
 }
 
 void
-fndecls(int pass)
-{
-	static Sym *funcsym;
-	Node *n;
-
-	if(thisfnnode->etype != TFUNC)
-		return;
-	if(pass == 0){
-		n = new(ONAME, Z, Z);
-		n->type = typ(TARRAY, garbt(types[TCHAR], BCONSTNT));
-		n->type->width = 0;
-		n->sym = slookup("__func__");
-		n->sym->type = n->type;
-		funcsym = dodecl(adecl, CLOCAL, n->type, n)->sym;
-	}else if(funcsym->aused){
-		n = new(OSTRING, Z, Z);
-		n->cstring = thisfnnode->sym->name;
-		n->type = copytyp(funcsym->type);
-		n->type->width = strlen(n->cstring)+1;
-		n->etype = TARRAY;
-		n->class = CSTATIC;
-		doinit(funcsym, funcsym->type, 0L, n);
-	}
-}
-
-void
 markdcl(void)
 {
 	Decl *d;
@@ -975,8 +965,6 @@ rsametype(Type *t1, Type *t2, int n, int f)
 			return 1;
 		et = t1->etype;
 		if(et != t2->etype)
-			return 0;
-		if((t1->garb & GNORET) != (t2->garb & GNORET))
 			return 0;
 		if(et == TFUNC) {
 			if(!rsametype(t1->link, t2->link, n, 0))
@@ -1641,8 +1629,10 @@ contig(Sym *s, Node *n, long v)
 		stkoff = maxround(stkoff, autoffset);
 		symadjust(s, n, v - s->offset);
 	}
+
 	if(n->op == OAS)
 		diag(Z, "oops in contig");
+
 	if(n->op == OASI)
 		if(n->left->type)
 		if(n->left->type->width == w)

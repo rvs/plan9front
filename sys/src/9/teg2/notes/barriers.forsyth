@@ -1,0 +1,65 @@
+Date: Sat, 1 Jan 2022 21:45:59 +0000
+Return-Path: plan9+bncBCHYZBMXQQOBBJEXYOHAMGQEWXJJ3QY@9netics.com
+From: Charles Forsyth <charles.forsyth@gmail.com>
+To: Richard Miller <miller@hamnavoe.com>
+Cc: Plan 9 Technical Advisory Team <plan9@9netics.com>
+Subject: Re: tricky memory models are tricky
+List-Unsubscribe: <mailto:googlegroups-manage+44542423190+unsubscribe@googlegroups.com>,
+ <https: //groups.google.com/a/9netics.com/group/plan9/subscribe>
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@9netics-com.20210112.gappssmtp.com header.s=20210112 header.b=fy+ISATI;
+       arc=pass (i=2 spf=pass spfdomain=gmail.com dkim=pass dkdomain=gmail.com dmarc=pass fromdomain=gmail.com);
+       spf=neutral (google.com: 209.85.220.69 is neither permitted nor denied by best guess record for domain of plan9+bncbchyzbmxqqobbjexyohamgqewxjj3qy@9netics.com) smtp.mailfrom=plan9+bncBCHYZBMXQQOBBJEXYOHAMGQEWXJJ3QY@9netics.com;
+       dmarc=fail (p=NONE sp=QUARANTINE dis=NONE arc=pass) header.from=gmail.com
+List-Archive: <https://groups.google.com/a/9netics.com/group/plan9/>
+Message-ID: <CAOw7k5hA5LTOaiFWckersjSJ_=jrtZWGKDKM-2soHH7mH1oGhg@mail.gmail.com>
+List-Post: <https://groups.google.com/a/9netics.com/group/plan9/post>, <mailto:plan9@9netics.com>
+In-Reply-To: <8859b9978218900f66fc60e31ee0e900@hamnavoe.com>
+List-Id: <plan9.9netics.com>
+List-Help: <https://support.google.com/a/9netics.com/bin/topic.py?topic=25838>,
+ <mailto: plan9+help@9netics.com>
+List-Subscribe: <https://groups.google.com/a/9netics.com/group/plan9/subscribe>,
+ <mailto: plan9+subscribe@9netics.com>
+References: <CAOw7k5ia6UZBL3bR7XaUZ0W7aRVft=tAwqj4vbs=WNC3w2Gptw@mail.gmail.com>
+ <8859b9978218900f66fc60e31ee0e900@hamnavoe.com>
+Mailing-List: list plan9@9netics.com; contact plan9+owners@9netics.com
+Received-Spf: pass (google.com: domain of charles.forsyth@gmail.com designates 209.85.220.41 as permitted sender) client-ip=209.85.220.41;
+
+ISB is typically used when
+ 
+    - working on the instruction stream (context switch, dynamic code,
+      instruction cache changes or instruction memory mapping), to force
+      subsequent instructions to be interpreted in the right context; or
+    - otherwise needed to prevent speculative execution to ensure ordering
+
+as with access to not-otherwise synchronising control operations.  It can
+also be cheaper than DMB/DSB to order/synchronise data reads (eg, from a
+device) although we don't bother.  Ordinarily, it isn't needed to cause
+some other synchronisation operation to complete.
+
+DMB prevents memory accesses before it from appearing as if they were
+beyond it, for the given domain (but as here, doesn't guarantee an ordering
+of those accesses if there's more than one).
+
+DSB does DMB but also stalls execution until data accesses, TLB operations,
+branch prediction and cache operations have finished for the domain.  Some
+interprocessor operations need it too.  For example, DSB; SEV because you
+don't want the SEV to arrive before the data.
+
+ainc and adec following ainc(2) are just "atomic operations, useful for
+synchronization" which doesn't really say how they work in sequences of
+operations and doesn't specify the scope of the effect.  It seems
+reasonable, and probably was originally intended, that sequences of them
+produce the same results as sequential code in global (multicore) scope,
+even if that's somewhat slower for some special cases, especially since
+those can be dealt with another way when it matters.  On the other hand, if
+they don't make global guarantees, it's sadly easy to forget an mfence when
+you need it.  Superfically, adec(&p->inuse) == 0 means you don't care about
+the values written to *p since you're going to release it, but you don't
+want out of order writes messing up the new *p for the next observer to
+grab it, and you also want p->inuse==0 for every observer of the free list.
+
+Arguably ainc and adec are asymmetric with respect to guarantees of writes,
+so having adec ensure all writes are done before the decrement itself is
+visible seems fine to me.
+

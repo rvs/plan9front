@@ -10,8 +10,8 @@
 #include "io.h"
 #include "../port/error.h"
 #include "../port/netif.h"
-#include "../port/etherif.h"
 
+#include "etherif.h"
 #include "ether8390.h"
 
 enum {					/* NIC core registers */
@@ -309,7 +309,7 @@ top:
 				crda = regr(ctlr, Crda0);
 				crda |= regr(ctlr, Crda1)<<8;
 				if(crda != to)
-					panic("crda write %lud to %lud", crda, to);
+					panic("crda write %lud to %lud\n", crda, to);
 	
 				break;
 			}
@@ -377,7 +377,7 @@ receive(Ether* ether)
 	for(curr = getcurr(ctlr); ctlr->nxtpkt != curr; curr = getcurr(ctlr)){
 		data = ctlr->nxtpkt*Dp8390BufSz;
 		if(ctlr->ram)
-			memmove(&hdr, (uchar*)KADDR(ether->mem) + data, sizeof(Hdr));
+			memmove(&hdr, (void*)(ether->mem+data), sizeof(Hdr));
 		else
 			_dp8390read(ctlr, &hdr, data, sizeof(Hdr));
 
@@ -422,7 +422,7 @@ receive(Ether* ether)
 			if((data+len) >= ctlr->pstop*Dp8390BufSz){
 				count = ctlr->pstop*Dp8390BufSz - data;
 				if(ctlr->ram)
-					memmove(p, (uchar*)KADDR(ether->mem) + data, count);
+					memmove(p, (void*)(ether->mem+data), count);
 				else
 					_dp8390read(ctlr, p, data, count);
 				p += count;
@@ -431,7 +431,7 @@ receive(Ether* ether)
 			}
 			if(len){
 				if(ctlr->ram)
-					memmove(p, (uchar*)KADDR(ether->mem) + data, len);
+					memmove(p, (void*)(ether->mem+data), len);
 				else
 					_dp8390read(ctlr, p, data, len);
 			}
@@ -439,7 +439,7 @@ receive(Ether* ether)
 			/*
 			 * Copy the packet to whoever wants it.
 			 */
-			etheriq(ether, bp);
+			etheriq(ether, bp, 1);
 		}
 
 		/*
@@ -461,6 +461,7 @@ txstart(Ether* ether)
 	int len;
 	Dp8390 *ctlr;
 	Block *bp;
+	uchar minpkt[ETHERMINTU], *rp;
 
 	ctlr = ether->ctlr;
 
@@ -475,14 +476,23 @@ txstart(Ether* ether)
 		return;
 
 	/*
+	 * Make sure the packet is of minimum length;
 	 * copy it to the card's memory by the appropriate means;
 	 * start the transmission.
 	 */
 	len = BLEN(bp);
+	rp = bp->rp;
+	if(len < ETHERMINTU){
+		rp = minpkt;
+		memmove(rp, bp->rp, len);
+		memset(rp+len, 0, ETHERMINTU-len);
+		len = ETHERMINTU;
+	}
+
 	if(ctlr->ram)
-		memmove((uchar*)KADDR(ether->mem) + ctlr->tstart*Dp8390BufSz, bp->rp, len);
+		memmove((void*)(ether->mem+ctlr->tstart*Dp8390BufSz), rp, len);
 	else
-		dp8390write(ctlr, ctlr->tstart*Dp8390BufSz, bp->rp, len);
+		dp8390write(ctlr, ctlr->tstart*Dp8390BufSz, rp, len);
 	freeb(bp);
 
 	regw(ctlr, Tbcr0, len & 0xFF);
@@ -538,9 +548,10 @@ overflow(Ether *ether)
 		regw(ctlr, Cr, Page0|RdABORT|Txp|Sta);
 }
 
-static void
+static int
 interrupt(Ureg*, void* arg)
 {
+	int loops;
 	Ether *ether;
 	Dp8390 *ctlr;
 	uchar isr, r;
@@ -552,9 +563,11 @@ interrupt(Ureg*, void* arg)
 	 * While there is something of interest,
 	 * clear all the interrupts and process.
 	 */
+	loops = 0;
 	ilock(ctlr);
 	regw(ctlr, Imr, 0x00);
 	while(isr = (regr(ctlr, Isr) & (Cnt|Ovw|Txe|Rxe|Ptx|Prx))){
+		loops++;
 		if(isr & Ovw){
 			overflow(ether);
 			regw(ctlr, Isr, Ovw);
@@ -599,6 +612,7 @@ interrupt(Ureg*, void* arg)
 	}
 	regw(ctlr, Imr, Cnt|Ovw|Txe|Rxe|Ptx|Prx);
 	iunlock(ctlr);
+	return loops > 0? Intrforme: Intrnotforme;
 }
 
 static uchar allmar[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -742,6 +756,15 @@ disable(Dp8390* ctlr)
 			;
 }
 
+static void
+shutdown(Ether *ether)
+{
+	Dp8390 *ctlr;
+
+	ctlr = ether->ctlr;
+	disable(ctlr);
+}
+
 int
 dp8390reset(Ether* ether)
 {
@@ -791,13 +814,13 @@ dp8390reset(Ether* ether)
 	 */
 	ether->attach = attach;
 	ether->transmit = transmit;
+	ether->interrupt = interrupt;
+	ether->shutdown = shutdown;
 	ether->ifstat = 0;
 
 	ether->promiscuous = promiscuous;
 	ether->multicast = multicast;
 	ether->arg = ether;
-
-	intrenable(ether->irq, interrupt, ether, ether->tbdf, ether->name);
 
 	return 0;
 }

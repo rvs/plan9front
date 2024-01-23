@@ -15,7 +15,6 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "ureg.h"
 #include "../port/error.h"
 
@@ -477,14 +476,14 @@ mylex24rio(SDreq* r)
 	return sdstat;
 }
 
-static void
+static int
 mylex24interrupt(Ureg*, void* arg)
 {
 	ulong pa;
 	Ctlr *ctlr;
 	Ccb24 *ccb;
 	Mbox24 *mb, *mbox;
-	int port, rinterrupt, rstatus;
+	int port, rinterrupt, rstatus, forme;
 
 	ctlr = arg;
 	port = ctlr->port;
@@ -496,12 +495,12 @@ mylex24interrupt(Ureg*, void* arg)
 	 * There's one spurious interrupt left over from
 	 * initialisation, ignore it.
 	 */
+	forme = Intrnotforme;
 	rinterrupt = inb(port+Rinterrupt);
 	rstatus = inb(port+Rstatus);
 	outb(port+Rcontrol, Rint);
 	if((rinterrupt & ~(Cmdc|Imbl)) != Intv && ctlr->spurious++)
-		print("%s: interrupt 0x%2.2ux\n",
-			ctlr->sdev->name, rinterrupt);
+		print("%s: interrupt 0x%2.2ux\n", ctlr->sdev->name, rinterrupt);
 	if((rinterrupt & Cmdc) && (rstatus & Cmdinv))
 		print("%s: command invalid\n", ctlr->sdev->name);
 
@@ -511,6 +510,8 @@ mylex24interrupt(Ureg*, void* arg)
 	 * and wakeup whoever.
 	 */
 	mb = ctlr->mb;
+	if (mb[ctlr->mbix].code)
+		forme = Intrforme;
 	for(mbox = &mb[ctlr->mbix]; mbox->code; mbox = &mb[ctlr->mbix]){
 		pa = (mbox->ccb[0]<<16)|(mbox->ccb[1]<<8)|mbox->ccb[2];
 		ccb = BPA2K(pa, BUSUNKNOWN);
@@ -522,6 +523,7 @@ mylex24interrupt(Ureg*, void* arg)
 		if(ctlr->mbix >= NMbox+NMbox)
 			ctlr->mbix = NMbox;
 	}
+	return forme;
 }
 
 static int
@@ -611,8 +613,8 @@ mylex32rio(SDreq* r)
 	ccb->ccbctl = 0;
 
 	/*
-	 * There's one more mbox than there there is
-	 * ccb so there is always one free.
+	 * There's one more mbox than there are
+	 * ccbs so there is always one mbox free.
 	 */
 	lock(&ctlr->mboxlock);
 	mb = ctlr->mb;
@@ -694,14 +696,14 @@ mylex32rio(SDreq* r)
 	return sdstat;
 }
 
-static void
+static int
 mylex32interrupt(Ureg*, void* arg)
 {
 	ulong pa;
 	Ctlr *ctlr;
 	Ccb32 *ccb;
 	Mbox32 *mb, *mbox;
-	int port, rinterrupt, rstatus;
+	int port, rinterrupt, rstatus, forme;
 
 	ctlr = arg;
 	port = ctlr->port;
@@ -714,6 +716,7 @@ mylex32interrupt(Ureg*, void* arg)
 	 * initialisation, ignore it.
 	 * In order to share PCI IRQs, just ignore spurious interrupts.
 	 */
+	forme = Intrnotforme;
 	rinterrupt = inb(port+Rinterrupt);
 	rstatus = inb(port+Rstatus);
 	outb(port+Rcontrol, Rint);
@@ -728,6 +731,8 @@ mylex32interrupt(Ureg*, void* arg)
 	 * If there is, free the mailbox and wakeup whoever.
 	 */
 	mb = ctlr->mb;
+	if (mb[ctlr->mbix].code)
+		forme = Intrforme;
 	for(mbox = &mb[ctlr->mbix]; mbox->code; mbox = &mb[ctlr->mbix]){
 		pa = (mbox->ccb[3]<<24)
 		    |(mbox->ccb[2]<<16)
@@ -745,6 +750,7 @@ mylex32interrupt(Ureg*, void* arg)
 		if(ctlr->mbix >= NMbox+NMbox)
 			ctlr->mbix = NMbox;
 	}
+	return forme;
 }
 
 static int
@@ -841,6 +847,7 @@ mylexprobe(int port, int irq)
 	Ctlr *ctlr;
 	uchar cmd[6], data[256];
 	int clen, dlen, timeo;
+	static int count;
 
 	if(ioalloc(port, 0x3, 0, "mylex") < 0)
 		return nil;
@@ -894,13 +901,18 @@ buggery:
 	if(issue(ctlr, cmd, clen, data, dlen)){
 		if(data[0] == 'E')
 			ctlr->bus = 32;
-		print("mylex ctlr @ port 0x%ux: 32-bit ", ctlr->port);
 		ctlr->wide = data[0x0D] & 0x01;
+		/*
+		 * devsd doesn't pass us the `spec' argument, so
+		 * we'll assume that sd0 goes to the first scsi host
+		 * adapter found, etc.
+		 */
+		print("#S/sd%d: mylex SCSI: irq %d port %#ux: %d-bit, ",
+			count++, ctlr->irq, ctlr->port, ctlr->bus);
 		if (ctlr->wide)
-			print("wide ");
+			print("wide\n");
 		else
-			print("narrow ");
-		print("SCSI host adapter\n");
+			print("narrow\n");
 	}
 	else{
 		/*
@@ -1029,7 +1041,7 @@ buggery:
 		goto buggery;
 	sdev->ifc = &sdmylexifc;
 	sdev->ctlr = ctlr;
-	sdev->idno = '0';
+	sdev->idno = '0';		/* actually assigned in sdadddevs() */
 	ctlr->sdev = sdev;
 	if(!ctlr->wide)
 		sdev->nunit = 8;
@@ -1055,7 +1067,7 @@ mylexpnp(void)
 	p = nil;
 	head = tail = nil;
 	while(p = pcimatch(p, 0x104B, 0)){
-		if((sdev = mylexprobe(p->mem[0].bar & ~3, p->intl)) == nil)
+		if((sdev = mylexprobe(p->mem[0].bar & ~0x01, p->intl)) == nil)
 			continue;
 
 		ctlr = sdev->ctlr;
@@ -1182,9 +1194,8 @@ mylex32enable(Ctlr* ctlr)
 		cmd[1] = 1;
 		if(!issue(ctlr, cmd, 2, 0, 0)) {
 			ctlr->wide = 0;
-			print(
-"mylex32enable: ctlr @ port 0x%ux: scsi wide-mode setup failed on wide host adapter",
-				ctlr->port);
+			print("mylex32enable: port 0x%ux: scsi wide-mode setup "
+				"failed on wide host adapter", ctlr->port);
 		}
 	}
 
@@ -1213,7 +1224,7 @@ mylexenable(SDev* sdev)
 {
 	int tbdf;
 	Ctlr *ctlr;
-	void (*interrupt)(Ureg*, void*);
+	int (*interrupt)(Ureg*, void*);
 	char name[32];
 
 	ctlr = sdev->ctlr;
@@ -1238,7 +1249,7 @@ mylexenable(SDev* sdev)
 		return 0;
 
 	snprint(name, sizeof(name), "sd%c (%s)", sdev->idno, sdev->ifc->name);
-	intrenable(ctlr->irq, interrupt, ctlr, tbdf, name);
+	ctlr->irq = intrenable(ctlr->irq, interrupt, ctlr, tbdf, name);
 
 	return 1;
 }
@@ -1247,6 +1258,7 @@ SDifc sdmylexifc = {
 	"mylex",			/* name */
 
 	mylexpnp,			/* pnp */
+	nil,				/* legacy */
 	mylexenable,			/* enable */
 	nil,				/* disable */
 

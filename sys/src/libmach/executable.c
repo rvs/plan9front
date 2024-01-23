@@ -14,7 +14,7 @@ typedef struct {
 	union{
 		struct {
 			Exec;		/* a.out.h */
-			uvlong hdr[1];
+			uvlong hdr[1];	/* potential expansion header */
 		};
 		Ehdr;			/* elf.h */
 		E64hdr;
@@ -66,6 +66,7 @@ extern	Mach	m68020;
 extern	Mach	mi386;
 extern	Mach	mamd64;
 extern	Mach	marm;
+extern	Mach	marm64;
 extern	Mach	mpower;
 extern	Mach	mpower64;
 extern	Mach	malpha;
@@ -236,6 +237,15 @@ ExecTable exectab[] =
 		sizeof(Exec),
 		leswal,
 		armdotout },
+	{ R_MAGIC,			/* Arm64 7.out and boot image */
+		"arm64 plan 9 executable",
+		"arm64 plan 9 dlm",
+		FARM64,
+		1,
+		&marm64,
+		sizeof(Exec)+8,
+		nil,
+		commonllp64 },
 	{ L_MAGIC,			/* alpha 7.out */
 		"alpha plan 9 executable",
 		"alpha plan 9 dlm",
@@ -254,8 +264,8 @@ ExecTable exectab[] =
 		sizeof(Exec),
 		beswal,
 		common },
-	{ Z_MAGIC,			/* riscv i.out */
-		"riscv executable",
+	{ Z_MAGIC,			/* riscv i.out and boot image */
+		"riscv plan 9 executable",
 		nil,
 		FRISCV,
 		0,
@@ -263,15 +273,24 @@ ExecTable exectab[] =
 		sizeof(Exec),
 		beswal,
 		common },
-	{ Y_MAGIC,			/* riscv j.out */
-		"riscv64 executable",
+	{ Y_MAGIC,			/* riscv64 old j.out and boot image */
+		"riscv64 plan 9 executable",
 		nil,
 		FRISCV64,
 		0,
 		&mriscv64,
 		sizeof(Exec),
-		beswal,
-		common },
+		nil,
+		commonllp64 },
+	{ B_MAGIC,			/* riscv64 j.out and boot image */
+		"riscv64 plan 9 executable extended",
+		nil,
+		FRISCV64,
+		0,
+		&mriscv64,
+		sizeof(Exec)+sizeof(vlong),
+		nil,
+		commonllp64 },
 	{ 0 },
 };
 
@@ -396,6 +415,12 @@ commonboot(Fhdr *fp)
 {
 	if (!(fp->entry & mach->ktmask))
 		return;
+	/*
+	 * hack since HDR_MAGIC is missing in riscv64 Y_MAGIC: assume
+	 * user executable, not boot image.
+	 */
+	if (fp->type == FRISCV64 && (fp->magic & HDR_MAGIC) == 0)
+		return;
 
 	switch(fp->type) {				/* boot image */
 	case F68020:
@@ -449,7 +474,7 @@ commonboot(Fhdr *fp)
 		fp->txtaddr = mach->kbase | (u32int)fp->entry;
 		fp->name = "riscv64 plan 9 boot image";
 		fp->dataddr = _round(fp->txtaddr+fp->txtsz, mach->pgsize);
-		break;
+  		break;
 	default:
 		return;
 	}
@@ -481,7 +506,7 @@ commonllp64(int, Fhdr *fp, ExecHdr *hp)
 	uvlong entry;
 
 	hswal(&hp->e, sizeof(Exec)/sizeof(long), beswal);
-	if(!(hp->e.magic & HDR_MAGIC))
+	if(!(hp->e.magic & HDR_MAGIC) && mach->szaddr == 4)
 		return 0;
 
 	/*

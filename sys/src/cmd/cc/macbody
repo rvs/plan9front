@@ -128,18 +128,21 @@ dodefine(char *cp)
 	char *p;
 	long l;
 
-	strncpy(symb, cp, NSYMB);
-	if(symb[NSYMB-1] != '\0'){
-		yyerror("macro too long: %s", cp);
-		symb[NSYMB-1] = 0;
-	}
+	strcpy(symb, cp);
 	p = strchr(symb, '=');
 	if(p) {
 		*p++ = 0;
 		s = lookup();
 		l = strlen(p) + 2;	/* +1 null, +1 nargs */
-		s->macro = alloc(l);
-		memcpy(s->macro, p-1, l);
+		while(l & 3)
+			l++;
+		while(nhunk < l)
+			gethunk();
+		*hunk = 0;
+		strcpy(hunk+1, p);
+		s->macro = hunk;
+		hunk += l;
+		nhunk -= l;
 	} else {
 		s = lookup();
 		s->macro = "\0001";	/* \000 is nargs */
@@ -246,7 +249,7 @@ macdef(void)
 	if(isspace(c))
 		if(c != '\n')
 			c = getnsc();
-	base = alloc(1);
+	base = hunk;
 	len = 1;
 	ischr = 0;
 	for(;;) {
@@ -343,7 +346,7 @@ macdef(void)
 		}
 		base = allocn(base, len, 1);
 		base[len++] = c;
-		c = GETC();
+		c = ((--fi.c < 0)? filbuf(): (*fi.p++ & 0xff));
 		if(c == '\n')
 			lineno++;
 		if(c == -1) {
@@ -372,31 +375,27 @@ bad:
 	macend();
 }
 
-int
-macexpand(Sym *s, char *b, int blen)
+void
+macexpand(Sym *s, char *b)
 {
 	char buf[2000];
 	int n, l, c, nargs;
-	char *arg[NARG], *cp, *ob, *eb, *ecp, dots;
+	char *arg[NARG], *cp, *ob, *ecp, dots;
 
+	ob = b;
 	if(*s->macro == 0) {
-		b[blen-1] = 0;
-		strncpy(b, s->macro+1, blen);
-		if(b[blen-1] != '\0')
-			goto toobig;
+		strcpy(b, s->macro+1);
 		if(debug['m'])
-			print("#expand %s %s\n", s->name, b);
-		return 1;
+			print("#expand %s %s\n", s->name, ob);
+		return;
 	}
 	
 	nargs = (char)(*s->macro & ~VARMAC) - 1;
 	dots = *s->macro & VARMAC;
 
 	c = getnsc();
-	if(c != '('){
-		unget(c);
-		return 0;
-	}
+	if(c != '(')
+		goto bad;
 	n = 0;
 	c = getc();
 	if(c != ')') {
@@ -492,14 +491,10 @@ macexpand(Sym *s, char *b, int blen)
 	if(n != nargs) {
 		yyerror("argument mismatch expanding: %s", s->name);
 		*b = 0;
-		return 0;
+		return;
 	}
-	ob = b;
-	eb = b + blen-1;
 	cp = s->macro+1;
 	for(;;) {
-		if(b >= eb)
-			goto toobig;
 		c = *cp++;
 		if(c == '\n')
 			c = ' ';
@@ -519,26 +514,22 @@ macexpand(Sym *s, char *b, int blen)
 		c -= 'a';
 		if(c < 0 || c >= n)
 			continue;
-		l = strlen(arg[c]);
-		if(b+l > eb)
-			goto toobig;
-		memmove(b, arg[c], l);
-		b += l;
+		strcpy(b, arg[c]);
+		b += strlen(arg[c]);
 	}
 	*b = 0;
 	if(debug['m'])
 		print("#expand %s %s\n", s->name, ob);
-	return 1;
+	return;
 
 bad:
 	yyerror("syntax in macro expansion: %s", s->name);
 	*b = 0;
-	return 0;
+	return;
 
 toobig:
 	yyerror("too much text in macro expansion: %s", s->name);
 	*b = 0;
-	return 0;
 }
 
 void
@@ -560,10 +551,6 @@ macinc(void)
 			break;
 		if(c == '\n')
 			goto bad;
-		if(hp >= &str[STRINGSZ-1]){
-			yyerror("name too long for #include");
-			break;
-		}
 		*hp++ = c;
 	}
 	*hp = 0;
@@ -571,24 +558,34 @@ macinc(void)
 	c = getcom();
 	if(c != '\n')
 		goto bad;
+
 	f = -1;
 	for(i=0; i<ninclude; i++) {
 		if(i == 0 && c0 == '>')
 			continue;
-		c = snprint(symb, NSYMB, "%s/%s", include[i], str);;
-		while(strncmp(symb, "./", 2) == 0){
-			c -= 2;
-			memmove(symb, symb+2, c+1);
-		}
+		strcpy(symb, include[i]);
+		strcat(symb, "/");
+		if(strcmp(symb, "./") == 0)
+			symb[0] = 0;
+		strcat(symb, str);
 		f = open(symb, 0);
 		if(f >= 0)
 			break;
 	}
 	if(f < 0)
-		snprint(symb, NSYMB, "%s", str);
+		strcpy(symb, str);
+	c = strlen(symb) + 1;
+	while(c & 3)
+		c++;
+	while(nhunk < c)
+		gethunk();
+	hp = hunk;
+	memcpy(hunk, symb, c);
+	nhunk -= c;
+	hunk += c;
 	newio();
 	pushio();
-	newfile(strdup(symb), f);
+	newfile(hp, f);
 	return;
 
 bad:
@@ -636,8 +633,14 @@ maclin(void)
 
 nn:
 	c = strlen(symb) + 1;
-	cp = alloc(c);
-	memcpy(cp, symb, c);
+	while(c & 3)
+		c++;
+	while(nhunk < c)
+		gethunk();
+	cp = hunk;
+	memcpy(hunk, symb, c);
+	nhunk -= c;
+	hunk += c;
 	linehist(cp, n);
 	return;
 
@@ -764,9 +767,17 @@ praglib:
 	 * put pragma-line in as a funny history 
 	 */
 	c = strlen(symb) + 1;
+	while(c & 3)
+		c++;
+	while(nhunk < c)
+		gethunk();
+	hp = hunk;
+	memcpy(hunk, symb, c);
+	nhunk -= c;
+	hunk += c;
+
 	h = alloc(sizeof(Hist));
-	h->name = alloc(c);
-	memcpy(h->name, symb, c);
+	h->name = hp;
 	h->line = lineno;
 	h->offset = -1;
 	h->link = H;
@@ -835,4 +846,23 @@ linehist(char *f, int offset)
 	}
 	ehist->link = h;
 	ehist = h;
+}
+
+void
+gethunk(void)
+{
+	char *h;
+	long nh;
+
+	nh = NHUNK;
+	if(thunk >= 10L*NHUNK)
+		nh = 10L*NHUNK;
+	h = (char*)mysbrk(nh);
+	if(h == (char*)-1) {
+		yyerror("out of memory");
+		errorexit();
+	}
+	hunk = h;
+	nhunk = nh;
+	thunk += nh;
 }

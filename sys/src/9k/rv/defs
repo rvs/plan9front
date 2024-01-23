@@ -1,0 +1,3 @@
+# choose a default subarchitecture
+ARCH=vf
+< ./$ARCH/defs

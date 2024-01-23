@@ -5,7 +5,11 @@
 #include "fns.h"
 #include "io.h"
 #include "ureg.h"
-#include "tos.h"
+#include "../port/error.h"
+
+enum {
+	Maxtimerloops = 20*1000,
+};
 
 struct Timers
 {
@@ -14,6 +18,7 @@ struct Timers
 };
 
 static Timers timers[MAXMACH];
+static int timersinited;
 
 ulong intrcount[MAXMACH];
 ulong fcallcount[MAXMACH];
@@ -66,7 +71,6 @@ tadd(Timers *tt, Timer *nt)
 static uvlong
 tdel(Timer *dt)
 {
-
 	Timer *t, **last;
 	Timers *tt;
 
@@ -109,16 +113,11 @@ timeradd(Timer *nt)
 	iunlock(nt);
 }
 
-
 void
 timerdel(Timer *dt)
 {
-	Mach *mp;
 	Timers *tt;
 	uvlong when;
-
-	/* avoid Tperiodic getting re-added */
-	dt->tmode = Trelative;
 
 	ilock(dt);
 	if(tt = dt->tt){
@@ -128,16 +127,7 @@ timerdel(Timer *dt)
 			timerset(tt->head->twhen);
 		iunlock(tt);
 	}
-	if((mp = dt->tactive) == nil || mp->machno == m->machno){
-		iunlock(dt);
-		return;
-	}
 	iunlock(dt);
-
-	/* rare, but tf can still be active on another cpu */
-	while(dt->tactive == mp && dt->tt == nil)
-		if(up->state == Running && up->nlocks == 0 && islo())
-			sched();
 }
 
 void
@@ -148,37 +138,33 @@ hzclock(Ureg *ur)
 		m->proc->pc = ur->pc;
 
 	if(m->flushmmu){
-		if(up && up->newtlb)
+		if(up)
 			flushmmu();
 		m->flushmmu = 0;
 	}
 
 	accounttime();
-	dtracytick(ur);
 	kmapinval();
 
 	if(kproftimer != nil)
 		kproftimer(ur->pc);
 
-	if(active.machs[m->machno] == 0)
+	if(!iscpuactive(m->machno))
 		return;
 
-	if(active.exiting)
-		exit(panicking);
-
-	if(m->machno == 0)
-		checkalarms();
-
-	if(up && up->state == Running){
-		if(userureg(ur)){
-			/* user profiling clock */
-			Tos *tos = (Tos*)(USTKTOP-sizeof(Tos));
-			tos->clock += TK2MS(1);
-			segclock(ur->pc);
-		}
-
-		hzsched();	/* in proc.c */
+	if(active.exiting) {
+		print("someone's exiting\n");
+		exit(0);
 	}
+
+	/*
+	 * you might think that we only need to run checkalarms on cpu0,
+	 * but that's empirically not true; the system misbehaves if we do that.
+	 */
+	checkalarms();
+
+	if(up && up->state == Running)
+		hzsched();	/* in proc.c */
 }
 
 void
@@ -187,14 +173,17 @@ timerintr(Ureg *u, Tval)
 	Timer *t;
 	Timers *tt;
 	uvlong when, now;
-	int callhzclock;
+	int count, callhzclock;
 
 	intrcount[m->machno]++;
 	callhzclock = 0;
 	tt = &timers[m->machno];
 	now = fastticks(nil);
+	if(now == 0)
+		panic("timerintr: zero fastticks()");
 	ilock(tt);
-	while(t = tt->head){
+	count = Maxtimerloops;
+	while((t = tt->head) != nil){
 		/*
 		 * No need to ilock t here: any manipulation of t
 		 * requires tdel(t) and this must be done with a
@@ -212,17 +201,21 @@ timerintr(Ureg *u, Tval)
 		tt->head = t->tnext;
 		assert(t->tt == tt);
 		t->tt = nil;
-		t->tactive = MACHP(m->machno);
 		fcallcount[m->machno]++;
 		iunlock(tt);
 		if(t->tf)
 			(*t->tf)(u, t);
 		else
 			callhzclock++;
-		t->tactive = nil;
 		ilock(tt);
 		if(t->tmode == Tperiodic)
 			tadd(tt, t);
+		if (--count <= 0) {
+			count = Maxtimerloops;
+			iprint("timerintr: probably stuck in while loop; "
+				"scrutinise clock.c or use faster cycle "
+				"counter\n");
+		}
 	}
 	iunlock(tt);
 }
@@ -235,10 +228,11 @@ timersinit(void)
 	/*
 	 * T->tf == nil means the HZ clock for this processor.
 	 */
+	timersinited = 1;
 	todinit();
 	t = malloc(sizeof(*t));
 	if(t == nil)
-		panic("timersinit: no memory for Timer");
+		error(Enomem);
 	t->tmode = Tperiodic;
 	t->tt = nil;
 	t->tns = 1000000000/HZ;
@@ -252,10 +246,12 @@ addclock0link(void (*f)(void), int ms)
 	Timer *nt;
 	uvlong when;
 
+	if(!timersinited)
+		panic("addclock0link: timersinit not called yet");
 	/* Synchronize to hztimer if ms is 0 */
 	nt = malloc(sizeof(Timer));
 	if(nt == nil)
-		panic("addclock0link: no memory for Timer");
+		error(Enomem);
 	if(ms == 0)
 		ms = 1000/HZ;
 	nt->tns = (vlong)ms*1000000LL;
@@ -274,26 +270,26 @@ addclock0link(void (*f)(void), int ms)
 /*
  *  This tk2ms avoids overflows that the macro version is prone to.
  *  It is a LOT slower so shouldn't be used if you're just converting
- *  a delta.
+ *  a delta, *iff* 1000%HZ != 0, else it's the same.
  */
 ulong
 tk2ms(ulong ticks)
 {
-	uvlong t, hz;
-
-	t = ticks;
-	hz = HZ;
-	t *= 1000L;
-	t = t/hz;
-	ticks = t;
-	return ticks;
+	if (1000%HZ == 0)
+		return ticks * MS2HZ;
+	else
+		return (ticks * 1000ULL)/HZ;
 }
 
 ulong
 ms2tk(ulong ms)
 {
-	/* avoid overflows at the cost of precision */
-	if(ms >= 1000000000/HZ)
-		return (ms/1000)*HZ;
-	return (ms*HZ+500)/1000;
+	if (1000%HZ == 0)
+		return ms / MS2HZ;
+	else {
+		/* avoid overflows at the cost of precision */
+		if(ms >= 1000000000/HZ)
+			return (ms/1000)*HZ;
+		return (ms*HZ+500)/1000;
+	}
 }

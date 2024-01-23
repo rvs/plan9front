@@ -17,6 +17,7 @@ enum
 	Nstatqid,
 	Ntypeqid,
 	Nifstatqid,
+	Nmtuqid,
 };
 
 /*
@@ -38,13 +39,10 @@ struct Netfile
 	char	owner[KNAMELEN];
 
 	int	type;			/* multiplexor type */
-
-	char	prom;			/* promiscuous mode */
-	char	scan;			/* base station scanning interval */
-	char	bridge;			/* bridge mode */
-	char	bypass;			/* bypass transmission */
-	char	headersonly;		/* headers only - no data */
-
+	int	prom;			/* promiscuous mode */
+	int	scan;			/* base station scanning interval */
+	int	bridge;			/* bridge mode */
+	int	headersonly;		/* headers only - no data */
 	uchar	maddr[8];		/* bitmask of multicast addresses requested */
 	int	nmaddr;			/* number of multicast addresses */
 
@@ -70,16 +68,18 @@ struct Netif
 	QLock;
 
 	/* multiplexing */
-	char	name[KNAMELEN];		/* for top level directory */
 	int	nfile;			/* max number of Netfiles */
 	Netfile	**f;
-	Netfile	*bypass;
+	char	name[KNAMELEN];		/* for top level directory */
 
 	/* about net */
 	int	limit;			/* flow control */
 	int	alen;			/* address length */
 	int	mbps;			/* megabits per sec */
 	int	link;			/* link status */
+	int	minmtu;
+	int 	maxmtu;
+	int	mtu;
 	uchar	addr[Nmaxaddr];
 	uchar	bcast[Nmaxaddr];
 	Netaddr	*maddr;			/* known multicast addresses */
@@ -104,6 +104,7 @@ struct Netif
 	void	*arg;
 	void	(*promiscuous)(void*, int);
 	void	(*multicast)(void*, uchar*, int);
+	int	(*hwmtu)(void*, int);	/* get/set mtu */
 	void	(*scanbs)(void*, uint);	/* scan for base stations */
 };
 
@@ -127,11 +128,6 @@ enum
 	ETHERMINTU =	60,		/* minimum transmit size */
 	ETHERMAXTU =	1514,		/* maximum transmit size */
 	ETHERHDRSIZE =	14,		/* size of an ethernet header */
-
-	/* ethernet packet types */
-	ETARP		= 0x0806,
-	ETIP4		= 0x0800,
-	ETIP6		= 0x86DD,
 };
 
 struct Etherpkt

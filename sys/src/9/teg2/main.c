@@ -1,45 +1,49 @@
 #include "u.h"
-#include "tos.h"
 #include "../port/lib.h"
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
-#include "io.h"
-#include "../port/pci.h"
-
+#include <tos.h>
 #include <pool.h>
-
 #include "arm.h"
-#include "rebootcode.i"
+#include "init.h"
+#include "reboot.h"
 
 /*
  * Where configuration info is left for the loaded programme.
  * This will turn into a structure as more is done by the boot loader
  * (e.g. why parse the .ini file twice?).
- * There are 3584 bytes available at CONFADDR.
  */
 #define BOOTARGS	((char*)CONFADDR)
-#define	BOOTARGSLEN	(16*KiB)		/* limit in devenv.c */
+#define	BOOTARGSLEN	(16*KB)			/* limit in devenv.c */
 #define	MAXCONF		64
 #define MAXCONFLINE	160
 
 enum {
 	Minmem	= 256*MB,			/* conservative default */
+
+	/* space for syscall args, return PC, top-of-stack struct */
+	Ustkheadroom	= sizeof(Sargs) + sizeof(uintptr) + sizeof(Tos),
 };
 
 #define isascii(c) ((uchar)(c) > 0 && (uchar)(c) < 0177)
 
-extern char bdata[], edata[], end[], etext[];
+Mach* machaddr[MAXMACH] = { (Mach *)MACHADDR };
 
-uintptr kseg0 = KZERO;
-Mach* machaddr[MAXMACH];
-uchar *l2pages;
-
-Memcache cachel[8];		/* arm arch v7 supports 1-7 */
 /*
- * these are used by the cache.v7.s routines.
+ * Option arguments from the command line.
+ * oargv[0] is the boot file.
+ * Optionsinit() is called from multiboot()
+ * or some other machine-dependent place
+ * to set it all up.
  */
-Lowmemcache *cacheconf;
+static int oargc;
+static char* oargv[20];
+static char oargb[128];
+static int oargblen;
+static char oenv[] = "";		/* no inherited environment */
+
+static uintptr sp; /* XXX - must go. user stack of init proc; bootargs→touser */
 
 int vflag;
 char debug[256];
@@ -85,7 +89,7 @@ addconf(char *name, char *val)
 		i = nconf++;
 		strecpy(confname[i], confname[i]+sizeof(confname[i]), name);
 	}
-//	confval[i] = val;
+	/* overwrite current value in place */
 	strecpy(confval[i], confval[i]+sizeof(confval[i]), val);
 }
 
@@ -150,28 +154,65 @@ plan9iniinit(void)
 	}
 }
 
+static void
+optionsinit(char* s)
+{
+	char *o;
+
+	o = strecpy(oargb, oargb+sizeof(oargb), s) + 1;
+
+	/* no inherited environment */
+//	if(getenv("bootargs", o, o - oargb) != nil)
+//		*(o-1) = ' ';
+	USED(o);
+
+	oargblen = strlen(oargb);
+	oargc = tokenize(oargb, oargv, nelem(oargv)-1);
+	oargv[oargc] = nil;
+}
+
+char*
+getenv(char* name, char* buf, int n)
+{
+	char *e, *p, *q;
+
+	p = oenv;
+	while(*p != 0){
+		if((e = strchr(p, '=')) == nil)
+			break;
+		for(q = name; p < e; p++){
+			if(*p != *q)
+				break;
+			q++;
+		}
+		if(p == e && *q == 0){
+			strecpy(buf, buf+n, e+1);
+			return buf;
+		}
+		p += strlen(p)+1;
+	}
+
+	return nil;
+}
+
 /* enable scheduling of this cpu */
 void
 machon(uint cpu)
 {
-	lock(&active);
-	if (active.machs[cpu] == 0) {	/* currently off? */
-		active.machs[cpu] = 1;
-		conf.nmach++;
-	}
-	unlock(&active);
+	ilock(&active);
+	if (!iscpuactive(cpu)) 		/* currently off? */
+		cpuactive(cpu);
+	iunlock(&active);
 }
 
 /* disable scheduling of this cpu */
 void
 machoff(uint cpu)
 {
-	lock(&active);
-	if (active.machs[cpu]) {		/* currently on? */
-		active.machs[cpu] = 0;
-		conf.nmach--;
-	}
-	unlock(&active);
+	ilock(&active);
+	if (iscpuactive(cpu))		/* currently on? */
+		cpuinactive(cpu);
+	iunlock(&active);
 }
 
 void
@@ -179,28 +220,18 @@ machinit(void)
 {
 	Mach *m0;
 
-	if (m == 0) {
-		uartputc('?');
-		uartputc('m');
-		uartputc('0');
-	}
-	if(machaddr[m->machno] != m) {
-		uartputc('?');
-		uartputc('m');
-		uartputc('m');
-	}
-
-	if (canlock(&testlock)) {
-		uartputc('?');
-		uartputc('l');
-		panic("cpu%d: locks don't work", m->machno);
-	}
+	if (m == 0)
+		panic("machinit: nil m");
+	if(machaddr[m->machno] != m)
+		panic("machinit: machaddr[%d] != %#p", m->machno, m);
+	if (canlock(&testlock))
+		panic("machinit: cpu%d: locks don't work", m->machno);
 
 	m->ticks = 1;
 	m->perf.period = 1;
-	m0 = MACHP(0);
 	if (m->machno != 0) {
 		/* synchronise with cpu 0 */
+		m0 = MACHP(0);
 		m->ticks = m0->ticks;
 		m->fastclock = m0->fastclock;
 		m->cpuhz = m0->cpuhz;
@@ -218,20 +249,18 @@ machinit(void)
 void
 mach0init(void)
 {
-	if (m == 0) {
-		uartputc('?');
-		uartputc('m');
-	}
-	conf.nmach = 0;
+	if (m == 0)
+		panic("mach0init: nil m");
 
-	m->machno = 0;
 	machaddr[0] = m;
+	m->machno = 0;
 
+	conf.nmach = 1;
+	cpuactive(0);
 	lock(&testlock);		/* hold this forever */
 	machinit();
 
 	active.exiting = 0;
-	l1cache->wbse(&active, sizeof active);
 	up = nil;
 }
 
@@ -243,26 +272,43 @@ mach0init(void)
 void
 launchinit(void)
 {
-	int mach;
+	int mach, cpu, navailcpus;
 	Mach *mm;
 	PTE *l1;
 
-	for(mach = 1; mach < MAXMACH; mach++){
+	navailcpus = getncpus();
+	for(mach = 1; mach < navailcpus; mach++){
 		machaddr[mach] = mm = mallocalign(MACHSIZE, MACHSIZE, 0, 0);
-		l1 = mallocalign(L1SIZE, L1SIZE, 0, 0);
-		if(mm == nil || l1 == nil)
-			panic("launchinit");
+		if(mm == nil)
+			panic("launchinit: no memory");
 		memset(mm, 0, MACHSIZE);
 		mm->machno = mach;
+		/* load defaults from cpu 0 */
+		mm->ticks = m->ticks;
+		mm->fastclock = m->fastclock;
+		mm->cpuhz = m->cpuhz;
+		mm->delayloop = m->delayloop;
 
-		memmove(l1, (void *)L1, L1SIZE);  /* clone cpu0's l1 table */
-		l1cache->wbse(l1, L1SIZE);
+		l1 = (PTE *)(L1CPU0 + mach*L1SIZE);
+		/* bootstrap this new cpu with our current L1 table */
+		mmul1copy(l1, (char *)L1CPU0);
+		allcacheswbse(l1, L1SIZE);
 
-		mm->mmul1 = l1;
-		l1cache->wbse(mm, MACHSIZE);
+		/* l1 will be populated for real by mmuinit() */
+		mmusetnewl1(mm, l1);
+		allcacheswbse(mm, sizeof *mm);
 	}
-	l1cache->wbse(machaddr, sizeof machaddr);
-	conf.nmach = 1;
+	allcacheswbse(machaddr, sizeof machaddr);
+
+	/* SMP & FW are already on when we get here; u-boot set them? */
+	for (cpu = 1; cpu < navailcpus && cpu < MAXMACH; cpu++)
+		if (startcpu(cpu) < 0)
+			print("launchinit: cpu%d didn't start\n", cpu);
+		else
+			conf.nmach++;
+
+	/* reflects MP operation, not permission to go MP. */
+	active.thunderbirdsarego = 1;
 }
 
 void
@@ -272,87 +318,117 @@ dump(void *vaddr, int words)
 
 	addr = vaddr;
 	while (words-- > 0)
-		iprint("%.8lux%c", *addr++, words % 8 == 0? '\n': ' ');
+		print("%.8lux%c", *addr++, words % 8 == 0? '\n': ' ');
 }
 
 static void
-cacheinit(void)
+launchproc(void *)
 {
-	allcacheinfo(cachel);
-	cacheconf = (Lowmemcache *)CACHECONF;
-	cacheconf->l1waysh = cachel[1].waysh;
-	cacheconf->l1setsh = cachel[1].setsh;
-	/* on the tegra 2, l2 is unarchitected */
-	cacheconf->l2waysh = cachel[2].waysh;
-	cacheconf->l2setsh = cachel[2].setsh;
+	launchinit();
+	pexit("kproc exiting", 1);
+}
 
-	l2pl310init();
+int
+inkzeroseg(void)
+{
+	return (getpc() & KSEGM) == KSEG0;
+}
+
+/* cpu 0 init: enable l1 caches (and scu) and mmu. */
+void
+l1cachesmmuon(void)
+{
+	if (m->machno != 0)
+		panic("main entered on cpu other than 0");
+
+	/* mmuinit maps high vectors later */
+	memmove(0, vectors, (char *)_vrst - (char *)vectors);
+	exceptinit();
+
+	scuoff();		/* step 2: invalidate all scu tags */
+	scuinval();
+	cacheinit();		/* writes cacheconf for cache ops */
+	l2pl310off();		/* step 3: disable PL310 L2 cache */
+	scuon();		/* step 4: enable the scu */
+	mmuinit0();		/* set up cpu0's page tables */
+	cachedinv();		/* step 1b: inval. L1 D cache before enabling */
+	cachedon();		/* step 5: turn my L1 caches (i & d) on */
+
+	/* We're supposed to wait until l1 & l2 are on before smpcoheron(). */
+	/* now that l1 caches are on, include cacheability and shareability */
+	mmuon(PADDR(L1CPU0) | TTBlow);
+}
+
+/* cpu0 step 6: enable the PL310. */
+void
+l2on(void)
+{
+	cachedwbinv();
 	allcacheson();
-	allcache->wb();
+	l2cache->on();
+	l2cache->info(&cachel[2]);
+	cortexa9cachecfg();		/* needs l2 cache on first */
 }
 
 void
-l2pageinit(void)
+main(int cpuid)
 {
-	l2pages = KADDR(PHYSDRAM + DRAMSIZE - RESRVDHIMEM);
-}
-
-/*
- * at entry, l.s has set m for cpu0 and printed "Plan 9 from Be"
- * but has not zeroed bss.
- */
-void
-main(void)
-{
-	int cpu;
-
+	/* this initialization is often done in assembler, in l.s. */
+	resetcpu1();		/* ensure we're cpu0, force cpu1 into reset */
+	m = (Mach *)PADDR(MACHADDR);
 	up = nil;
-	memset(edata, 0, end - edata);
+
+	errata();		/* work around cortex-a9 bugs */
+	datasegok();		/* verify data seg alignment */
+	zerolow();		/* zero bss, cpu0 Mach & L1CPU0 */
+	m->machno = cpuid;
+	m->printok = 0;		/* actually: don't lock; lets iprint work */
+
+	/* put cpu0's kernel stack in newly-zeroed Mach; invalidates autos */
+	setsp((uintptr)m + MACHSIZE - 4 - ARGLINK);
+
+	/* mmu, scu, and caches are off, and the pc is in the zero segment. */
+	warpregs(0);		/* ensure that we're executing in the 0 seg */
+	l1cachesmmuon();
+	warpregs(KZERO);	/* warp PC, SB, SP & m into the virtual map */
+	/*
+	 * NB: now running at virtual KZERO+something, with
+	 * PC, SB, m, and SP adjusted to KZERO space.
+	 */
+	watchdogoff();
+
+	iprint("Plan 9 from Bell Labs\n\n");
+	mmuzerouser();	/* vacate mapping 0 -> PHYSDRAM for user space */
 
 	/*
-	 * we can't lock until smpon has run, but we're supposed to wait
-	 * until l1 & l2 are on.  too bad.  l1 is on, l2 will soon be.
+	 * important: reset the interrupt controller.  without this,
+	 * cpu1 doesn't get interrupts after a reboot.
 	 */
-	smpon();
-	uartconsinit();
-	iprint("ll Labs ");
-	cacheinit();
+	periphreset();
+	poweron();
 
+	l2on();			/* cpu0 step 6: enable the PL310. */
+	cachedwbinv();
+	smpcoheron();		/* cpu0 step 7: set smp mode; enables atomics */
 	/*
-	 * data segment is aligned, bss is zeroed, caches' characteristics
-	 * are known.  begin initialisation.
+	 * this cpu is now participating in cache coherence maintained by
+	 * the scu.  as other cpus come on-line and call smpcoheron, they will
+	 * participate too.
+	 * NB: ldrex/strex and thus locks, ainc/adec, etc. will now work.
 	 */
+
 	mach0init();
-	l2pageinit();
 	mmuinit();
-
-	quotefmtinstall();
-
+	optionsinit("/boot/boot boot");
 	/* want plan9.ini to be able to affect memory sizing in confinit */
 	plan9iniinit();		/* before we step on plan9.ini in low memory */
 
-	/* l2 looks for *l2off= in plan9.ini */
-	l2cache->on();		/* l2->on requires locks to work, thus smpon */
-	l2cache->info(&cachel[2]);
-	allcache->on();
-
-	cortexa9cachecfg();
-
 	trapinit();		/* so confinit can probe memory to size it */
 	confinit();		/* figures out amount of memory */
-	/* xinit prints (if it can), so finish up the banner here. */
-	delay(100);
 	navailcpus = getncpus();
-	iprint("(mp arm; %d cpus)\n\n", navailcpus);
-	delay(100);
-
-	for (cpu = 1; cpu < navailcpus; cpu++)
-		stopcpu(cpu);
-
-	xinit();
+	xinit();		/* xinit prints (if it can) */
 	irqtooearly = 0;	/* now that xinit and trapinit have run */
-
-	mainmem->flags |= POOL_ANTAGONISM /* | POOL_PARANOIA */ ;
+	sgienable();
 
 	/*
 	 * Printinit will cause the first malloc call.
@@ -360,94 +436,240 @@ main(void)
 	 * above (like clockinit) do an irqenable, which
 	 * will call malloc.
 	 * If the system dies here it's probably due
-	 * to malloc(->xalloc) not being initialised
-	 * correctly, or the data segment is misaligned
+	 * to malloc(->xalloc) not being initialised correctly
 	 * (it's amazing how far you can get with
 	 * things like that completely broken).
 	 *
 	 * (Should be) boilerplate from here on.
 	 */
+	printinit();
+	kmesginit();
+	quotefmtinstall();
+	kbdenable();
 
 	archreset();			/* cfg clock signals, print cache cfg */
-	clockinit();			/* start clocks */
+	clockinit();			/* start clocks, including watchdog */
 	timersinit();
 
-	delay(50);			/* let uart catch up */
-	printinit();
-
+	if (vfyintrs() < 0)
+		panic("cpu0: not receiving interrupts");
 	cpuidprint();
 	chkmissing();
 
 	procinit0();
 	initseg();
 
-//	dmainit();
 	links();
-	conf.monitor = 1;
-//	screeninit();
+	conf.monitor = 0;
+//	screeninit();			/* hdmi video not implemented yet */
 
-	iprint("pcireset...");
-	pcireset();			/* this tends to hang after a reboot */
-	iprint("ok\n");
-
+	pcireset();		/* this infrequently hangs after reboot */
 	chandevreset();			/* most devices are discovered here */
+	i8250console();
+	m->printok = 1;			/* serial cons is on, cpu0 locks work */
 
 	pageinit();			/* prints "1020M memory: ⋯ */
+	swapinit();
 	userinit();
 
+	/* moved launchinit into a kproc started by userinit */
+	schedinit();
+	panic("cpu%d: schedinit returned", m->machno);
+}
+
+/*
+ * called on a cpu other than 0 from _vrst in lexception.s,
+ * still in the zero segment.  L2 cache and scu are on (cpu0 did that),
+ * but our L1 D cache, mmu, SMP coherency, and interrupts should be off.
+ * thus we need to manually flush our caches for other cpus to see the contents.
+ *
+ * our mmu will start with an exact copy of cpu0's l1 page table
+ * as it was after userinit ran.  m has been set to Mach* for this cpu.
+ */
+void
+seccpustart(void)
+{
+	m->printok = 0;		/* actually: don't lock; lets iprint work */
+	up = nil;
+	cacheiinv();
+	if (m->machno == 0)
+		panic("seccpustart called on cpu 0");
+	if (iscpuactive(m->machno))
+		panic("cpu%d: resetting after started", m->machno);
+	if (iscpureset(m->machno))
+		panic("cpu%d: in reset in seccpustart", m->machno);
+
+	warpregs(0);		/* ensure that we're executing in the 0 seg */
+	errata();		/* work around cortex-a9 bugs */
+	cortexa9cachecfg();
+	exceptinit();
+	watchdogoff();
 	/*
-	 * starting a cpu will eventually result in it calling schedinit,
-	 * so everything necessary to run user processes should be set up
-	 * before starting secondary cpus.
+	 * starting from an old copy of cpu0's L1 ptes,
+	 * redo double map of PHYSDRAM, KZERO in this cpu's ptes.
+	 * map v 0 -> p 0 so we can run after enabling mmu.
 	 */
-	launchinit();
-	/* SMP & FW are already on when we get here; u-boot set them? */
-	for (cpu = 1; cpu < navailcpus; cpu++)
-		if (startcpu(cpu) < 0)
-			panic("cpu%d didn't start", cpu);
-	l1diag();
+	mmudoublemap();
+	cachedinv(); /* cpu non-0 step 1b: inval. L1 D cache before enabling */
+
+	/*
+	 * step 2: turn my L1 D cache on; need it (and mmu) for tas below.
+	 * need branch prediction to make delay() timing right.
+	 */
+	cachedon();
+	smpcoheron();	/* step 3: enable cache coherency, for atomics */
+
+	/*
+	 * apparently we can't enable the TTBlow attributes until after
+	 * mmuon's cacheuwbinv() or mmuinvalidate() with caches on,
+	 * or else cpu1 won't come up.
+	 */
+	mmuon(PADDR(m->mmul1));
+	ttbput(ttbget() | TTBlow);
+
+	/*
+	 * we now have normal, shareable, write-back, write-allocate
+	 * cacheable memory on this cpu.
+	 */
+
+	warpregs(KZERO);  /* warp the PC, SB, SP and m into the virtual map */
+
+	/*
+	 * now running at virtual KZERO+something with
+	 * PC, SB, m, and SP adjusted to KZERO space.
+	 */
+	m->printok = 1;		/* serial cons is on, locks work on this cpu */
+	hivecs();
+	machinit();			/* bumps nmach, adds bit to machs */
+	machoff(m->machno);		/* not ready to schedule yet */
+
+	/* establish new kernel stack for this cpu in Mach */
+	setsp((uintptr)m + MACHSIZE - 4 - ARGLINK);
+
+	/* clock signals and scu are system-wide and already on */
+	clockshutdown();
+
+	poweron();
+
+	trapinit();
+	sgienable();
+	clockenable(m->machno);
+	clockinit();			/* sets loop delay */
+	timersinit();
+	confirmup();		/* notify cpu0 that we're up (or down) */
+	cpuidprint();
+
+	/*
+	 * 8169 has to initialise before we get past this, thus cpu0
+	 * has to schedule processes first.
+	 */
+	awaitstablel1pt();
+	mmuinit();	/* update our l1 pt from cpu0's, zero user ptes */
+
+	fpoff();
+	machon(m->machno);		/* now ready to schedule */
+	irqreassign();
 
 	schedinit();
 	panic("cpu%d: schedinit returned", m->machno);
+}
+
+static int rebooting;
+
+/*
+ * take this cpu out of service and wait for others to shut down.
+ * if we're cpu0 and they don't, put them into reset.
+ */
+static void
+shutdown(int ispanic)
+{
+	int ms, once, cpu, want;
+
+	want = 0;
+	if (m->machno == 0)
+		/*
+		 * the other cpus could be holding locks that will never get
+		 * released (e.g., in the print path) if we put them into
+		 * reset now, so ask them to shutdown gracefully first.
+		 */
+		for (want = 0, cpu = 1; cpu < navailcpus; cpu++)
+			want |= 1 << cpu;
+
+	ilock(&active);
+	if(ispanic)
+		active.ispanic = ispanic;
+	else if(m->machno == 0 && !iscpuactive(m->machno))
+		active.ispanic = 0;
+	once = iscpuactive(m->machno);
+	/*
+	 * setting exiting will make hzclock() on each processor call exit(0),
+	 * which calls shutdown(0) and idles non-bootstrap cpus and returns
+	 * on bootstrap processors (to permit a reboot).  clearing our bit
+	 * in machs avoids calling exit(0) from hzclock() on this processor.
+	 */
+	cpuinactive(m->machno);
+	active.exiting = 1;
+	iunlock(&active);
+
+	if(once) {
+		delay((MAXMACH - m->machno)*100);	/* stagger them */
+		print("cpu%d: exiting in shutdown\n", m->machno);
+	}
+	spllo();
+	if (m->machno == 0)
+		ms = 10*1000;
+	else
+		ms = 1000;
+	for(; ms > 0; ms -= TK2MS(2)){
+		delay(TK2MS(2));
+		if(active.nmachs == 0 && consactive() == 0)
+			break;
+	}
+	iprint("cpu%d: shutdown done: active.nmachs %#d\n",
+		m->machno, active.nmachs);
+	if (m->machno == 0)
+		forcedown(want);
 }
 
 /*
  *  exit kernel either on a panic or user request
  */
 void
-exit(int)
+exit(int ispanic)
 {
-	cpushutdown();
 	splhi();
-
-	if(m->machno){
-		intrcpushutdown();
+	if (m->machno == 0) {
+		delay(2000);
+		shutdown(ispanic);
+		iprint("cpu%d: rebooting in exit\n", m->machno);
+		prstkuse();
+		delay(3000);
+		cpucleanup();
+		archreboot();		/* no return */
+	} else {
+		shutdown(ispanic);
+		if (!rebooting) {
+			ilock(&active);
+			cpuactive(0);		/* make sure cpu0 runs exit */
+			iunlock(&active);
+		}
+		cpucleanup();
 		stopcpu(m->machno);
-		for (;;)
-			idlehands();
+		resetcpu(m->machno);	/* no return */
 	}
-
-	/* clear secrets */
-	zeroprivatepages();
-	poolreset(secrmem);
-
-	archreboot();
+	cpuwfi();
 }
 
 int
 isaconfig(char *class, int ctlrno, ISAConf *isa)
 {
-	char cc[32], *p, *x;
+	char cc[32], *p;
 	int i;
 
 	snprint(cc, sizeof cc, "%s%d", class, ctlrno);
 	p = getconf(cc);
 	if(p == nil)
 		return 0;
-
-	x = nil;
-	kstrdup(&x, p);
-	p = x;
 
 	isa->type = "";
 	isa->nopt = tokenize(p, isa->opt, NISAOPT);
@@ -471,31 +693,91 @@ isaconfig(char *class, int ctlrno, ISAConf *isa)
 	return 1;
 }
 
+/* try to reschedule this process onto the designated cpu. */
+int
+runoncpu(uint cpu)
+{
+	if (m->machno == cpu)
+		return 0;
+	/* if it's marked as out-of-service, sched won't schedule on it. */
+	if (!iscpuactive(cpu)) {
+		iprint("runoncpu: cpu%d not active, can't switch to it\n", cpu);
+		return -1;
+	}
+	if (up != nil) {
+		procwired(up, cpu);
+		sched();
+		coherence();
+	}
+	return m->machno == cpu? 0: -1;
+}
+
+/* shut down the other cpus by forcing them into reset. */
+void
+forcedown(uint want)
+{
+	int cpu, ms, nmach;
+
+	nmach = conf.nmach;
+	for (ms = 3*1000; ms > 0 && (cpusinreset() & want) != want; ms--) {
+		delay(1);
+		coherence();
+	}
+	if ((cpusinreset() & want) == want) {
+		iprint("secondary cpus shutdown voluntarily\n");
+		return;
+	}
+
+	for (cpu = 1; cpu < nmach; cpu++)
+		if (!iscpureset(cpu) && want & (1<<cpu)) {
+			iprint("resetting cpu%d\n", cpu);
+			stopcpu(cpu);		/* make really sure */
+		}
+	if ((cpusinreset() & want) == want)
+		return;
+
+	/* take no chances.  force other cpus into reset. */
+	delay(10);
+	for (cpu = 1; cpu < nmach; cpu++)
+		resetcpu(cpu);
+	delay(10);
+	if (!ckcpurst())
+		iprint("secondary cpus refused to reset!\n");
+}
+
 /*
  * the new kernel is already loaded at address `code'
  * of size `size' and entry point `entry'.
  */
 void
-reboot(void *entry, void *code, ulong size)
+reboot(void *phyentry, void *code, ulong size)
 {
 	void (*f)(ulong, ulong, ulong);
 
+	watchdogoff();
 	writeconf();
 
+	if (m->machno != 0)
+		cachedwb();
 	/*
 	 * the boot processor is cpu0.  execute this function on it
 	 * so that the new kernel has the same cpu0.
 	 */
-	while(m->machno != 0){
-		procwired(up, 0);
-		sched();
-	}
-	cpushutdown();
+	if (runoncpu(0) < 0)
+		print("reboot: running on cpu%d instead of cpu0.  beware!\n",
+			m->machno);
+	watchdogoff();
+	rebooting = 1;
+	shutdown(0);
 
 	/*
-	 * should be the only processor running now
+	 * must be the only processor running now
 	 */
+	prstkuse();
 	pcireset();
+	print("cpu%d: reboot entry %#p, code @ %#p size %ld\n",
+		m->machno, phyentry, PADDR(code), size);
+	delay(100);
 
 	/* turn off buffered serial console */
 	serialoq = nil;
@@ -505,26 +787,28 @@ reboot(void *entry, void *code, ulong size)
 	/* shutdown devices */
 	chandevshutdown();
 
-	/* call off the dog */
 	clockshutdown();
 
 	splhi();
 	intrshutdown();
 
-	/* clear secrets */
-	zeroprivatepages();
-	poolreset(secrmem);
-
 	/* setup reboot trampoline function */
 	f = (void*)REBOOTADDR;
 	memmove(f, rebootcode, sizeof(rebootcode));
-	cachedwb();
-	l2cache->wbinv();
+
+	allcacheswbinv();
 	l2cache->off();
-	cacheuwbinv();
+	cachedwbinv();
+	/*
+	 * rebootcode expects L1 to be on.
+	 */
+	cacheiinv();
 
 	/* off we go - never to return */
-	(*f)(PADDR(entry), PADDR(code), size);
+	(*f)((ulong)phyentry, PADDR(code), size);
+
+	iprint("loaded kernel returned!\n");
+	archreboot();
 }
 
 /*
@@ -533,11 +817,23 @@ reboot(void *entry, void *code, ulong size)
 void
 init0(void)
 {
-	char buf[2*KNAMELEN], **sp;
 	int i;
+	char buf[2*KNAMELEN];
+
+	up->nerrlab = 0;
+	coherence();
+	spllo();
+
+	/*
+	 * These are o.k. because rootinit is null.
+	 * Then early kproc's will have a root and dot.
+	 */
+	up->slash = namec("#/", Atodir, 0, 0);
+	pathclose(up->slash->path);
+	up->slash->path = newpath("/");
+	up->dot = cclone(up->slash);
 
 	chandevinit();
-
 	if(!waserror()){
 		snprint(buf, sizeof(buf), "%s %s", "ARM", conffile);
 		ksetenv("terminal", buf, 0);
@@ -555,11 +851,116 @@ init0(void)
 		poperror();
 	}
 	kproc("alarm", alarmkproc, 0);
+	kproc("launchproc", launchproc, 0);
 
-	sp = (char**)(USTKTOP - sizeof(Tos) - 8 - sizeof(sp[0])*4);
-	sp[3] = sp[2] = sp[1] = nil;
-	strcpy(sp[0] = (char*)&sp[4], "boot");
-	touser((uintptr)sp);
+	touser(sp);
+}
+
+static void
+bootargs(uintptr base)
+{
+	int i;
+	ulong ssize;
+	char **av, *p;
+
+	/*
+	 * Push the boot args onto the stack.
+	 * The initial value of the user stack must be such
+	 * that the total used is larger than the maximum size
+	 * of the argument list checked in syscall.
+	 */
+	i = oargblen+1;
+	p = UINT2PTR(STACKALIGN(base + BY2PG - Ustkheadroom - i));
+	memmove(p, oargb, i);
+
+	/*
+	 * Now push argc and the argv pointers.
+	 * This isn't strictly correct as the code jumped to by
+	 * touser in init9.s calls startboot (port/initcode.c) which
+	 * expects arguments
+	 * 	startboot(char *argv0, char **argv)
+	 * not the usual (int argc, char* argv[]), but argv0 is
+	 * unused so it doesn't matter (at the moment...).
+	 */
+	av = (char**)(p - (oargc+2)*sizeof(char*));
+	ssize = base + BY2PG - PTR2UINT(av);
+	*av++ = (char*)oargc;
+	for(i = 0; i < oargc; i++)
+		*av++ = (oargv[i] - oargb) + (p - base) + (USTKTOP - BY2PG);
+	*av = nil;
+
+	/*
+	 * Leave space for the return PC of the
+	 * caller of initcode.  sp is for touser.
+	 */
+	sp = USTKTOP - ssize - sizeof(void*);
+}
+
+/*
+ *  create the first process
+ */
+void
+userinit(void)
+{
+	Proc *p;
+	Segment *s;
+	KMap *k;
+	Page *pg;
+
+	/* no processes yet */
+	up = nil;
+
+	p = newproc();
+	p->pgrp = newpgrp();
+	p->egrp = smalloc(sizeof(Egrp));
+	p->egrp->ref = 1;
+	p->fgrp = dupfgrp(nil);
+	p->rgrp = newrgrp();
+	p->procmode = 0640;
+
+	kstrdup(&eve, "");
+	kstrdup(&p->text, "*init*");
+	kstrdup(&p->user, eve);
+
+	/*
+	 * Kernel Stack
+	 */
+	p->sched.pc = PTR2UINT(init0);
+	p->sched.sp = PTR2UINT(p->kstack+KSTACK-sizeof(up->s.args)-sizeof(uintptr));
+	p->sched.sp = STACKALIGN(p->sched.sp);
+
+	/*
+	 * User Stack
+	 *
+	 * Technically, newpage can't be called here because it
+	 * should only be called when in a user context as it may
+	 * try to sleep if there are no pages available, but that
+	 * shouldn't be the case here.
+	 */
+	s = newseg(SG_STACK, USTKTOP-USTKSIZE, USTKSIZE/BY2PG);
+	s->flushme++;
+	p->seg[SSEG] = s;
+	pg = newpage(1, 0, USTKTOP-BY2PG);
+	segpage(s, pg);
+	k = kmap(pg);
+	bootargs(VA(k));
+	kunmap(k);
+
+	/*
+	 * Text
+	 */
+	s = newseg(SG_TEXT, UTZERO, 1);
+	p->seg[TSEG] = s;
+	pg = newpage(1, 0, UTZERO);
+	memset(pg->cachectl, PG_TXTFLUSH, sizeof(pg->cachectl));
+	segpage(s, pg);
+	k = kmap(s->map[0]->pages[0]);
+	memmove(UINT2PTR(VA(k)), initcode, sizeof initcode);
+	kunmap(k);
+
+	allcacheswb();
+
+	ready(p);
 }
 
 Conf conf;			/* XXX - must go - gag */
@@ -579,10 +980,8 @@ gotmem(uintptr sz)
 
 	/* back off a little from the end */
 	addr = (uintptr)KADDR(PHYSDRAM + sz - BY2WD);
-	if (probeaddr(addr) >= 0) {	/* didn't trap? memory present */
-		memsize = sz;
-		return 0;
-	}
+	if (probeaddr(addr) >= 0)	/* didn't trap? memory present */
+		return sz;
 	return -1;
 }
 
@@ -590,24 +989,16 @@ void
 confinit(void)
 {
 	int i;
-	ulong kpages;
+	ulong kpages, npages;
 	uintptr pa;
 	char *p;
-
-	if(p = getconf("service")){
-		if(strcmp(p, "cpu") == 0)
-			cpuserver = 1;
-		else if(strcmp(p,"terminal") == 0)
-			cpuserver = 0;
-	}
+	Confmem *cm;
 
 	/*
 	 * Copy the physical memory configuration to Conf.mem.
 	 */
-	if(nelem(tsmem) > nelem(conf.mem)){
-		iprint("memory configuration botch\n");
-		exit(1);
-	}
+	if(nelem(tsmem) > nelem(conf.mem))
+		panic("memory configuration botch");
 	if(0 && (p = getconf("*maxmem")) != nil) {
 		memsize = strtoul(p, 0, 0) - PHYSDRAM;
 		if (memsize < 16*MB)		/* sanity */
@@ -618,30 +1009,36 @@ confinit(void)
 	 * see if all that memory exists; if not, find out how much does.
 	 * trapinit must have been called first.
 	 */
-	if (gotmem(memsize - RESRVDHIMEM) < 0)
-		panic("can't find 1GB of memory");
+	memsize -= RESRVDHIMEM;			/* reserve end of memory */
+	i = gotmem(memsize);
+	if (i < 0)
+		panic("can't find %ld bytes of memory", memsize);
+	memsize = i;
 
 	tsmem[0].limit = PHYSDRAM + memsize;
 	memmove(conf.mem, tsmem, sizeof(tsmem));
 
-	conf.npage = 0;
-	pa = PADDR(PGROUND((uintptr)end));
-
 	/*
 	 *  we assume that the kernel is at the beginning of one of the
-	 *  contiguous chunks of memory and fits therein.
+	 *  contiguous chunks of memory and entirely fits therein.
 	 */
-	for(i=0; i<nelem(conf.mem); i++){
+	conf.npage = 0;
+	pa = PADDR(PGROUND(PTR2UINT(end)));
+	for(cm = conf.mem; cm < conf.mem + nelem(conf.mem); cm++){
 		/* take kernel out of allocatable space */
-		if(pa > conf.mem[i].base && pa < conf.mem[i].limit)
-			conf.mem[i].base = pa;
+		if(pa > cm->base && pa < cm->limit)
+			cm->base = pa;
 
-		conf.mem[i].npage = (conf.mem[i].limit - conf.mem[i].base)/BY2PG;
-		conf.npage += conf.mem[i].npage;
+		cm->npage = (cm->limit - cm->base)/BY2PG;
+		conf.npage += cm->npage;
+		if (cm->npage != 0)
+			kmsgbase = (uchar *)cm->limit -
+				BY2PG*(HOWMANY(KMESGSIZE, BY2PG) + 1);
 	}
-
-	conf.upages = (conf.npage*80)/100;
-	conf.ialloc = ((conf.npage-conf.upages)/2)*BY2PG;
+	/* omit top pages for kmesg buffer */
+	npages = conf.npage - (HOWMANY(KMESGSIZE, BY2PG) + 1);
+	conf.upages = (npages*80)/100;
+	conf.ialloc = ((npages-conf.upages)/2)*BY2PG;
 
 	/* set up other configuration parameters */
 	conf.nproc = 100 + ((conf.npage*BY2PG)/MB)*5;
@@ -662,15 +1059,16 @@ confinit(void)
 
 	/*
 	 * Guess how much is taken by the large permanent
-	 * datastructures. Mntcache and Mntrpc are not accounted for.
+	 * datastructures. Mntcache and Mntrpc are not accounted for
+	 * (probably ~300KB).
 	 */
-	kpages = conf.npage - conf.upages;
+	kpages = npages - conf.upages;
 	kpages *= BY2PG;
-	kpages -= conf.upages*sizeof(Page)
-		+ conf.nproc*sizeof(Proc*)
-		+ conf.nimage*sizeof(Image)
-		+ conf.nswap
-		+ conf.nswppo*sizeof(Page*);
+	kpages -= conf.upages*sizeof(Page)	/* palloc.pages in pageinit */
+		+ conf.nproc*sizeof(Proc)  /* procalloc.free in procinit0 */
+		+ conf.nimage*sizeof(Image)	/* imagealloc.free in initseg */
+		+ conf.nswap		/* swapalloc.swmap in swapinit */
+		+ conf.nswppo*sizeof(Page*);	/* iolist in swapinit */
 	mainmem->maxsize = kpages;
 	if(!cpuserver)
 		/*
@@ -679,69 +1077,60 @@ confinit(void)
 		 * be careful with 32-bit overflow.
 		 */
 		imagmem->maxsize = kpages;
+
+	/* don't call archconfinit here; see archreset */
 }
 
-void
-advertwfi(void)			/* advertise my wfi status */
-{
-	ilock(&active);
-	active.wfi |= 1 << m->machno;
-	iunlock(&active);
-}
-
-void
-unadvertwfi(void)		/* do not advertise my wfi status */
-{
-	ilock(&active);
-	active.wfi &= ~(1 << m->machno);
-	iunlock(&active);
-}
+extern int nrdy;
 
 void
 idlehands(void)
 {
-#ifdef use_ipi
-	int advertised;
+	int s, advertised;
 
 	/* don't go into wfi until my local timer is ticking */
-	if (m->ticks <= 1)
+	if (m->ticks == 0 || nrdy > 0)
 		return;
 
-	advertised = 0;
-	m->inidlehands++;
-	/* avoid recursion via ilock, advertise iff this cpu is initialised */
-	if (m->inidlehands == 1 && m->syscall > 0) {
-		advertwfi();
-		advertised = 1;
-	}
+	/* flush dirty cache lines before splhi, leaving almost none dirty */
+	l2pl310sync();			/* pl310 erratum 769419 */
 
+	s = splhi();
+	if (m->inidlehands) {		/* don't recurse */
+		splx(s);
+		return;
+	}
+	m->inidlehands++;
+	advertised = m->inidlehands == 1;
+	if (advertised)
+		active.wfi[m->machno] = 1;
+
+	l2pl310sync();			/* pl310 erratum 769419 */
 	wfi();
 
 	if (advertised)
-		unadvertwfi();
+		active.wfi[m->machno] = 0;
 	m->inidlehands--;
-#endif
+	splx(s);
+	/* the interrupt that resumed WFI will be taken here. */
 }
 
+/*
+ * interrupt any cpu, other than me, currently in wfi.
+ * need not be exact.
+ */
 void
 wakewfi(void)
 {
-#ifdef use_ipi
 	uint cpu;
 
-	/*
-	 * find any cpu other than me currently in wfi.
-	 * need not be exact.
-	 */
-	cpu = BI2BY*BY2WD - 1 - clz(active.wfi & ~(1 << m->machno));
-	if (cpu < MAXMACH)
-		intrcpu(cpu);
-#endif
+	if (m->ticks == 0)
+		return;
+	for (cpu = 0; cpu < conf.nmach; cpu++)
+		if (active.wfi[cpu] && cpu != m->machno) {
+			intrcpu(cpu, 0);
+			break;
+		}
 }
 
-void
-setupwatchpts(Proc *, Watchpt *, int n)
-{
-	if(n > 0)
-		error("no watchpoints");
-}
+void (*lockwake)(void) = wakewfi;

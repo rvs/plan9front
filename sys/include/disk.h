@@ -1,6 +1,9 @@
 #pragma src "/sys/src/libdisk"
 #pragma lib "libdisk.a"
 
+/* sorry, but the kernel uses these and we want only one set of definitions. */
+#include <diskcmd.h>
+
 /* SCSI interface */
 typedef struct Scsi Scsi;
 struct Scsi {
@@ -41,9 +44,7 @@ struct Disk {
 	vlong secsize;
 	vlong size;
 	vlong offset;	/* within larger disk, perhaps */
-	int width;	/* of disk size in bytes as decimal string */
-	int psecsize;
-	int physalign;
+	int width;	/* of disk size as decimal string */
 	int c;
 	int h;
 	int s;
@@ -65,4 +66,5 @@ enum {
 /* proto file parsing */
 typedef void Protoenum(char *new, char *old, Dir *d, void *a);
 typedef void Protowarn(char *msg, void *a);
+
 int rdproto(char*, char*, Protoenum*, Protowarn*, void*);

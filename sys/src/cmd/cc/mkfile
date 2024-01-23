@@ -19,15 +19,12 @@ OFILES=\
 	omachcap.$O\
 
 HFILES=cc.h\
-	compat.h\
 	y.tab.h\
 
 YFILES=cc.y\
 
-CLEANFILES=$LIB
-
-CURCC=6c 8c qc vc
-OTHERCC=1c 2c 5c 7c kc
+CURCC=5c 6c 7c 8c ic qc vc
+OTHERCC=kc
 
 </sys/src/cmd/mklib
 
@@ -37,9 +34,7 @@ install:V:	$LIB
 $LIB:	$LIBOBJ
 	ar vu $LIB $OFILES
 
-mac.$O: macbody
-
-compat.$O: compat
+mac.$O:	macbody
 
 everything:V:
 	# mk the current compilers

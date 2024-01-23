@@ -1,0 +1,137 @@
+# 9k risc-v diagnostic for rvb-ice xuantie 910 triple-core board
+dev +dev
+	root
+	cons
+	arch
+	env
+	pipe
+	proc
+	mnt
+	srv
+	dup
+	uart
+
+uart +dev
+	uarti8250
+
+misc +dev
+	nocache
+
+boot cpu
+	tcp
+
+rootdir
+	boot$CONF.out		boot
+
+conf
+	#include "riscv64.h"
+
+	int cpuserver = 1;
+	uvlong cpuhz = 1200*1000*1000;	/* rdtsc tick freq */
+	uvlong timebase = 1000*1000;	/* clint tick freq */
+	Membank membanks[] = {		/* (address, size) pairs */
+		PHYSMEM, GB,
+		PHYSMEM + GB, 0xe0000000ull - GB,	/* gpu follows */
+		0,
+	};
+	char defnvram[] = "#S/sdM0/nvram";
+
+	uintptr uartregs[] = { PAUart0 };
+	int nuart = nelem(uartregs);
+	vlong uartfreq = 62500000;	/* from pf docs & dev tree */
+
+	/* copied the mac address that u-boot uses */
+	uchar ether0mac[] = { 0x0, 0xa0, 0xa0, 0xa0, 0xa0, 0xa1, };
+
+	Soc soc = {
+		.clint	 = (char *)PAClint,
+		.ether[0]= (char *)0x3fffc0000LL,
+	//	.l2cache = (char *)0,	/* xuantie one uses csrs instead */
+		.pci	 = (char *)0,	/* ecam for cfg space */
+		.pcictl  = (char *)0,	/* axi: 2nd bridge, ctrl regs */
+		.pciess	 = (char *)0,	/* soft reset, etc. */
+		.plic    = (char *)0x3f0000000LL,
+		.uart	 = (char *)PAUart0,
+		.wdog0	 = (char *)0x3fff78000LL,
+		.hobbled = 0,		/* mgmt hart 0 present? */
+		.c910	 = 1,		/* broken cpu */
+	};
+	Ioconf ioconfs[] = {	/* devices whose drivers vmap their regs */
+		0
+	};
+	Ioconf socconf[] = { /* devices without drivers that vmap their regs */
+		{ "clint", 64*KB, &soc.clint, },
+	//	{ "l2cache", PGSZ, &soc.l2cache, },
+		{ "pci",   2*MB, &soc.pci, },		/* pcie [01] ecam cfg */
+		{ "pcictl", 2*32*KB, &soc.pcictl, },	/* pcie [01] brg, ctl */
+		{ "pciess", PGSZ, &soc.pciess, },
+		{ "plic",  64*MB, &soc.plic, },		/* common */
+		{ "uart",  PGSZ, &soc.uart, 24, },
+		{ "wdog",  PGSZ, &soc.wdog0, },
+		0
+	};
+
+riscv64
+	start
+	low
+	beginxt
+	mchxt
+# choose fakemtrap or mtrap.  determines bootmachmode.
+	mtrap
+	strap
+	mch
+	main
+	arch
+	archrv
+	csr
+	fakepci
+	fp
+	fpu
+	ioconf
+	map
+	memory
+	mmu
+	sane
+	sbi
+# choose fakesbi or sbicall & sbiecall
+	fakesbi
+#	sbicall
+#	sbiecall
+	trap
+port
+	alarm
+	allocb
+	byteserial
+	chan
+	ctype
+	dev
+	devtab
+	edf
+	fault
+	image
+#	latin1
+	logpow
+	page
+	parse
+	pgrp
+	portclock
+	prf
+	print
+	proc
+	ps
+	qio
+	qlock
+	qmalloc
+	random
+	rebootcmd
+	segment
+	sysauth
+	sysfile
+	taslock
+	tod
+
+#
+# controls which directories to look in for source files; must be relative to ..
+#
+dir
+	port

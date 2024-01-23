@@ -100,27 +100,14 @@ loop1:
 		case AMOVQ:
 		case AMOVSS:
 		case AMOVSD:
-			if(!regtyp(&p->to))
-				break;
+			if(regtyp(&p->to))
 			if(regtyp(&p->from)) {
 				if(copyprop(r)) {
 					excise(r);
 					t++;
-					break;
-				}
+				} else
 				if(subprop(r) && copyprop(r)) {
 					excise(r);
-					t++;
-					break;
-				}
-			}
-			if(p->as != AMOVL)
-				break;
-			r1 = rnops(uniqs(r));
-			if(r1 != R){
-				p1 = r1->prog;
-				if(p1->as == AMOVLQZX && p1->from.type == p->to.type && p1->to.type == p->to.type){
-					excise(r1);
 					t++;
 				}
 			}
@@ -134,17 +121,7 @@ loop1:
 				r1 = rnops(uniqs(r));
 				if(r1 != R) {
 					p1 = r1->prog;
-					if(p->to.type != p1->from.type)
-						break;
-					if((p->as == AMOVBLZX && p1->as == AMOVBQZX)
-					|| (p->as == AMOVWLZX && p1->as == AMOVWQZX)
-					|| (p->as == AMOVBLSX && p1->as == AMOVBQSX && p1->to.type == p->to.type)
-					|| (p->as == AMOVWLSX && p1->as == AMOVWQSX && p1->to.type == p->to.type)) {
-						p->as = p1->as;
-						p1->as = AMOVQ;
-						t++;
-					} else
-					if(p->as == p1->as) {
+					if(p->as == p1->as && p->to.type == p1->from.type){
 						p1->as = AMOVL;
 						t++;
 					}
@@ -164,24 +141,6 @@ loop1:
 					p1 = r1->prog;
 					if(p->as == p1->as && p->to.type == p1->from.type){
 						p1->as = AMOVQ;
-						t++;
-					}
-				}
-			}
-			break;
-
-		case ALEAQ:
-			if(regtyp(&p->to)) {
-				r1 = rnops(uniqs(r));
-				if(r1 != R){
-					p1 = r1->prog;
-					if((p1->as == AMOVL || p1->as == AMOVQ)
-					&& p1->to.type == p->to.type
-					&& p1->from.type-D_INDIR == p->to.type
-					&& p1->from.index == D_NONE
-					&& p1->from.offset == 0){
-						p->as = p1->as;
-						excise(r1);
 						t++;
 					}
 				}
@@ -235,61 +194,6 @@ loop1:
 				else
 					p->as = ADECW;
 				p->from = zprog.from;
-			}
-			break;
-
-		case ACMPL:
-		case ACMPQ:
-			if(p->to.type != D_CONST || p->to.offset != 0 || regtyp(&p->from) == 0)
-				break;
-			if(p->link == P || (p->link->as != AJEQ && p->link->as != AJNE))
-				break;
-			r1 = uniqp(r);
-			while(r1 != R && r1->prog->as == ANOP)
-				r1 = uniqp(r1);
-			if(r1 == R || r1->prog->to.type != p->from.type)
-				break;
-			p1 = r1->prog;
-			switch(p1->as){
-			case ASHLQ:
-			case ASHRQ:
-			case ASALQ:
-			case ASARQ:
-				/* shift doesnt affect ZF when shift count is zero */
-				if(p1->from.type != D_CONST || p1->from.offset == 0)
-					break;
-			case AANDQ:
-			case AORQ:
-			case AXORQ:
-			case ANEGQ:
-			case AADDQ:
-			case AADCQ:
-			case ASUBQ:
-			case ASBBQ:
-			case AINCQ:
-			case ADECQ:
-				if(p->as != ACMPQ)
-					break;
-			case AANDL:
-			case AORL:
-			case AXORL:
-			case ANEGL:
-			case AADDL:
-			case AADCL:
-			case ASUBL:
-			case ASBBL:
-			case AINCL:
-			case ADECL:
-				excise(r);
-				break;
-			case ASHLL:
-			case ASHRL:
-			case ASALL:
-			case ASARL:
-				/* shift doesnt affect ZF when shift count is zero */
-				if(p1->from.type != D_CONST || p1->from.offset == 0)
-					break;
-				excise(r);
 			}
 			break;
 		}
@@ -388,11 +292,15 @@ subprop(Reg *r0)
 			break;
 		p = r->prog;
 		switch(p->as) {
+		case ACALL:
+			return 0;
+
 		case AIMULL:
 		case AIMULQ:
 		case AIMULW:
 			if(p->to.type != D_NONE)
 				break;
+
 		case ADIVB:
 		case ADIVL:
 		case ADIVQ:
@@ -406,19 +314,6 @@ subprop(Reg *r0)
 		case AMULL:
 		case AMULQ:
 		case AMULW:
-
-		case ACWD:
-		case ACDQ:
-		case ACQO:
-
-		case AREP:
-		case AREPN:
-		case ALOOP:
-		case ALOOPEQ:
-		case ALOOPNE:
-
-		case ACALL:
-			return 0;
 
 		case AROLB:
 		case AROLL:
@@ -444,60 +339,20 @@ subprop(Reg *r0)
 		case ASHRL:
 		case ASHRQ:
 		case ASHRW:
-			if(p->from.type == D_CX && v1->type == D_CX)
-				return 0;
-			break;
 
-		case AORL:
-		case AORQ:
-		case AANDL:
-		case AANDQ:
-		case AXORL:
-		case AXORQ:
-		case AADDL:
-		case AADDQ:
-		case AADCL:
-		case AADCQ:
+		case AREP:
+		case AREPN:
 
-		case AADDSS:
-		case AADDSD:
-		case AMULSS:
-		case AMULSD:
-			/*
-			 * can swap when:
-			 *  ADD R2, R1
-			 *  MOV R1, R2
-			 * convert to:
-			 *  ADD R1, R2
-			 *  MOV R2, R1	/ no use for R1
-			 */
-			if(p->to.type == v1->type && p->from.type == v2->type){
-				copysub(&p->from, v2, v1, 1);
-				goto gotit;
-			}
-			break;
+		case ACWD:
+		case ACDQ:
+		case ACQO:
+
+		case AMOVSL:
+		case AMOVSQ:
+			return 0;
 
 		case AMOVL:
-		case ALEAL:
-		case AMOVSL:
-		case AMOVBLZX:
-		case AMOVBLSX:
-		case AMOVWLZX:
-		case AMOVWLSX:
-		case AMOVQL:
-
 		case AMOVQ:
-		case ALEAQ:
-		case AMOVSQ:
-		case AMOVBQZX:
-		case AMOVBQSX:
-		case AMOVWQZX:
-		case AMOVWQSX:
-		case AMOVLQZX:
-		case AMOVLQSX:
-
-		case AMOVSS:
-		case AMOVSD:
 			if(p->to.type == v1->type)
 				goto gotit;
 			break;
@@ -692,7 +547,6 @@ copyu(Prog *p, Adr *v, Adr *s)
 	case AMOVWLZX:
 	case AMOVWQSX:
 	case AMOVWQZX:
-	case AMOVQL:
 
 	case AMOVSS:
 	case AMOVSD:
@@ -890,8 +744,6 @@ copyu(Prog *p, Adr *v, Adr *s)
 		return 0;
 
 	case ARET:	/* funny */
-		if(REGEXT && v->type <= REGEXT && v->type > exregoffset)
-			return 2;
 		if(v->type == REGRET || v->type == FREGRET)
 			return 2;
 		if(s != A)

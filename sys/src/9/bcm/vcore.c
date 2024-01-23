@@ -15,8 +15,8 @@ typedef struct Fbinfo Fbinfo;
 typedef struct Vgpio Vgpio;
 
 enum {
-	Read		= 0x00>>2,
-	Write		= 0x00>>2,
+//	Read		= 0x00>>2,
+	VcWrite		= 0x00>>2,
 	Peek		= 0x10>>2,
 	Sender		= 0x14>>2,
 	Status		= 0x18>>2,
@@ -40,20 +40,10 @@ enum {
 	TagGetpower	= 0x00020001,
 	TagSetpower	= 0x00028001,
 		Powerwait	= 1<<1,
-	TagGetclkstate	= 0x00030001,
-	TagGetclkspd	= 0x00030002,
-	TagGetclkmax	= 0x00030004,
-	TagSetclkstate	= 0x00038001,
-	TagSetclkspd	= 0x00038002,
-
-	TagGetEgpioState= 0x00030041,
-	TagSetEgpioState= 0x00038041,
-	TagSetSdhostClk	= 0x00038042,
-	TagGetEgpioConf	= 0x00030043,
-	TagSetEgpioConf	= 0x00038043,
-
+	TagGetclkspd= 0x00030002,
+	TagGetclkmax= 0x00030004,
+	TagSetclkspd= 0x00038002,
 	TagGettemp	= 0x00030006,
-	TagXhciReset	= 0x00030058,
 	TagFballoc	= 0x00040001,
 	TagFbfree	= 0x00048001,
 	TagFbblank	= 0x00040002,
@@ -112,7 +102,7 @@ vcwrite(uint chan, int val)
 	while(r[Status]&Full)
 		;
 	coherence();
-	r[Write] = val | chan;
+	r[VcWrite] = val | chan;
 }
 
 static int
@@ -157,9 +147,9 @@ vcreq(int tag, void *buf, int vallen, int rsplen)
 	prop->taglen = vallen;
 	if(vallen > 0)
 		memmove(prop->data, buf, vallen);
-	cachedwbinvse(prop, n);
+	cachedwbinvse(prop, prop->len);
 	for(;;){
-		aprop = busaddr? dmaaddr(prop) : (uintptr)prop;
+		aprop = busaddr? dmaaddr(prop) : PTR2UINT(prop);
 		vcwrite(ChanProps, aprop);
 		r = vcread(ChanProps);
 		if(r == aprop)
@@ -168,7 +158,6 @@ vcreq(int tag, void *buf, int vallen, int rsplen)
 			return -1;
 		busaddr = 0;
 	}
-	cachedinvse(prop, n);
 	if(prop->req == RspOk &&
 	   prop->tag == tag &&
 	   (prop->taglen&TagResp)) {
@@ -221,9 +210,8 @@ fbinit(int set, int *width, int *height, int *depth)
 	cachedwbinvse(fi, sizeof(*fi));
 	vcwrite(ChanFb, dmaaddr(fi));
 	if(vcread(ChanFb) != 0)
-		return nil;
-	cachedinvse(fi, sizeof(*fi));
-	va = mmukmap(FRAMEBUFFER, (fi->base&~0xC0000000)|PHYSDRAM, fi->screensize);
+		return 0;
+	va = mmukmap(FRAMEBUFFER, fi->base & ~0xC0000000, fi->screensize);
 	if(va)
 		memset((char*)va, 0x7F, fi->screensize);
 	return (void*)va;
@@ -281,7 +269,7 @@ getethermac(void)
 	vcreq(TagGetmac, ea, 0, sizeof ea);
 	p = buf;
 	for(i = 0; i < 6; i++)
-		p += sprint(p, "%.2x", ea[i]);
+		p = seprint(p, buf + sizeof buf, "%.2x", ea[i]);
 	return buf;
 }
 
@@ -398,35 +386,4 @@ vgpset(uint port, int on)
 		vgpio.decs++;
 	vgpio.counts[port] = (vgpio.incs << 16) | vgpio.decs;
 	vgpio.ison = on;
-}
-
-/*
- * Raspberry Pi GPIO expander (Pi 3 and 4)
- */
-void
-egpset(uint port, int on)
-{
-	u32int buf[2];
-
-	if(port >= 8)
-		return;
-	buf[0] = 128 + port;
-	buf[1] = on;
-	vcreq(TagSetEgpioState, buf, sizeof(buf), sizeof(buf));
-}
-
-/*
- * Notify gpu that xhci firmware might need loading. This is for some
- * pi4 board versions which are missing the eeprom chip for the vl805,
- * requiring its firmware to come from the boot eeprom instead.
- */
-int
-xhcireset(int devaddr)
-{
-	u32int buf[1];
-
-	buf[0] = devaddr;
-	if(vcreq(TagXhciReset, buf, sizeof(buf), sizeof(buf[0])) == sizeof(buf[0]))
-		return buf[0];
-	return -1;
 }

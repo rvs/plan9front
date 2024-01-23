@@ -1,0 +1,110 @@
+ARCH=k10
+CONF=${ARCH}cpu
+CONFLIST=$ARCH ${ARCH}cpu ${ARCH}cpuf ${ARCH}fs	# ${ARCH}cpuaoe; $ARCH won't work
+EXTRACOPIES=fsstand
+
+objtype=amd64
+</$objtype/mkfile
+p=9
+
+9k:V:	$p$CONF
+
+<| ../mk/mkparts $CONF; awk -f ../mk/parse $CONF
+<../mk/bootmkfile
+<../mk/portmkfile
+
+OBJ=$MACH $CONF.root.$O $CONF.$O $DEVS $PORT
+VGA=`{echo devvga.c screen.c vga*.c | sed 's/\.c/.'$O'/g'}
+
+# $LD -o $target.elf -H5 -E0x120000 -P0x120000 -8 -T0xffffffff80120000 $OBJ $CONF.$O
+$p$CONF:	$CONF.c $OBJ $LIB
+	d=`{date}
+	$CC $CFLAGS '-DKERNDATE='`{date -n} '-DDATESTR="'$"d'"' $CONF.c
+	# at -2gb.  -T arg is KZERO + 0x120000; see also use of sipi.h below
+	$LD -o $target -T0xffffffff80120000 -R4096 $OBJ
+	size $target
+	echo -n self-decompressing kernel...
+	{ cat /386/expand-pxe; strzip <$target } >$target^lz
+	echo
+
+# don't strip the gzipped kernels -- too frustrating when that's all you have!
+$p%.gz:D:	$p%
+	gzip -9 <$p$stem >$p$stem.gz
+$p%.lz:D:	$p%
+	lzip -9 <$p$stem >$p$stem.lz
+
+EXP=/sys/src/9/pcexp
+/386/expand-pxe /386/expand-pbs: $EXP/expand.c $EXP/expand.l.s \
+	$EXP/mem.h $EXP/a20.c $EXP/bios.s $EXP/cga.c $EXP/print.c
+	@ { cd $EXP && mk install}
+
+# we don't need gzipped kernels otherwise, so don't make them
+install:V:	$p$CONF	# $p$CONF^lz
+	cp -x $p$CONF /$objtype/ &
+	if (test `{ls -s $p$CONF^lz | awk '{print $1}'} -lt 640)
+		cp -x $p$CONF^lz /$objtype/ &
+	for(i in $EXTRACOPIES)
+		{ 9fs $i && cp -x $p$CONF $p$CONF^lz /n/$i/$objtype && echo -n $i... & }
+	wait
+	echo
+
+l%.$O:		${objtype}l.h
+l16sipi.$O:	l64lme.s
+l32p.$O:	l64lme.s
+
+apic.$O:	apic.h io.h
+archk10.$O:	amd64.h
+asm.$O:		amd64.h
+devarch.$O:	../port/error.h /$objtype/include/ureg.h
+fpu.$O:		amd64.h
+fpu.$O:		/$objtype/include/ureg.h
+ioapic.$O:	apic.h io.h
+main.$O:	amd64.h io.h init.h reboot.h
+memory.$O:	amd64.h
+mmu.$O:		amd64.h
+mp.$O:		apic.h mp.h
+random.$O:	../port/error.h
+sipi.$O:	apic.h sipi.h
+svm.$O:		amd64.h
+svm.$O:		/$objtype/include/ureg.h
+trap.$O:	../port/error.h io.h amd64.h
+trap.$O:	/sys/include/tos.h /$objtype/include/ureg.h
+vsvm.$O:	amd64.h
+
+devether.$O:	../port/error.h ../port/netif.h etherif.h
+devpmc.$O:	../port/error.h ../386/pmc.h
+devrtc.$O:	../port/error.h
+ether%.$O:	../port/error.h ../port/netif.h etherif.h io.h
+etherigbepci.$O: ../port/ethermii.h
+i8259.$O:	io.h
+kbd.$O:		../port/error.h io.h
+pci.$O:		io.h
+pmc.$O:		../port/error.h amd64.h ../386/pmc.h
+sd%.$O:		../port/error.h io.h ../port/sd.h /sys/include/ctype.h
+devusb.$O usb*.$O:	../port/usb.h ../port/portusbehci.h usbehci.h
+
+$VGA mouse.$O devdraw.$O devmouse.$O:	screen.h /sys/include/memdraw.h
+
+${objtype}l.h:D:	$objtype.h ${objtype}ladd.h
+	{rc ../mk/mkenum $objtype.h; cat $objtype^ladd.h} >$target
+
+sipi.h:		l16sipi.$O mkfile
+	# -T arg is KZERO + 0x3000
+	$LD -o l16sipi.out -T0xffffffff80003000 -R4 -l -s l16sipi.$O # -2gb
+	{echo 'uchar sipihandler[]={'; ../mk/extexec2hex l16sipi.out; echo '};'} >$target
+
+# -T argument must match REBOOTADDR in mem.h
+reboot.h:D:	rebootcode.s amd64l.h
+	6a rebootcode.s
+	6l -a >$target.list -l -s -T0x11000 -R4 -o reboot.out rebootcode.6
+	size reboot.out
+	{echo 'uchar rebootcode[]={'; ../mk/extexec2hex reboot.out; echo '};'} >$target
+
+$CONF.rr:	../mk/mkrr $CONF hpc-root/$CONF.proto hpc-root/$O.cpu
+	../mk/mkrr $CONF hpc-root/$CONF.proto
+
+$ARCH.clean:V:
+	rm -f $ARCH^*.c [9bz]$ARCH^* [9bz]$ARCH^*.gz boot$ARCH^*.*
+
+$ARCH.nuke:V:
+	rm -f $objtype^l.h sipi.h reboot.h

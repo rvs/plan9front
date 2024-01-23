@@ -172,9 +172,9 @@ pickletype(Type *t)
 	int n;
 	char *an;
 
-	if(!debug['Z'])
+	if(!debug['P'])
 		return;
-	if(debug['Z'] > 1) {
+	if(debug['P'] > 1) {
 		n = 0;
 		for(i=iostack; i; i=i->link)
 			n++;
@@ -221,9 +221,9 @@ picklevar(Sym *s)
 	Type *t;
 	Sym *s1, *s2;
 
-	if(!debug['Z'] || debug['s'])
+	if(!debug['P'] || debug['s'])
 		return;
-	if(debug['Z'] > 1) {
+	if(debug['P'] > 1) {
 		n = 0;
 		for(i=iostack; i; i=i->link)
 			n++;

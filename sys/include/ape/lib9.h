@@ -7,8 +7,6 @@
 
 #include <u.h>		/* ick; need Rune defined below */
 
-#define IOUNIT	32768U	/* default buffer size for 9p io */
-
 #define	MORDER	0x0003	/* mask for bits defining order of mounting */
 #define	MREPL	0x0000	/* mount replaces object */
 #define	MBEFORE	0x0001	/* mount goes before others in union directory */
@@ -71,11 +69,10 @@ extern	void*	segbrk(void*, void*);
 extern	int	segdetach(void*);
 extern	int	segflush(void*, unsigned long);
 extern	int	segfree(void*, unsigned long);
-extern	void*	rendezvous(void*, void*);
+extern	void*	rendezvous(void *, void *);
 extern	unsigned long	getfcr(void);
 extern	unsigned long	getfsr(void);
 extern	void		setfcr(unsigned long);
 extern	void		setfsr(unsigned long);
-extern	int 	fd2path(int, char*, int);
 
 #endif

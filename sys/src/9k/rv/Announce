@@ -1,0 +1,21 @@
+This directory contains a port of the Plan 9 9k kernel to 64-bit
+RISC-V systems, specifically RV64GC systems.  It currently only runs
+on the Microchip Polarfire Icicle, Starfive Visionfive 2, and
+discontinued Hifive Unmatched and pre-release Beagle V boards, but
+should be relatively easy to adapt to future RV64GC systems.  SiFive
+designs have worked best.
+
+The Nezha board's u-boot lacks PXE booting, so it's a non-starter.  An Rvb-ice
+port is in progress but seriously stalled; it is incompatible (if not buggy)
+in a few respects.  You will find debugging code, particularly at start-up,
+mostly tagged with "C910".
+
+Set the ARCH environment variable to the target RISC-V architecture (e.g.,
+"pf" for Icicle, "um" for Unmatched) before invoking mk.
+
+Please read ../doc/*.pdf.
+
+To print KZERO and the reboot trampoline base address (RBKTZERO) for the
+current ARCH,
+
+	mk -f kzmkfile

@@ -1,0 +1,37 @@
+</$objtype/mkfile
+
+BIN=$home/bin/$objtype
+
+TARG=temu
+OFILES=\
+	temu.$O\
+	virtio.$O\
+	pci.$O\
+	fs.$O\
+	cutils.$O\
+	iomem.$O\
+	simplefb.$O\
+	json.$O\
+	machine.$O\
+	riscv_machine.$O\
+	softfp.$O\
+	riscv_cpu32.$O\
+	riscv_cpu64.$O\
+	getopt.$O\
+	nsec.$O\
+
+</sys/src/cmd/mkone
+
+riscv_cpu32.$O: riscv_cpu.c
+	$CC $CFLAGS -DMAX_XLEN'='32 -o $target $prereq
+
+riscv_cpu64.$O: riscv_cpu.c
+	$CC $CFLAGS -DMAX_XLEN'='64 -o $target $prereq
+
+nsec.$O: /$objtype/lib/libc.a
+	ar x /$objtype/lib/libc.a $target
+
+CC=pcc
+CFLAGS=-c -I. -D_POSIX_SOURCE -D_BSD_EXTENSION -D_SUSV2_SOURCE -DPlan9\
+	-DCONFIG_RISCV_MAX_XLEN'='64 -DCONFIG_VERSION'='"plan9"
+LD=pcc

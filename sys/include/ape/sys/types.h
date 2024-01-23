@@ -11,13 +11,24 @@ typedef short		gid_t;
 typedef short		nlink_t;
 typedef int		pid_t;
 
+#include "_apetypes.h"
+
 #ifndef _SIZE_T
 #define _SIZE_T
+#ifdef _BITS64
+typedef unsigned long long size_t;
+#else
 typedef unsigned long size_t;
 #endif
+#endif
+
 #ifndef _SSIZE_T
 #define _SSIZE_T
+#ifdef _BITS64
+typedef long long ssize_t;
+#else
 typedef long ssize_t;
+#endif
 #endif
 
 #ifndef _TIME_T
@@ -40,9 +51,6 @@ typedef struct fd_set {
 #define FD_CLR(n,p)	((p)->fds_bits[(n)>>5] &= ~(1 << ((n) &0x1f)))
 #define FD_ISSET(n,p)	((p)->fds_bits[(n)>>5] & (1 << ((n) &0x1f)))
 #define FD_ZERO(p)	((p)->fds_bits[0] =0, (p)->fds_bits[1] =0, (p)->fds_bits[2] =0)
-#ifndef FD_SETSIZE
-#define FD_SETSIZE	96
-#endif
 #endif
 #endif
 

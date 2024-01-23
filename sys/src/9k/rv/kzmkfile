@@ -1,0 +1,17 @@
+# rv kzmkfile - mkfile to print kzero for ARCH
+
+</$cputype/mkfile
+<./$ARCH/defs
+<| mk null
+
+CFLAGS=$CFLAGS $CONFDEF
+
+kzero:V: $O.prkzero
+	$O.prkzero
+prkzero.$O: prkzero.c mem.h addrconf.h ./$ARCH/defs /dev/cons
+	$CC $CFLAGS prkzero.c
+$O.prkzero: prkzero.$O
+	$LD -o $target $prereq
+
+clean:V:
+	rm -f prkzero.$O $O.prkzero

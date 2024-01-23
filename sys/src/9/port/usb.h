@@ -17,11 +17,11 @@ typedef struct Hciimpl Hciimpl;	/* Link to the controller impl. */
 enum
 {
 	/* fundamental constants */
-	Ndeveps	= 32,		/* max nb. of endpoints per device (16 in + 16 out) */
+	Ndeveps	= 16,		/* max nb. of endpoints per device */
 
 	/* tunable parameters */
 	Nhcis	= 16,		/* max nb. of HCIs */
-	Neps	= 64,		/* max nb. of endpoints */
+	Neps	= 128,		/* max nb. of endpoints */
 	Maxctllen = 32*1024, /* max allowed sized for ctl. xfers; see Maxdevconf */
 	Xfertmout = 2000,	/* default request time out (ms) */
 
@@ -37,11 +37,11 @@ enum
 	Devmax	= 0x7F,		/* max dev. addr */
 
 	/* Speeds */
-	Fullspeed = 0,
-	Lowspeed,
-	Highspeed,
+	Fullspeed = 0,		/* 480Mb/s, usb 2 */
+	Lowspeed,		/* 1.5Mb/s */
+	Highspeed,		/* 12Mb/s */
 	Nospeed,
-	Superspeed,
+	/* usb 3 (xhci) adds Superspeed 5Gb/s */
 
 	/* request type */
 	Rh2d = 0<<7,
@@ -87,21 +87,25 @@ enum
 };
 
 /*
- * Services provided by the driver.
+ * Services provided by an Hci driver.
+ *
  * epopen allocates hardware structures to prepare the endpoint
- * for I/O. This happens when the user opens the data file.
- * epclose releases them. This happens when the data file is closed.
+ * for I/O when the user opens the data file.
+ * epclose releases them when the data file is closed.
+ *
  * epwrite tries to write the given bytes, waiting until all of them
  * have been written (or failed) before returning; but not for Iso.
  * epread does the same for reading.
+ *
  * It can be assumed that endpoints are DMEXCL but concurrent
  * read/writes may be issued and the controller must take care.
  * For control endpoints, device-to-host requests must be followed by
  * a read of the expected length if needed.
- * The port requests are called when usbd issues commands for root
- * hubs. Port status must return bits as a hub request would do.
+ *
+ * The port requests are called when usbd issues commands for root hubs.
+ * Port status must return bits as a hub request would do.
  * Toggle handling and other details are left for the controller driver
- * to avoid mixing too much the controller and the comon device.
+ * to avoid mixing too much the controller and the common device.
  * While an endpoint is closed, its toggles are saved in the Ep struct.
  */
 struct Hciimpl
@@ -109,7 +113,7 @@ struct Hciimpl
 	void	*aux;				/* for controller info */
 	void	(*init)(Hci*);			/* init. controller */
 	void	(*dump)(Hci*);			/* debug */
-	void	(*interrupt)(Ureg*, void*);	/* service interrupt */
+	Intrsvcret (*interrupt)(Ureg*, void*);	/* service interrupt */
 	void	(*epopen)(Ep*);			/* prepare ep. for I/O */
 	void	(*epclose)(Ep*);		/* terminate I/O on ep. */
 	long	(*epread)(Ep*,void*,long);	/* transmit data for ep */
@@ -120,6 +124,7 @@ struct Hciimpl
 	int	(*portstatus)(Hci*, int);	/* get port status */
 	void	(*shutdown)(Hci*);		/* shutdown for reboot */
 	void	(*debug)(Hci*, int);		/* set/clear debug flag */
+	void	(*setintrrate)(Hci*);		/* set suitable max intr rate */
 };
 
 struct Hci
@@ -128,9 +133,14 @@ struct Hci
 	int	tbdf;				/* type+busno+devno+funcno */
 	int	ctlrno;				/* controller number */
 	int	nports;				/* number of ports in hub */
-	int	highspeed;			/* supports highspeed devices */
-	uint	superspeed;			/* bitmap of superspeed ports */
-	Hciimpl;					/* HCI driver  */
+	int	highspeed;
+
+	/* interrupt reduction */
+	unsigned nonhubdevs;			/* # of non-hub devs */
+	unsigned nonhubfsdevs;			/* # of usb 2 non-hub devs */
+//	int	pollme;
+
+	Hciimpl;				/* HCI driver  */
 };
 
 /*
@@ -163,17 +173,15 @@ struct Ep
 	char*	info;		/* for humans to read */
 	long	maxpkt;		/* maximum packet size */
 	int	ttype;		/* tranfer type */
-	ulong	load;		/* in µs, for a transfer of maxpkt bytes */
+	ulong	load;		/* in µs, for a fransfer of maxpkt bytes */
 	void*	aux;		/* for controller specific info */
-	u64int	rhrepl;		/* fake root hub replies */
+	int	rhrepl;		/* fake root hub replies */
 	int	toggle[2];	/* saved toggles (while ep is not in use) */
-	long	pollival;	/* poll interval ([µ]frames; intr/iso) */
+	long	pollival;		/* poll interval ([µ]frames; intr/iso) */
 	long	hz;		/* poll frequency (iso) */
 	long	samplesz;	/* sample size (iso) */
 	int	ntds;		/* nb. of Tds per µframe */
 	int	tmout;		/* 0 or timeout for transfers (ms) */
-	int	sampledelay;	/* maximum delay introduced by buffering (iso) */
-	int	uframes;	/* uframes mode (iso); 0 = normal behaviour, 1 = return only one uframe per read */
 };
 
 /*
@@ -186,24 +194,30 @@ struct Udev
 	int	state;		/* state for the device */
 	int	ishub;		/* hubs can allocate devices */
 	int	isroot;		/* is a root hub */
-	int	speed;		/* Full/Low/High/Super/No -speed */
-	int	hubnb;		/* USB device number for the parent hub */
-	int	hub;		/* device address for the parent hub */
+	int	speed;		/* Full/Low/High/No -speed */
+	int	hub;		/* dev number for the parent hub */
 	int	port;		/* port number in the parent hub */
-	int	addr;		/* device address */
-	int	depth;		/* hub depth from root port */
-	int	rootport;	/* port number on root hub */
-	int	routestr;	/* route string */
-
-	void	*aux;
-	void	(*free)(void*);
-
 	Ep*	eps[Ndeveps];	/* end points for this device (cached) */
 };
+
+typedef struct Intrtypes Intrtypes;
+struct Intrtypes {
+	ulong	not_ours;
+	ulong	no_work;
+	ulong	qh;
+	ulong	tderr;
+	ulong	isohs;
+	ulong	isohsact;
+	ulong	isofs;
+	ulong	isofsact;
+
+	/* not a type really */
+	ulong	async_wake;
+};
+Intrtypes intrtypes;
 
 void	addhcitype(char *type, int (*reset)(Hci*));
 
 extern char *usbmodename[];
-extern char Estalled[];
 
 extern char *seprintdata(char*,char*,uchar*,int);

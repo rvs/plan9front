@@ -4,7 +4,6 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 
 #define	Image	IMAGE
@@ -51,24 +50,44 @@ i81xblank(VGAscr *scr, int blank)
 	*dpms = mode;
 }
 
+static Pcidev *
+i81xpcimatch(void)
+{
+	Pcidev *p;
+
+	p = nil;
+	while((p = pcimatch(p, Vintel, 0)) != nil){
+		switch(p->did){
+		default:
+			continue;
+		case 0x7121:
+		case 0x7123:
+		case 0x7125:
+		case 0x1102:
+		case 0x1112:
+		case 0x1132:
+		case 0x3577:	/* IBM R31 uses intel 830M chipset */
+			return p;
+		}
+	}
+	return nil;
+}
+
 static void
 i81xenable(VGAscr* scr)
 {
 	Pcidev *p;
 	int size;
-	ulong *pgtbl, *rp;
-	uintptr fbuf, fbend;
+	Mach *mach0;
+	ulong *pgtbl, *rp, cursor, *pte, fbuf, fbend;
 	
 	if(scr->mmio)
 		return;
-	p = scr->pci;
+	p = i81xpcimatch();
 	if(p == nil)
 		return;
-	if((p->mem[0].bar & 1) != 0
-	|| (p->mem[1].bar & 1) != 0)
-		return;
 	scr->mmio = vmap(p->mem[1].bar & ~0x0F, p->mem[1].size);
-	if(scr->mmio == nil)
+	if(scr->mmio == 0)
 		return;
 	addvgaseg("i81xmmio", p->mem[1].bar&~0x0F, p->mem[1].size);
 
@@ -94,8 +113,20 @@ i81xenable(VGAscr* scr)
 		fbuf += BY2PG;
 	}
 
-	scr->storage = 0;
+	/*
+	 * allocate space for the cursor data in system memory.
+	 * must be uncached.
+	 */
+	cursor = (ulong)xspanalloc(BY2PG, BY2PG, 0);
+	mach0 = MACHP(0);
+	pte = mmuwalk(mach0->pdb, cursor, 2, 0);
+	if(pte == nil)
+		panic("i81x cursor mmuwalk");
+	*pte |= PTEUNCACHED;
+	scr->storage = cursor;
+
 	scr->blank = i81xblank;
+	hwblank = 1;
 }
 
 static void
@@ -116,7 +147,7 @@ i81xcurload(VGAscr* scr, Cursor* curs)
 	uchar *p;
 	CursorI81x *hwcurs;
 
-	if(scr->mmio == 0 || scr->storage == 0)
+	if(scr->mmio == 0)
 		return;
 	hwcurs = (void*)((uchar*)scr->mmio+hwCur);
 
@@ -185,37 +216,27 @@ i81xcurenable(VGAscr* scr)
 {
 	int i;
 	uchar *p;
+	CursorI81x *hwcurs;
 
 	i81xenable(scr);
 	if(scr->mmio == 0)
 		return;
-
-	if(scr->storage == 0){
-		CursorI81x *hwcurs;
-		Page *pg = newpage(0, nil, 0);
-		scr->storage = (uintptr)vmap(pg->pa, BY2PG);
-		if(scr->storage == 0){
-			putpage(pg);
-			return;
-		}
-		hwcurs = (void*)((uchar*)scr->mmio+hwCur);
-		hwcurs->base = pg->pa;
-	}
+	hwcurs = (void*)((uchar*)scr->mmio+hwCur);
 
 	/*
 	 * Initialise the 32x32 cursor to be transparent in 2bpp mode.
 	 */
+	hwcurs->base = PADDR(scr->storage);
 	p = (uchar*)scr->storage;
 	for(i = 0; i < 32/2; i++) {
 		memset(p, 0xff, 8);
 		memset(p+8, 0, 8);
 		p += 16;
 	}
-
 	/*
 	 * Load, locate and enable the 32x32 cursor in 2bpp mode.
 	 */
-	i81xcurload(scr, &cursor);
+	i81xcurload(scr, &arrow);
 	i81xcurmove(scr, ZP);
 }
 

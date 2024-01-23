@@ -3,16 +3,22 @@
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
-#include "../port/error.h"
-#include "edf.h"
+
+#include "../port/edf.h"
+
+enum {
+	Notilock,
+	Isilock,
+};
 
 long maxlockcycles;
 long maxilockcycles;
 long cumlockcycles;
 long cumilockcycles;
-uintptr maxlockpc;
-uintptr maxilockpc;
+ulong maxlockpc;
+ulong maxilockpc;
 
+/* only approximate counts on MPs because incremented by ++ not ainc() */
 struct
 {
 	ulong	locks;
@@ -20,166 +26,180 @@ struct
 	ulong	inglare;
 } lockstats;
 
-static void
-dumplockmem(char *tag, Lock *l)
-{
-	uchar *cp;
-	int i;
+#define inccnt(r) ainc(&(r)->ref)
 
-	iprint("%s: ", tag);
-	cp = (uchar*)l;
-	for(i = 0; i < 64; i++)
-		iprint("%2.2ux ", cp[i]);
-	iprint("\n");
+static int
+deccnt(Ref *r, char *who, uintptr caller)
+{
+	int x, old;
+
+	x = old = r->ref;
+	/* imperfect attempt to avoid decrementing a zero ref count */
+	if (old <= 0 || (x = adec(&r->ref)) < 0)
+		panic("deccnt: r->ref %d <= 0; %s callerpc=%#p",
+			old, who, caller);
+	return x;
 }
 
 void
-lockloop(Lock *l, uintptr pc)
+lockloop(Lock *l, ulong pc)
 {
 	Proc *p;
 
-	if(panicking)
-		return;
-
 	p = l->p;
-	print("lock %#p loop key %#lux pc %#p held by pc %#p proc %lud\n",
+	print("lock %#p loop key %#lux pc %#lux held by pc %#lux proc %lud\n",
 		l, l->key, pc, l->pc, p ? p->pid : 0);
 	dumpaproc(up);
 	if(p != nil)
 		dumpaproc(p);
 }
 
+/*
+ * Priority inversion, yield on a uniprocessor;
+ * on a multiprocessor, another processor will unlock.
+ */
+static void
+edfunipriinversion(Lock *l, ulong pc)
+{
+	print("inversion %#p pc %#lux proc %lud held by pc %#lux proc %lud\n",
+		l, pc, up? up->pid: 0, l->pc, l->p? l->p->pid: 0);
+	/* yield to process with lock */
+	up->edf->d = todget(nil);
+}
+
+static int
+grablock(Lock *l, char *who, uintptr caller)
+{
+	if (up) {
+		/* prevent being scheded until nlocks==0*/
+		inccnt(&up->nlocks);
+		if(tas(&l->key) == 0)
+			return 0;
+		deccnt(&up->nlocks, who, caller);
+	} else
+		if(tas(&l->key) == 0)
+			return 0;
+	return -1;
+}
+
+/* call once the lock is ours */
+static void
+ownlock(Lock *l, ulong pc, int isilock)
+{
+	if (up)
+		up->lastlock = l;
+	l->pc = pc;
+	l->p = up;
+	l->m = MACHP(m->machno);
+	l->isilock = isilock;
+#ifdef LOCKCYCLES
+	l->lockcycles = -lcycles();
+#endif
+}
+
+static void
+waitforlock(Lock *l, ulong pc, Edf *edf)
+{
+	uvlong stcyc, nowcyc;
+
+	cycles(&stcyc);
+	while (l->key){
+		/* lock's busy; wait a bit for it to be released */
+		if(edf && edf->flags & Admitted)
+			edfunipriinversion(l, pc);
+		cycles(&nowcyc);
+		if(nowcyc - stcyc > 500000000){	/* are we stuck? */
+			lockloop(l, pc);
+			cycles(&stcyc);
+		}
+	}
+}
+
 int
 lock(Lock *l)
 {
-	int i;
-	uintptr pc;
-
-	pc = getcallerpc(&l);
+	int ret;
+	ulong pc;
+	Edf *edf;
 
 	lockstats.locks++;
-	if(up)
-		up->nlocks++;	/* prevent being scheded */
-	if(tas(&l->key) == 0){
-		if(up)
-			up->lastlock = l;
-		l->pc = pc;
-		l->p = up;
-		l->m = MACHP(m->machno);
-		l->isilock = 0;
-#ifdef LOCKCYCLES
-		l->lockcycles = -lcycles();
-#endif
-		return 0;
+	pc = getcallerpc(&l);
+	ret = 0;
+	edf = conf.nmach <= 1 && up? up->edf: nil;
+	while (grablock(l, "lock", pc) < 0) {
+		/* didn't grab the lock? wait & try again */
+		if (ret == 0) {
+			lockstats.glare++;
+			ret = 1;		/* took more than one try */
+		} else
+			lockstats.inglare++;
+		waitforlock(l, pc, edf);
 	}
-	if(up)
-		up->nlocks--;
-
-	lockstats.glare++;
-	for(;;){
-		lockstats.inglare++;
-		i = 0;
-		while(l->key){
-			if(conf.nmach < 2 && up && up->edf && (up->edf->flags & Admitted)){
-				/*
-				 * Priority inversion, yield on a uniprocessor; on a
-				 * multiprocessor, the other processor will unlock
-				 */
-				print("inversion %#p pc %#p proc %lud held by pc %#p proc %lud\n",
-					l, pc, up ? up->pid : 0, l->pc, l->p ? l->p->pid : 0);
-				up->edf->d = todget(nil);	/* yield to process with lock */
-			}
-			if(i++ > 100000000){
-				i = 0;
-				lockloop(l, pc);
-			}
-		}
-		if(up)
-			up->nlocks++;
-		if(tas(&l->key) == 0){
-			if(up)
-				up->lastlock = l;
-			l->pc = pc;
-			l->p = up;
-			l->m = MACHP(m->machno);
-			l->isilock = 0;
-#ifdef LOCKCYCLES
-			l->lockcycles = -lcycles();
-#endif
-			return 1;
-		}
-		if(up)
-			up->nlocks--;
-	}
+	ownlock(l, pc, Notilock);
+	return ret;				/* nobody looks at this value */
 }
 
 void
 ilock(Lock *l)
 {
 	ulong x;
-	uintptr pc;
 
-	pc = getcallerpc(&l);
 	lockstats.locks++;
-
 	x = splhi();
 	if(tas(&l->key) != 0){
 		lockstats.glare++;
 		/*
+		 * Have to wait for l to be released.
 		 * Cannot also check l->pc, l->m, or l->isilock here
 		 * because they might just not be set yet, or
 		 * (for pc and m) the lock might have just been unlocked.
 		 */
-		for(;;){
+		do{
 			lockstats.inglare++;
 			splx(x);
-			while(l->key)
+			while(l->key)	/* this is usually a short wait */
 				;
 			x = splhi();
-			if(tas(&l->key) == 0)
-				goto acquire;
-		}
+			/* looks free, grab it quick */
+		} while (tas(&l->key) != 0);
 	}
-acquire:
 	m->ilockdepth++;
-	if(up)
-		up->lastilock = l;
+	ownlock(l, getcallerpc(&l), Isilock);
 	l->sr = x;
-	l->pc = pc;
-	l->p = up;
-	l->m = MACHP(m->machno);
-	l->isilock = 1;
-#ifdef LOCKCYCLES
-	l->lockcycles = -lcycles();
-#endif
 }
 
+/* try to acquire lock once; return success boolean */
 int
 canlock(Lock *l)
 {
-	if(up)
-		up->nlocks++;
-	if(tas(&l->key)){
-		if(up)
-			up->nlocks--;
-		return 0;
-	}
+	uintptr caller;
 
-	if(up)
-		up->lastlock = l;
-	l->pc = getcallerpc(&l);
-	l->p = up;
-	l->m = MACHP(m->machno);
-	l->isilock = 0;
-#ifdef LOCKCYCLES
-	l->lockcycles = -lcycles();
-#endif
+	caller = getcallerpc(&l);
+	if (grablock(l, "canlock", caller) < 0)
+		return 0;
+	ownlock(l, caller, Notilock);
 	return 1;
+}
+
+static void
+givelockback(Lock *l)
+{
+	l->m = nil;
+	l->p = nil;
+	coherence();
+	/*
+	 * actual release; data protected by this Lock and the Lock itself
+	 * must be current before release.
+	 */
+	l->key = 0;
+	coherence();
 }
 
 void
 unlock(Lock *l)
 {
+	uintptr caller;
+
 #ifdef LOCKCYCLES
 	l->lockcycles += lcycles();
 	cumlockcycles += l->lockcycles;
@@ -188,38 +208,32 @@ unlock(Lock *l)
 		maxlockpc = l->pc;
 	}
 #endif
+	caller = getcallerpc(&l);
 	if(l->key == 0)
-		print("unlock(%#p): not locked: pc %#p\n",
-			l, getcallerpc(&l));
+		print("unlock: not locked: pc %#p\n", caller);
 	if(l->isilock)
-		print("unlock(%#p) of ilock: pc %#p, held by %#p\n",
-			l, getcallerpc(&l), l->pc);
-	if(l->p != up){
-		print("unlock(%#p): up changed: pc %#p, acquired at pc %#p, lock p %#p, unlock up %#p\n",
-			l, getcallerpc(&l), l->pc, l->p, up);
-		dumpaproc(l->p);
-		dumpaproc(up);
-	}
-	l->m = nil;
-	coherence();
-	l->key = 0;
-
-	/*
-	 * Call sched if the need arose while locks were held
-	 * But, don't do it from interrupt routines, hence the islo() test
-	 */
-	if(up && --up->nlocks == 0)
-	if(up->state == Running && up->delaysched && islo())
+		print("unlock of ilock: pc %#lux, held by %#lux\n", caller, l->pc);
+	if(l->p != up)
+		print("unlock: up changed: pc %#p, acquired at pc %#lux, "
+			"lock p %#p, unlock up %#p\n", caller, l->pc, l->p, up);
+	givelockback(l);
+	if(up && deccnt(&up->nlocks, "unlock", caller) == 0 &&
+	    up->delaysched && islo())
+		/*
+		 * Call sched if the need arose while locks were held.
+		 * But don't do it from intr routines, hence the islo() test.
+		 */
 		sched();
 }
 
-uintptr ilockpcs[0x100] = { [0xff] = 1 };
-static int n;
+ulong ilockpcs[0x100] = { [0xff] = 1 };
+static int ilockpc;
 
 void
 iunlock(Lock *l)
 {
 	ulong sr;
+	uintptr caller;
 
 #ifdef LOCKCYCLES
 	l->lockcycles += lcycles();
@@ -229,21 +243,27 @@ iunlock(Lock *l)
 		maxilockpc = l->pc;
 	}
 	if(l->lockcycles > 2400)
-		ilockpcs[n++ & 0xff]  = l->pc;
+		ilockpcs[ilockpc++ & 0xff] = l->pc;
 #endif
+	caller = getcallerpc(&l);
 	if(l->key == 0)
-		print("iunlock(%#p): not locked: pc %#p\n", l, getcallerpc(&l));
+		print("iunlock: not locked: pc %#p\n", caller);
 	if(!l->isilock)
-		print("iunlock(%#p) of lock: pc %#p, held by %#p\n", l, getcallerpc(&l), l->pc);
+		print("iunlock of lock: pc %#p, held by %#lux\n", caller, l->pc);
 	if(islo())
-		print("iunlock(%#p) while lo: pc %#p, held by %#p\n", l, getcallerpc(&l), l->pc);
+		print("iunlock while lo: pc %#p, held by %#lux\n", caller, l->pc);
 
 	sr = l->sr;
-	l->m = nil;
-	coherence();
-	l->key = 0;
+	givelockback(l);
 	m->ilockdepth--;
 	if(up)
 		up->lastilock = nil;
 	splx(sr);
+}
+
+static void
+profiling_after_iunlock(void)
+{
+	profiling_after_iunlock();
+	profiling_after_iunlock();
 }

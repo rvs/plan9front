@@ -47,7 +47,7 @@ extern PhysUart miniphysuart;
 
 static Uart miniuart = {
 	.regs	= (u32int*)AUXREGS,
-	.name	= "uart1",
+	.name	= "uart0",
 	.freq	= 250000000,
 	.baud	= 115200,
 	.phys	= &miniphysuart,
@@ -70,6 +70,12 @@ interrupt(Ureg*, void *arg)
 	if(ap[MuLsr] & TxRdy)
 		uartkick(uart);
 	if(ap[MuLsr] & RxRdy){
+		if(uart->console){
+			if(uart->opens == 1)
+				uart->putc = kbdcr2nl;
+			else
+				uart->putc = nil;
+		}
 		do{
 			uartrecv(uart, ap[MuIo] & 0xFF);
 		}while(ap[MuLsr] & RxRdy);
@@ -80,7 +86,12 @@ interrupt(Ureg*, void *arg)
 static Uart*
 pnp(void)
 {
-	return &miniuart;
+	Uart *uart;
+
+	uart = &miniuart;
+	if(uart->console == 0)
+		kbdq = qopen(8*1024, 0, nil, nil);
+	return uart;
 }
 
 static void
@@ -100,7 +111,7 @@ enable(Uart *uart, int ie)
 	ap[MuCntl] = TxEn|RxEn;
 	baud(uart, uart->baud);
 	if(ie){
-		intrenable(IRQaux, interrupt, uart, BUSUNKNOWN, uart->name);
+		intrenable(IRQaux, interrupt, uart, 0, "uart");
 		ap[MuIer] = RxIen|TxIen;
 	}else
 		ap[MuIer] = 0;
@@ -121,8 +132,10 @@ kick(Uart *uart)
 {
 	u32int *ap;
 
-	coherence();
 	ap = (u32int*)uart->regs;
+	if(uart->blocked)
+		return;
+	coherence();
 	while(ap[MuLsr] & TxRdy){
 		if(uart->op >= uart->oe && uartstageoutput(uart) == 0)
 			break;
@@ -135,7 +148,7 @@ kick(Uart *uart)
 	coherence();
 }
 
-/* TODO */
+/* TODO dobreak */
 static void
 dobreak(Uart *uart, int ms)
 {
@@ -257,7 +270,7 @@ donothing(Uart*, int)
 {
 }
 
-static void
+void
 putc(Uart*, int c)
 {
 	u32int *ap;
@@ -270,7 +283,7 @@ putc(Uart*, int c)
 		;
 }
 
-static int
+int
 getc(Uart*)
 {
 	u32int *ap;
@@ -281,8 +294,38 @@ getc(Uart*)
 	return ap[MuIo] & 0xFF;
 }
 
+void
+uartconsinit(void)
+{
+	Uart *uart;
+	int n;
+	char *p, *cmd;
+
+	if((p = getconf("console")) == nil)
+		return;
+	n = strtoul(p, &cmd, 0);
+	if(p == cmd)
+		return;
+	switch(n){
+	default:
+		return;
+	case 0:
+		uart = &miniuart;
+		break;
+	}
+
+	if(!uart->enabled)
+		(*uart->phys->enable)(uart, 0);
+	uartctl(uart, "l8 pn s1");
+	if(*cmd != '\0')
+		uartctl(uart, cmd);
+
+	consuart = uart;
+	uart->console = 1;
+}
+
 PhysUart miniphysuart = {
-	.name		= "mini",
+	.name		= "miniuart",
 	.pnp		= pnp,
 	.enable		= enable,
 	.disable	= disable,
@@ -300,3 +343,31 @@ PhysUart miniphysuart = {
 	.getc		= getc,
 	.putc		= putc,
 };
+
+void
+okay(int on)
+{
+	static int first;
+	static int okled, polarity;
+	char *p;
+
+	if(!first++){
+		p = getconf("bcm2709.disk_led_gpio");
+		if(p == nil)
+			p = getconf("bcm2708.disk_led_gpio");
+		if(p != nil)
+			okled = strtol(p, 0, 0);
+		else
+			okled = 'v';
+		p = getconf("bcm2709.disk_led_active_low");
+		if(p == nil)
+			p = getconf("bcm2708.disk_led_active_low");
+		polarity = (p == nil || *p == '1');
+		if(okled != 'v')
+			gpiosel(okled, Output);
+	}
+	if(okled == 'v')
+		vgpset(0, on);
+	else if(okled != 0)
+		gpioout(okled, on^polarity);
+}

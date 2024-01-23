@@ -39,20 +39,16 @@ static Netlogflag flags[] =
 	{ "ppp",	Logppp, },
 	{ "ip",		Logip, },
 	{ "fs",		Logfs, },
-	{ "il",		Logil, },
 	{ "tcp",	Logtcp, },
 	{ "icmp",	Logicmp, },
-	{ "igmp",	Logigmp, },
 	{ "udp",	Logudp, },
 	{ "compress",	Logcompress, },
-	{ "logilmsg",	Logilmsg, },
 	{ "gre",	Loggre, },
 	{ "tcpwin",	Logtcp|Logtcpwin, },
 	{ "tcprxmt",	Logtcp|Logtcprxmt, },
 	{ "udpmsg",	Logudp|Logudpmsg, },
 	{ "ipmsg",	Logip|Logipmsg, },
 	{ "esp",	Logesp, },
-	{ "trans",	Logtrans, },
 	{ nil,		0, },
 };
 
@@ -87,11 +83,10 @@ netlogopen(Fs *f)
 		nexterror();
 	}
 	if(f->alog->opens == 0){
-		if(f->alog->buf == nil){
+		if(f->alog->buf == nil)
 			f->alog->buf = malloc(Nlog);
-			if(f->alog->buf == nil)
-				error(Enomem);
-		}
+		if(f->alog->buf == nil)
+			error(Enomem);
 		f->alog->rptr = f->alog->buf;
 		f->alog->end = f->alog->buf + Nlog;
 	}
@@ -130,41 +125,43 @@ netlogread(Fs *f, void *a, ulong, long n)
 {
 	int i, d;
 	char *p, *rptr;
+	Netlog *log;
 
-	qlock(f->alog);
+	log = f->alog;
+	qlock(log);
 	if(waserror()){
-		qunlock(f->alog);
+		qunlock(log);
 		nexterror();
 	}
 
 	for(;;){
-		lock(f->alog);
-		if(f->alog->len){
-			if(n > f->alog->len)
-				n = f->alog->len;
+		lock(log);
+		if(log->len){
+			if(n > log->len)
+				n = log->len;
 			d = 0;
-			rptr = f->alog->rptr;
-			f->alog->rptr += n;
-			if(f->alog->rptr >= f->alog->end){
-				d = f->alog->rptr - f->alog->end;
-				f->alog->rptr = f->alog->buf + d;
+			rptr = log->rptr;
+			log->rptr += n;
+			if(log->rptr >= log->end){
+				d = log->rptr - log->end;
+				log->rptr = log->buf + d;
 			}
-			f->alog->len -= n;
-			unlock(f->alog);
+			log->len -= n;
+			unlock(log);
 
 			i = n-d;
 			p = a;
 			memmove(p, rptr, i);
-			memmove(p+i, f->alog->buf, d);
+			memmove(p+i, log->buf, d);
 			break;
 		}
 		else
-			unlock(f->alog);
+			unlock(log);
 
-		sleep(f->alog, netlogready, f);
+		sleep(log, netlogready, f);
 	}
 
-	qunlock(f->alog);
+	qunlock(log);
 	poperror();
 
 	return n;
@@ -211,7 +208,7 @@ netlogctl(Fs *f, char* s, int n)
 		return;
 
 	default:
-		cmderror(cb, "unknown ip control message");
+		cmderror(cb, "unknown netlog control message");
 	}
 
 	for(i = 1; i < cb->nf; i++){
@@ -235,35 +232,37 @@ netlog(Fs *f, int mask, char *fmt, ...)
 {
 	char buf[256], *t, *fp;
 	int i, n;
+	Netlog *log;
 	va_list arg;
 
-	if(!(f->alog->logmask & mask))
+	log = f->alog;
+	if(!(log->logmask & mask))
 		return;
 
-	if(f->alog->opens == 0)
+	if(log->opens == 0)
 		return;
 
 	va_start(arg, fmt);
 	n = vseprint(buf, buf+sizeof(buf), fmt, arg) - buf;
 	va_end(arg);
 
-	lock(f->alog);
-	i = f->alog->len + n - Nlog;
+	lock(log);
+	i = log->len + n - Nlog;
 	if(i > 0){
-		f->alog->len -= i;
-		f->alog->rptr += i;
-		if(f->alog->rptr >= f->alog->end)
-			f->alog->rptr = f->alog->buf + (f->alog->rptr - f->alog->end);
+		log->len -= i;
+		log->rptr += i;
+		if(log->rptr >= log->end)
+			log->rptr = log->buf + (log->rptr - log->end);
 	}
-	t = f->alog->rptr + f->alog->len;
+	t = log->rptr + log->len;
 	fp = buf;
-	f->alog->len += n;
+	log->len += n;
 	while(n-- > 0){
-		if(t >= f->alog->end)
-			t = f->alog->buf + (t - f->alog->end);
+		if(t >= log->end)
+			t = log->buf + (t - log->end);
 		*t++ = *fp++;
 	}
-	unlock(f->alog);
+	unlock(log);
 
-	wakeup(f->alog);
+	wakeup(log);
 }

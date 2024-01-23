@@ -1,0 +1,30 @@
+The SG2042 (as in the TH1520) uses its physical address space
+perversely, especially given 39-bit virtual addresses.
+
+physical 0 - 256G is ram, that consumes the lower address range.
+physical 256G - 320G is pcie space;
+	320G - 448G is free; virtual space could be mapped to first 128G
+			of low ram, ignoring the rest;
+	448G - 451G is peripherals;
+	451G - 512G is free, so far; could be 61G of more low ram.
+that's the whole Sv39 space.
+
+KZERO == 320G is awkward;
+it's not contiguous 1 bits high and contiguous 0 bits low,
+so that affects physical/kernel mappings.
+could map KZERO->0 for ram, and KZERO+128G->256G for pcie space.
+could vmap pcie+peripherals to virtual top, use rest of high virtual for ram.
+
+moving all the assigned upper space to the end would have freed
+up a big block for trivial mapping of ram.
+using Sv48 would have allowed for less cramped assignments.
+
+possible mapping:
+kzero == -256G
+
+virtual		physical
+-------		--------
+kzero		0		ram
+kzero+189G	0x70...		peripherals
+-64G		0x40...		pcie
+-1		-1

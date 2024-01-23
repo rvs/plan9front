@@ -1,0 +1,132 @@
+# rv mkfile - build risc-v rv64 kernels
+
+objtype=riscv64
+</$objtype/mkfile
+
+# defaults
+PHYSMEM=0x80000000u
+KTZERO=0xffffffc080000000		# Sv39 at 2GB phys
+PAClint=0x02000000
+PAUart0=0x10010000			# sifive's default
+RBKTZERO=0xbff05000
+BANK0SIZE=GB
+SFX=uim bin
+
+# changing ARCH should change addrconf.h thus triggering recompilation.
+# this is more foolproof than requiring "mk nuke" when changing ARCH.
+<|getdefs
+# don't add KTZERO to addrconf.h, it's just for this mkfile
+<|mkconf RVARCH $ARCH'' PAUart0 $PAUart0'' PAClint $PAClint'' PHYSMEM $PHYSMEM'' BANK0SIZE $BANK0SIZE'' >tmpac; cpdiffers tmpac addrconf.h; echo
+
+CONF=${ARCH}cpu
+CONFLIST=${ARCH}cpu # ${ARCH}cpuf ${ARCH}fs
+EXTRACOPIES=fsstand
+
+p=9
+
+CFLAGS=$CFLAGS $CONFDEF
+AFLAGS=$AFLAGS $CONFDEF
+
+9k:V:	$p$CONF
+
+null:VQ:
+	echo
+
+# <| ../mk/mkparts $CONF; awk -f ../mk/parse $CONF
+<|awk -f ../mk/parse $CONF
+<../mk/bootmkfile
+<../mk/portmkfile
+
+OBJ=$MACH $CONF.root.$O $CONF.$O $PORT $DEVS
+# OBJ=$MACH $PORT $DEVS $CONF.$O $CONF.root.$O
+
+$p$CONF:	$CONF.c $OBJ $LIB
+	d=`{date}
+	$CC $CFLAGS '-DKERNDATE='`{date -n} '-DDATESTR='"$"d" $CONF.c
+	$LD $LDFLAGS -X -o $target -T$KTZERO -R4096 $OBJ
+	size $target
+
+$p$CONF.bin:Q:	$CONF.c $OBJ $LIB		# .bin for temu, for tecpu
+	$LD $LDFLAGS -a >$target.list -o $target -H1 -T$KTZERO -R8 $OBJ
+$p$CONF.uim:Q:	$p$CONF.bin			# .uim for u-boot
+	loadaddr=`{echo $KTZERO | sed 's/0xf+[8ce]?/0x/'}
+	echo loadaddr $loadaddr
+	gzip <$prereq >$prereq.gz	# mkubootimage screws up on /fd/0
+	aux/mkubootimage -l $loadaddr $prereq.gz $target # for u-boot
+#	aux/mkubootimage -l $loadaddr $prereq $target	# uncompressed payload
+	rm -f $prereq.gz
+
+$p$CONF.elf:Q:	$CONF.c $OBJ $LIB
+	# -H5 -P0x020000 sets INITTEXTP
+	loadaddr=`{echo $KTZERO | sed 's/0xf+[8ce]?/0x/'}
+	echo loadaddr $loadaddr
+	$LD -o $target -S -H5 -k -T$KTZERO -P$loadaddr -E_main -R8 $OBJ
+
+# don't strip the gzipped kernels -- too frustrating when that's all you have!
+$p%.gz:D:	$p%
+	gzip -9 <$p$stem >$p$stem.gz
+$p%.lz:D:	$p%
+	lzip -9 <$p$stem >$p$stem.lz
+
+# we don't need gzipped kernels otherwise, so don't make them
+kernels=`{echo $p$CONF; if (! ~ $#SFX 0) echo $p$CONF.^($SFX)}
+install:V:	$kernels
+	cp -x $prereq /$objtype/ &
+	if (! ~ $#EXTRACOPIES 0)
+		echo -n 'installing on: '
+	for(i in $EXTRACOPIES)
+		{ 9fs $i && cp -x $prereq /n/$i/$objtype && echo -n $i... & }
+	wait
+	echo
+
+%.$O:	mem.h addrconf.h ./$ARCH/defs
+
+start.$O strap.$O mtrap.$O mch%.$O:	${objtype}l.h start.h
+fp.$O fakemtrap.$O sbiecall.$O:		${objtype}l.h
+rebootcode.$O:	${objtype}l.h
+
+$CONF.$O:	$objtype.h
+arch%.$O:	$objtype.h
+low.$O:	$objtype.h
+devarch.$O:	$objtype.h ../port/error.h /$objtype/include/ureg.h
+fpu.$O:		$objtype.h /$objtype/include/ureg.h
+main.$O:	$objtype.h io.h init.h reboot.h
+mmu.$O:		$objtype.h
+%sbi%.$O:	$objtype.h
+trap.$O:	../port/error.h io.h $objtype.h
+trap.$O:	/sys/include/tos.h /$objtype/include/ureg.h
+
+devether.$O:	../port/error.h ../port/netif.h etherif.h
+devrtc.$O:	../port/error.h
+ether%.$O:	../port/error.h ../port/netif.h etherif.h io.h ../port/ethermii.h
+ip%.$O %medium.$O: ../ip/ip.h
+kbd.$O:		../port/error.h io.h
+pci.$O:		io.h
+
+${objtype}l.h:D:	$objtype.h ${objtype}ladd.h
+	{echo '/* generated */'; rc ../mk/mkenum $objtype.h; cat $objtype^ladd.h} >$target
+
+
+# -T argument must match sys->reboottramp in dat.h (see acid), as PADDR.
+# currently assumes 1GB at PHYSMEM and lives at the top.
+# "mk -f kzmkfile" if PHYSMEM, BANK0SIZE, MACHSTKSZ or Mach changes,
+# to generate a new value.
+reboot.h reboot.out:D:	rebootcode.$O ${objtype}l.h mem.h
+	$LD -a >$target.list -l -s -T$RBKTZERO -R8 -o reboot.out rebootcode.$O
+	size reboot.out
+	{echo 'uchar rebootcode[]={'; ../mk/exec2hex reboot.out; echo '};'} >reboot.h
+
+$CONF.rr:	../mk/mkrr $CONF hpc-root/$CONF.proto hpc-root/$O.cpu
+	../mk/mkrr $CONF hpc-root/$CONF.proto
+
+$ARCH.clean:V:
+	rm -f $ARCH^*.c [9]$ARCH^* [9]$ARCH^*.gz boot$ARCH^*.* *.list
+	rm -f prkzero.[$OS] [$OS].prkzero
+
+$ARCH.nuke:V:
+	rm -f $objtype^l.h reboot.h
+
+time:V:
+	{ mk clean; time mk } >/dev/null
+subarchs:VQ:
+	for (f in */words) { echo -n `{basename -d $f} '- '; sed 1q $f }

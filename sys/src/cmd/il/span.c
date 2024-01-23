@@ -63,12 +63,14 @@ span(void)
 			m = o->size;
 			if(p->mark&COMPR)
 				m = 2;
+			/* opcode type beq or jal? */
 			if((o->type == 3 || o->type == 4) && p->cond) {
 				if((p->cond->mark&SPASS) == spass)
 					p->pc = c;
 				if(m == 2){
 					/*
-					 * If instruction was compressed, check again in case
+					 * If instruction was compressed,
+					 * check again in case
 					 * branch range is now too large.
 					 */
 					m = asmout(p, o, 3);
@@ -82,9 +84,10 @@ span(void)
 					otxt = -otxt;
 				if(o->type == 3){
 					/*
-					 * If Bcond branch range exceeds 4K, replace it by the
+					 * If Bcond branch range exceeds 4K,
+					 * replace it by the
 					 * logically negated branch around a JMP.
-					*/
+					 */
 					if(otxt >= 0x1000) {
 						q = prg();
 						q->link = p->link;
@@ -106,7 +109,8 @@ span(void)
 					}
 				}else{
 					/*
-					 * If JAL branch range exceeds 1M, change address class
+					 * If JAL branch range exceeds 1M,
+					 * change address class
 					 * and recalculate instruction length.
 					 */
 					if(otxt >= 0x100000) {

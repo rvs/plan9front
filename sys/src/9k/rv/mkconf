@@ -1,0 +1,12 @@
+#!/bin/rc
+# mkconf var value ...
+echo '/* automatically generated */'
+for (v)
+	if (test $#* -ge 2) {
+		if (~ $1 RVARCH)
+			echo '#define' $1 '"'$2'"'
+		if not
+			echo '#define' $1 '('$2')'
+		shift
+		shift
+	}

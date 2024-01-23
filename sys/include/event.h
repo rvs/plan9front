@@ -14,6 +14,7 @@ enum
 enum
 {
 	MAXSLAVE = 32,
+	/* TODO: there's an implicit dependency here on MAXRPC in devmnt.c */
 	EMAXMSG = 128+8192,	/* size of 9p header+data */
 };
 
@@ -64,4 +65,3 @@ extern Rectangle	egetrect(int, Mouse*);
 extern void		edrawgetrect(Rectangle, int);
 extern int		ereadmouse(Mouse*);
 extern int		eatomouse(Mouse*, char*, int);
-extern int		eenter(char*, char*, int, Mouse*);

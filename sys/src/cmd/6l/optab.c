@@ -295,11 +295,6 @@ uchar	yjmp[] =
 	Ynone,	Ybr,	Zjmp,	1,
 	0
 };
-uchar	yjmpf[] =
-{
-	Ynone,	Ybr,	Zjmpf,	1,
-	0
-};
 
 uchar	yfmvd[] =
 {
@@ -398,11 +393,6 @@ uchar	yxcvm2[] =
 uchar	yxmq[] = 
 {
 	Yxm,	Yxr,	Zm_r_xm,	2,
-	0
-};
-uchar	yxmi3[] =
-{
-	Yxm,	Yxr,	Zm_r_i_xm,	3,
 	0
 };
 uchar	yxr[] = 
@@ -532,10 +522,6 @@ Optab optab[] =
 	{ AADDSD,	yxm,	Pf2, 0x58 },
 	{ AADDSS,	yxm,	Pf3, 0x58 },
 	{ AADDW,	yaddl,	Pe, 0x83,(00),0x05,0x81,(00),0x01,0x03 },
-	{ AHADDPD,	yxm,	Pq, 0x7c },
-	{ AHADDPS,	yxm,	Pf2, 0x7c },
-	{ AADDSUBPD,	yxm,	Pq, 0xd0 },
-	{ AADDSUBPS,	yxm,	Pf2, 0xd0 },
 	{ AADJSP },
 	{ AANDB,	yxorb,	Pb, 0x24,0x80,(04),0x20,0x22 },
 	{ AANDL,	yxorl,	Px, 0x83,(04),0x25,0x81,(04),0x21,0x23 },
@@ -722,7 +708,6 @@ Optab optab[] =
 	{ AJLT,		yjcond,	Px, 0x7c,0x8c },
 	{ AJMI,		yjcond,	Px, 0x78,0x88 },
 	{ AJMP,		yjmp,	Px, 0xff,(04),0xeb,0xe9 },
-	{ AJMPF,	yjmpf,	Px, 0xe9  },
 	{ AJNE,		yjcond,	Px, 0x75,0x85 },
 	{ AJOC,		yjcond,	Px, 0x71,0x81,(00) },
 	{ AJOS,		yjcond,	Px, 0x70,0x80,(00) },
@@ -766,7 +751,7 @@ Optab optab[] =
 	{ AMOVBLSX,	ymb_rl,	Pm, 0xbe },
 	{ AMOVBLZX,	ymb_rl,	Pm, 0xb6 },
 	{ AMOVBQSX,	ymb_rl,	Pw, 0x0f,0xbe },
-	{ AMOVBQZX,	ymb_rl,	Py, 0x0f,0xb6 },
+	{ AMOVBQZX,	ymb_rl,	Pw, 0x0f,0xb6 },
 	{ AMOVBWSX,	ymb_rl,	Pq, 0xbe },
 	{ AMOVBWZX,	ymb_rl,	Pq, 0xb6 },
 	{ AMOVO,	yxmov,	Pe, 0x6f,0x7f },
@@ -787,7 +772,6 @@ Optab optab[] =
 	{ AMOVNTPS,	yxr_ml,	Pm, 0x2b },
 	{ AMOVNTQ,	ymr_ml,	Pm, 0xe7 },
 	{ AMOVQ,	ymovq,	Pw, 0x89,0x8b,0x31,0xc7,(00),0xb8,0xc7,(00),0x6f,0x7f,0x6e,0x7e,Pf2,0xd6,Pe,0xd6,Pe,0x6e,Pe,0x7e },
-	{ AMOVQL,	yrl_ml,	Px,	0x89 },
 	{ AMOVQOZX,	ymrxr,	Pf3, 0xd6,0x7e },
 	{ AMOVSB,	ynone,	Pb, 0xa4 },
 	{ AMOVSD,	yxmov,	Pf2, 0x10,0x11 },
@@ -801,7 +785,7 @@ Optab optab[] =
 	{ AMOVWLSX,	yml_rl,	Pm, 0xbf },
 	{ AMOVWLZX,	yml_rl,	Pm, 0xb7 },
 	{ AMOVWQSX,	yml_rl,	Pw, 0x0f,0xbf },
-	{ AMOVWQZX,	yml_rl,	Py, 0x0f,0xb7 },
+	{ AMOVWQZX,	yml_rl,	Pw, 0x0f,0xb7 },
 	{ AMULB,	ydivb,	Pb, 0xf6,(04) },
 	{ AMULL,	ydivl,	Px, 0xf7,(04) },
 	{ AMULPD,	yxm,	Pe, 0x59 },
@@ -902,7 +886,7 @@ Optab optab[] =
 	{ APSHUFW,	ymshuf,	Pm, 0x70 },
 	{ APSLLO,	ypsdq,	Pq, 0x73,(07) },
 	{ APSLLL,	yps,	Py, 0xf2, 0x72,(06), Pe,0xf2, Pe,0x72,(06) },
-	{ APSLLQ,	yps,	Py, 0xf3, 0x73,(06), Pe,0xf3, Pe,0x73,(06) },
+	{ APSLLQ,	yps,	Py, 0xf3, 0x73,(06), Pe,0xf3, Pe,0x7e,(06) },
 	{ APSLLW,	yps,	Py, 0xf1, 0x71,(06), Pe,0xf1, Pe,0x71,(06) },
 	{ APSRAL,	yps,	Py, 0xe2, 0x72,(04), Pe,0xe2, Pe,0x72,(04) },
 	{ APSRAW,	yps,	Py, 0xe1, 0x71,(04), Pe,0xe1, Pe,0x71,(04) },
@@ -1026,8 +1010,6 @@ Optab optab[] =
 	{ ASUBSD,	yxm,	Pf2, 0x5c },
 	{ ASUBSS,	yxm,	Pf3, 0x5c },
 	{ ASUBW,	yaddl,	Pe, 0x83,(05),0x2d,0x81,(05),0x29,0x2b },
-	{ AHSUBPD,	yxm,	Pq, 0x7d },
-	{ AHSUBPS,	yxm,	Pf2, 0x7d },
 	{ ASWAPGS,	ynone,	Pm, 0x01,0xf8 },
 	{ ASYSCALL,	ynone,	Px, 0x0f,0x05 },	/* fast syscall */
 	{ ATESTB,	ytestb,	Pb, 0xa8,0xf6,(00),0x84,0x84 },
@@ -1056,12 +1038,6 @@ Optab optab[] =
 	{ AXORPS,	yxm,	Pm, 0x57 },
 	{ AXORQ,	yxorl,	Pw, 0x83,(06),0x35,0x81,(06),0x31,0x33 },
 	{ AXORW,	yxorl,	Pe, 0x83,(06),0x35,0x81,(06),0x31,0x33 },
-	{ AROUNDSD,	yxmi3,	Pe, 0x0f,0x3a,0x0b },
-	{ AROUNDSS,	yxmi3,	Pe, 0x0f,0x3a,0x0a },
-	{ AROUNDPD,	yxmi3,	Pe, 0x0f,0x3a,0x09 },
-	{ AROUNDPS,	yxmi3,	Pe, 0x0f,0x3a,0x08 },
-	{ ADPPD,	yxmi3,	Pe, 0x0f,0x3a,0x41 },
-	{ ADPPS,	yxmi3,	Pe, 0x0f,0x3a,0x40 },
 
 	{ AFMOVB,	yfmvx,	Px, 0xdf,(04) },
 	{ AFMOVBP,	yfmvp,	Px, 0xdf,(06) },

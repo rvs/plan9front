@@ -1,23 +1,28 @@
+/*
+ * pc machine-language assist
+ *
+ * we use /sys/src/libc/386/atom.s ainc & adec atomics instead of private ones.
+ */
 #include "mem.h"
-#undef DELAY
+#include "/sys/src/boot/pc/x16.h"
 
-#define PADDR(a)	((a) & ~KZERO)
+#define PADDR(a)	((a) & ~KSEGM)
 #define KADDR(a)	(KZERO|(a))
 
 /*
  * Some machine instructions not handled by 8[al].
  */
-#define OP16		BYTE $0x66
-#define DELAY		BYTE $0xEB; BYTE $0x00	/* JMP .+2 */
-#define CPUID		BYTE $0x0F; BYTE $0xA2	/* CPUID, argument in AX */
-#define WRMSR		BYTE $0x0F; BYTE $0x30	/* WRMSR, argument in AX/DX (lo/hi) */
-#define RDTSC 		BYTE $0x0F; BYTE $0x31	/* RDTSC, result in AX/DX (lo/hi) */
-#define RDMSR		BYTE $0x0F; BYTE $0x32	/* RDMSR, result in AX/DX (lo/hi) */
-#define HLT		BYTE $0xF4
+#define OP16	BYTE $0x66
+#define CPUID	BYTE $0x0F; BYTE $0xA2	/* CPUID, argument in AX */
+#define FXRSTOR	BYTE $0x0f; BYTE $0xae; BYTE $0x08	/* SSE FP restore */
+#define FXSAVE	BYTE $0x0f; BYTE $0xae; BYTE $0x00	/* SSE FP save */
 #define INVLPG	BYTE $0x0F; BYTE $0x01; BYTE $0x39	/* INVLPG (%ecx) */
+#define MONITOR	BYTE $0x0f; BYTE $0x01; BYTE $0xc8
+#define MWAIT	BYTE $0x0f; BYTE $0x01; BYTE $0xc9
+#define RDMSR	BYTE $0x0F; BYTE $0x32	/* RDMSR, result in AX/DX (lo/hi) */
+#define RDTSC 	BYTE $0x0F; BYTE $0x31	/* RDTSC, result in AX/DX (lo/hi) */
 #define WBINVD	BYTE $0x0F; BYTE $0x09
-
-#define VectorSYSCALL	0x40
+#define WRMSR	BYTE $0x0F; BYTE $0x30	/* WRMSR, argument in AX/DX (lo/hi) */
 
 /*
  * Macros for calculating offsets within the page directory base
@@ -28,64 +33,52 @@
 #define PTO(a)		(((((a))>>12) & 0x03FF)<<2)
 
 /*
- * For backwards compatiblity with 9load - should go away when 9load is changed
- * 9load currently sets up the mmu, however the first 16MB of memory is identity
- * mapped, so behave as if the mmu was not setup
+ * 9boot currently sets up the mmu, however the first 16MB of memory is identity
+ * mapped, so behave as if the mmu was not setup.  it's also possible that we
+ * have been directly loaded via pxe, not via 9boot.
  */
+
+TEXT _main(SB), $0			/* avoid libc's main9.s */
 TEXT _startKADDR(SB), $0
+	CLI				/* don't allow interrupts */
+	NOP; NOP; NOP			/* alignment */
+	MOVL	AX, CX			/* save multiboot magic */
+	MOVL	BX, DX			/* save multiboot info addr */
 	MOVL	$_startPADDR(SB), AX
-	ANDL	$~KZERO, AX
-	JMP*	AX
+	ANDL	$~KSEGM, AX
+	JMP*	AX			/* jump to zero segment */
+
+/* flags bits in multiboot header */
+#define Mbpgalign	(1<<0)	/* boot modules are page aligned */
+#define Mbmemreqd	(1<<1)	/* Mbi->mem* fields must be filled in */
+#define Mbnotexechdr	(1<<16)	/* use header_addr—entry_addr not exec header */
+#define Mbours		(Mbpgalign | Mbmemreqd | Mbnotexechdr)
 
 /*
- * Must be 4-byte aligned.
+ * Must be 4-byte aligned.  Not Mbi.
  */
 TEXT _multibootheader(SB), $0
-	LONG	$0x1BADB002			/* magic */
-	LONG	$0x00010007			/* flags */
-	LONG	$-(0x1BADB002 + 0x00010007)	/* checksum */
+	LONG	$MBOOTHDRMAG			/* magic */
+	LONG	$Mbours				/* flags */
+	LONG	$-(MBOOTHDRMAG + Mbours)	/* checksum */
 	LONG	$_multibootheader-KZERO(SB)	/* header_addr */
 	LONG	$_startKADDR-KZERO(SB)		/* load_addr */
 	LONG	$edata-KZERO(SB)		/* load_end_addr */
 	LONG	$end-KZERO(SB)			/* bss_end_addr */
-	LONG	$_multibootentry-KZERO(SB)		/* entry_addr */
+	LONG	$_startKADDR-KZERO(SB)		/* entry_addr */
 	LONG	$0				/* mode_type */
 	LONG	$0				/* width */
 	LONG	$0				/* height */
-	LONG	$32				/* depth */
-
-/* 
- * the kernel expects the data segment to be page-aligned
- * multiboot bootloaders put the data segment right behind text
- */
-TEXT _multibootentry(SB), $0
-	MOVL	$etext-KZERO(SB), SI
-	MOVL	SI, DI
-	ADDL	$0xfff, DI
-	ANDL	$~0xfff, DI
-	MOVL	$edata-KZERO(SB), CX
-	SUBL	DI, CX
-	ADDL	CX, SI
-	ADDL	CX, DI
-	INCL	CX	/* one more for post decrement */
-	STD
-	REP; MOVSB
-	MOVL	BX, multibootptr-KZERO(SB)
-	MOVL	$_startPADDR-KZERO(SB), AX
-	JMP*	AX
-
-/* multiboot structure pointer (physical address) */
-TEXT multibootptr(SB), $0
-	LONG	$0
+	LONG	$0				/* depth */
 
 /*
  * In protected mode with paging turned off and segment registers setup
  * to linear map all memory. Entered via a jump to PADDR(entry),
  * the physical address of the virtual kernel entry point of KADDR(entry).
- * Make the basic page tables for processor 0. Six pages are needed for
+ * Make the basic page tables for processor 0. Several pages are needed for
  * the basic set:
  *	a page directory;
- *	page tables for mapping the first 8MB of physical memory to KZERO;
+ *	page tables for mapping the first MemMin of physical memory to KZERO;
  *	a page for the GDT;
  *	virtual and physical pages for mapping the Mach structure.
  * The remaining PTEs will be allocated later when memory is sized.
@@ -94,29 +87,30 @@ TEXT multibootptr(SB), $0
  * been made to virtual memory.
  */
 TEXT _startPADDR(SB), $0
-	CLI					/* make sure interrupts are off */
+	CLI					/* don't allow interrupts */
 
 	/* set up the gdt so we have sane plan 9 style gdts. */
-	MOVL	$tgdtptr-KZERO(SB), AX
+	MOVL	$tgdtptr(SB), AX
+	ANDL	$~KSEGM, AX
 	MOVL	(AX), GDTR
-	MOVW	$1, AX
-	MOVW	AX, MSW
+	MOVL	$PE, AX
+	MOVL	AX, CR0				/* protected mode on */
 
 	/* clear prefetch queue (weird code to avoid optimizations) */
 	DELAY
 
 	/* set segs to something sane (avoid traps later) */
-	MOVW	$(1<<3), AX
+	MOVW	$(KDSEG<<3), AX
 	MOVW	AX, DS
 	MOVW	AX, SS
 	MOVW	AX, ES
 	MOVW	AX, FS
 	MOVW	AX, GS
 
-/*	JMP	$(2<<3):$mode32bit(SB) /**/
+/*	JMP	$(KESEG<<3):$mode32bit(SB) /**/
 	 BYTE	$0xEA
 	 LONG	$mode32bit-KZERO(SB)
-	 WORD	$(2<<3)
+	 WORD	$(KESEG<<3)
 
 /*
  *  gdt to get us to 32-bit/segmented/unpaged mode
@@ -137,93 +131,110 @@ TEXT tgdt(SB), $0
 
 /*
  *  pointer to initial gdt
- *  Note the -KZERO which puts the physical address in the gdtptr. 
- *  that's needed as we start executing in physical addresses. 
+ *  Note the -KZERO which puts the physical address in the gdtptr.
+ *  that's needed as we start executing in physical addresses.
  */
 TEXT tgdtptr(SB), $0
-	WORD	$(3*8)
+	WORD	$(3*8-1)
 	LONG	$tgdt-KZERO(SB)
 
-TEXT vtgdtptr(SB), $0
-	WORD	$(3*8)
-	LONG	$tgdt(SB)
 
 TEXT mode32bit(SB), $0
-	MOVL	$((CPU0END-CPU0PDB)>>2), CX
-	MOVL	$PADDR(CPU0PDB), DI
+	/* At this point, the GDT setup is done. */
+	CMPL	CX, $MBOOTREGMAG		/* check multiboot magic */
+	JNE	notmboot
+	MOVL	DX, multibootheader-KZERO(SB)	/* incoming m'boot info addr */
+notmboot:
+	MOVL	$PADDR(CPU0START), DI	/* clear pages for tables, gdt, mach */
 	XORL	AX, AX
+	MOVL	$((CPU0END-CPU0START)/BY2WD), CX
+	CLD; REP; STOSL
 
-	CLD
-	REP;	STOSL
+	/* populate PDB for MemMin */
+	MOVL	$PADDR(CPU0PDB), AX	/* bootstrap processor PDB (page 0) */
+	MOVL	AX, DX
+	MOVL	$(PTEWRITE|PTEVALID), BX/* page permissions */
+	ADDL	$PDO(KZERO), AX		/* page dir. offset for KZERO */
+	MOVL	$LOWPTEPAGES, CX
+_setpdb:
+	ADDL	$BY2PG, DX		/* -> PA of next page of page table */
+	MOVL	DX, (AX)		/* PTEs for next 4MB */
+	ORL	BX, (AX)		/* 	set page perms */
+	ADDL	$BY2WD, AX		/* page dir. offset for next 4MB */
+	LOOP	_setpdb
 
-	MOVL	$PADDR(CPU0PTE), DX
-	MOVL	$(PTEWRITE|PTEVALID), BX	/* page permissions */
-	ORL	BX, DX
-
-	MOVL	$PADDR(CPU0PDB), AX
-	ADDL	$PDO(KZERO), AX			/* page directory offset for KZERO */
-
-	MOVL	DX, 0(AX)			/* PTE's for KZERO */
-	ADDL	$BY2PG, DX
-	MOVL	DX, 4(AX)			/* PTE's for KZERO+4MB */
-	ADDL	$BY2PG, DX
-	MOVL	DX, 8(AX)			/* PTE's for KZERO+8MB */
-	ADDL	$BY2PG, DX
-	MOVL	DX, 12(AX)			/* PTE's for KZERO+12MB */
-
-	MOVL	$PADDR(CPU0PTE), AX		/* first page of page table */
-	MOVL	$end-KZERO(SB), CX
-
-	ADDL	$(16*1024), CX			/* qemu puts multiboot data after the kernel */
-
-	ADDL	$(BY2XPG-1), CX
-	ANDL	$~(BY2XPG-1), CX		/* round to 4MB */
-	MOVL	CX, MemMin-KZERO(SB)		/* see memory.c */
-	SHRL	$PGSHIFT, CX
-	MOVL	BX, DX
+	/* initialise consecutive PTEs.  BX still has page perms. */
+	MOVL	$PADDR(CPU0PTE), AX	/* first page of page table */
+	MOVL	$((BY2PG*LOWPTEPAGES)/BY2WD), CX	/* cover MemMin */
 _setpte:
-	MOVL	DX, (AX)
-	ADDL	$BY2PG, DX
-	ADDL	$4, AX
+	MOVL	BX, (AX)
+	ADDL	$BY2PG, BX
+	ADDL	$BY2WD, AX
 	LOOP	_setpte
 
+	/* map Mach page(s). */
 	MOVL	$PADDR(CPU0PTE), AX
-	ADDL	$PTO(MACHADDR), AX		/* page table entry offset for MACHADDR */
-	ORL	$PADDR(CPU0MACH), BX
-	MOVL	BX, (AX)			/* PTE for Mach */
+	ADDL	$PTO(MACHADDR), AX	/* page table entry offset for MACHADDR */
+	MOVL	$PADDR(CPU0MACH), (AX)	/* PTE for Mach */
+	MOVL	$(PTEWRITE|PTEVALID), BX/* page permissions */
+	ORL	BX, (AX)
 
 /*
- * Now ready to use the new map. Make sure the processor options are what is wanted.
- * It is necessary on some processors to immediately follow mode switching with a JMP instruction
- * to clear the prefetch queues.
+ * Now ready to use the new map.  Make sure the processor options are what is
+ * wanted.  It is necessary on some processors to immediately follow mode
+ * switching with a JMP instruction to clear the prefetch queues.
  */
-	MOVL	$PADDR(CPU0PDB), CX		/* load address of page directory */
-	MOVL	(PDO(KZERO))(CX), DX		/* double-map KZERO at 0 */
-	MOVL	DX, (PDO(0))(CX)
-	MOVL	CX, CR3
+	MOVL	$(PADDR(MACHADDR)+MACHSIZE-BY2WD), SP
+	MOVL	$PADDR(CPU0PDB), DI	/* load address of page directory */
+	CALL	map0pages(SB)
+	MOVL	DI, CR3				/* load and flush the mmu */
 	DELAY					/* JMP .+2 */
 
 	MOVL	CR0, DX
-	ORL	$0x80010000, DX			/* PG|WP */
-	ANDL	$~0x6000000A, DX		/* ~(CD|NW|TS|MP) */
+	ORL	$(PG|WP), DX
+	/* CD and NW clear enables write-back caches */
+	ANDL	$~(CD|NW|TS|MP), DX
 
 	MOVL	$_startpg(SB), AX		/* this is a virtual address */
-	MOVL	DX, CR0				/* turn on paging */
+/**/	MOVL	DX, CR0				/* turn on paging */
 	JMP*	AX				/* jump to the virtual nirvana */
 
 /*
- * Basic machine environment set, can clear BSS and create a stack.
+ * also map first few KZERO pages at 0.   usable PDB address is in DI.
+ * clobbers [ABCD]X.
+ */
+TEXT map0pages(SB), $0
+	MOVL	DI, AX
+	MOVL	DI, BX
+	ADDL	$PDO(KZERO), AX
+	ADDL	$PDO(0), BX
+	MOVL	$LOWPTEPAGES, CX
+_dblmap:
+	MOVL	(AX), DX			/* double-map KZERO at 0 */
+	MOVL	DX, (BX)
+	ADDL	$PDO(4*MB), AX
+	ADDL	$PDO(4*MB), BX
+	LOOP	_dblmap
+	RET
+
+/*
+ * Basic machine environment set, can clear BSS and create a zeroed stack.
  * The stack starts at the top of the page containing the Mach structure.
  * The x86 architecture forces the use of the same virtual address for
  * each processor's Mach structure, so the global Mach pointer 'm' can
  * be initialised here.
  */
 TEXT _startpg(SB), $0
-	MOVL	$vtgdtptr(SB), AX
-	MOVL	(AX), GDTR
-
-	MOVL	$0, (PDO(0))(CX)		/* undo double-map of KZERO at 0 */
-	MOVL	CX, CR3				/* load and flush the mmu */
+	MOVL	DI, AX				/* load address of PDB */
+	ADDL	$KZERO, AX			/* make it virtual */
+	ADDL	$PDO(0), AX
+	MOVL	$LOWPTEPAGES, CX
+_unmap:
+	MOVL	$0, (AX)			/* undo double-map of KZERO at 0 */
+	ADDL	$PDO(4*MB), AX
+	LOOP	_unmap
+	MOVL	DI, CR3				/* load and flush the mmu */
+	DELAY					/* JMP .+2 */
 
 _clearbss:
 	MOVL	$edata(SB), DI
@@ -231,16 +242,17 @@ _clearbss:
 	MOVL	$end(SB), CX
 	SUBL	DI, CX				/* end-edata bytes */
 	SHRL	$2, CX				/* end-edata doublewords */
+	CLD; REP; STOSL				/* clear BSS */
 
-	CLD
-	REP;	STOSL				/* clear BSS */
+	MOVL	$MACHADDR, DI
+	MOVL	$(MACHSIZE/BY2WD), CX		/* # of longs to zero */
+	CLD; REP; STOSL				/* clear m */
 
 	MOVL	$MACHADDR, SP
 	MOVL	SP, m(SB)			/* initialise global Mach pointer */
 	MOVL	$0, 0(SP)			/* initialise m->machno */
 
-
-	ADDL	$(MACHSIZE-4), SP		/* initialise stack */
+	ADDL	$(MACHSIZE-BY2WD), SP		/* initialise stack */
 
 /*
  * Need to do one final thing to ensure a clean machine environment,
@@ -255,26 +267,24 @@ _clearbss:
 /*
  * Park a processor. Should never fall through a return from main to here,
  * should only be called by application processors when shutting down.
+ * Continue to service interrupts until put into reset by cpu0 (if rebooting)
+ * or a system-wide reset (if exiting).
  */
 TEXT idle(SB), $0
-_idle:
+	WBINVD
 	STI
 	HLT
-	JMP	_idle
+	JMP	idle(SB)
 
+#include "lreal.s"
 
-TEXT load_fs(SB), $0
-	MOVW fs+0(FP), AX
-	MOVW AX, FS
-	RET
-
-TEXT load_gs(SB), $0
-	MOVW gs+0(FP), AX
-	MOVW AX, GS
-	RET
-
+#ifdef DREGS						/* BIOS32 */
 /*
  * BIOS32.
+ * Ugh, but at least it doesn't require real mode.
+ * Only used by PCI code, and only as a last resort.
+ *
+ * int	bios32call(BIOS32ci *ci, u16int farptr[3]);
  */
 TEXT bios32call(SB), $0
 	MOVL	ci+0(FP), BP
@@ -286,7 +296,8 @@ TEXT bios32call(SB), $0
 	MOVL	20(BP), DI
 	PUSHL	BP
 
-	MOVL	12(SP), BP			/* ptr */
+	/* 0(SP) and up: BP (after *ci), return addr., ci, farptr */
+	MOVL	12(SP), BP			/* farptr */
 	BYTE $0xFF; BYTE $0x5D; BYTE $0x00	/* CALL FAR 0(BP) */
 
 	POPL	BP
@@ -303,12 +314,15 @@ TEXT bios32call(SB), $0
 
 _bios32xxret:
 	RET
+#endif
 
 /*
  * Port I/O.
  *	in[bsl]		input a byte|short|long
- *	ins[bsl]	input a string of bytes|shorts|longs
  *	out[bsl]	output a byte|short|long
+ * these are only used by ether8390.h (ether2000, ether8003, ether8390),
+ * etherelnk3 & sdata:
+ *	ins[bsl]	input a string of bytes|shorts|longs
  *	outs[bsl]	output a string of bytes|shorts|longs
  */
 TEXT inb(SB), $0
@@ -404,11 +418,6 @@ TEXT lgdt(SB), $0				/* GDTR - global descriptor table */
 	MOVL	(AX), GDTR
 	RET
 
-TEXT lldt(SB), $0				/* LDTR - local descriptor table */
-	MOVL	sel+0(FP), AX
-	BYTE $0x0F; BYTE $0x00; BYTE $0xD0	/* LLDT AX */
-	RET
-
 TEXT lidt(SB), $0				/* IDTR - interrupt descriptor table */
 	MOVL	idtptr+0(FP), AX
 	MOVL	(AX), IDTR
@@ -425,11 +434,6 @@ TEXT getcr0(SB), $0				/* CR0 - processor control */
 
 TEXT getcr2(SB), $0				/* CR2 - page fault linear address */
 	MOVL	CR2, AX
-	RET
-
-TEXT putcr2(SB), $0
-	MOVL	cr2+0(FP), AX
-	MOVL	AX, CR2
 	RET
 
 TEXT getcr3(SB), $0				/* CR3 - page directory base */
@@ -456,13 +460,12 @@ TEXT putcr4(SB), $0
 	RET
 
 TEXT invlpg(SB), $0
-	/* 486+ only */
 	MOVL	va+0(FP), CX
-	INVLPG
+	INVLPG					/* 486+ only */
 	RET
 
 TEXT wbinvd(SB), $0
-	WBINVD
+	WBINVD					/* 486+ only */
 	RET
 
 TEXT _cycles(SB), $0				/* time stamp counter */
@@ -475,42 +478,27 @@ TEXT _cycles(SB), $0				/* time stamp counter */
 /*
  * stub for:
  * time stamp counter; low-order 32 bits of 64-bit cycle counter
- * Runs at fasthz/4 cycles per second (m->clkin>>3)
+ * Runs at fasthz/4 cycles per second (m->cpuhz>>2?)
  */
 TEXT lcycles(SB),1,$0
 	RDTSC
 	RET
 
+/* rdmsr(index, &vl) */
 TEXT rdmsr(SB), $0				/* model-specific register */
-	MOVL	$0, BP
 	MOVL	index+0(FP), CX
-TEXT _rdmsrinst(SB), $0
 	RDMSR
 	MOVL	vlong+4(FP), CX			/* &vlong */
 	MOVL	AX, 0(CX)			/* lo */
 	MOVL	DX, 4(CX)			/* hi */
-	MOVL	BP, AX				/* BP set to -1 if traped */
 	RET
-	
+
+/* wrmsr(index, vl) */
 TEXT wrmsr(SB), $0
-	MOVL	$0, BP
 	MOVL	index+0(FP), CX
 	MOVL	lo+4(FP), AX
 	MOVL	hi+8(FP), DX
-TEXT _wrmsrinst(SB), $0
 	WRMSR
-	MOVL	BP, AX				/* BP set to -1 if traped */
-	RET
-
-/* fault-proof memcpy */
-TEXT peek(SB), $0
-	MOVL	src+0(FP), SI
-	MOVL	dst+4(FP), DI
-	MOVL	cnt+8(FP), CX
-	CLD
-TEXT _peekinst(SB), $0
-	REP; MOVSB
-	MOVL	CX, AX
 	RET
 
 /*
@@ -520,12 +508,12 @@ TEXT _peekinst(SB), $0
  * a 386 (Ac bit can't be set). If it's not a 386 and the Id bit can't be
  * toggled then it's an older 486 of some kind.
  *
- *	cpuid(fn, sublvl, regs[4]);
+ *	cpuid(fun, regs[4]);			// regs are passed in & out
  */
 TEXT cpuid(SB), $0
-	MOVL	$0x240000, AX
+	MOVL	$(Id|Ac), AX
 	PUSHL	AX
-	POPFL					/* set Id|Ac */
+	POPFL					/* try to set Id|Ac */
 	PUSHFL
 	POPL	BX				/* retrieve value */
 	MOVL	$0, AX
@@ -534,12 +522,16 @@ TEXT cpuid(SB), $0
 	PUSHFL
 	POPL	AX				/* retrieve value */
 	XORL	BX, AX
-	TESTL	$0x040000, AX			/* Ac */
-	JZ	_cpu386				/* can't set this bit on 386 */
-	TESTL	$0x200000, AX			/* Id */
-	JZ	_cpu486				/* can't toggle this bit on some 486 */
-	MOVL	fn+0(FP), AX
-	MOVL	sublvl+4(FP), CX
+	TESTL	$Ac, AX
+	JZ	_cpu386				/* can't set Ac on 386 */
+	TESTL	$Id, AX
+	JZ	_cpu486				/* can't toggle Id on some 486 */
+	/* load registers */
+	MOVL	regs+4(FP), BP
+	MOVL	fn+0(FP), AX			/* cpuid function */
+	MOVL	4(BP), BX
+	MOVL	8(BP), CX			/* typically an index */
+	MOVL	12(BP), DX
 	CPUID
 	JMP	_cpuid
 _cpu486:
@@ -556,7 +548,7 @@ _zaprest:
 	XORL	CX, CX
 	XORL	DX, DX
 _cpuid:
-	MOVL	regs+8(FP), BP
+	MOVL	regs+4(FP), BP
 	MOVL	AX, 0(BP)
 	MOVL	BX, 4(BP)
 	MOVL	CX, 8(BP)
@@ -580,66 +572,87 @@ _aamloop:
  * FNxxx variations) so WAIT instructions must be explicitly placed in the
  * code as necessary.
  */
-#define FPOFF							 ;\
+#define	FPOFF(l)						 ;\
+	MOVL	CR0, AX 					 ;\
+	ANDL	$(EM|TS), AX					 ;\
+	CMPL	AX, $TS						 ;\
+	JEQ 	l						 ;\
+	WAIT							 ;\
+l:								 ;\
 	MOVL	CR0, AX						 ;\
-	ORL	$0x28, AX			/* NE=1, TS=1 */ ;\
+	ANDL	$~EM, AX			/* EM=0 */	 ;\
+	ORL	$(NE|TS), AX			/* NE=1, TS=1 */ ;\
 	MOVL	AX, CR0
 
 #define	FPON							 ;\
 	MOVL	CR0, AX						 ;\
-	ANDL	$~0xC, AX			/* EM=0, TS=0 */ ;\
+	ANDL	$~(EM|TS), AX			/* EM=0, TS=0 */ ;\
 	MOVL	AX, CR0
 
+TEXT fpon(SB), $0				/* enable */
+	FPON
+	RET
+
 TEXT fpoff(SB), $0				/* disable */
-	FPOFF
+	FPOFF(l1)
 	RET
 
 TEXT fpinit(SB), $0				/* enable and init */
 	FPON
 	FINIT
 	WAIT
-	/* setfcr(FPPDBL|FPRNR|FPINVAL|FPZDIV|FPOVFL) */
-	/* note that low 6 bits are masks, not enables, on this chip */
+	/*
+	 * setfcr(FPPDBL|FPRNR|FPINVAL|FPZDIV|FPOVFL)
+	 * note that low 6 bits are masks, not enables, on this chip,
+	 * so [gs]etfcr toggles them.
+	 *
+	 * until 2000 was 0x33e: extended precision, signal only invalid ops.
+	 */
 	PUSHW	$0x0232
 	FLDCW	0(SP)
 	POPW	AX
 	WAIT
 	RET
 
-TEXT fpx87save0(SB), $0				/* save state and disable */
+TEXT fpx87save(SB), $0				/* save state and disable */
 	MOVL	p+0(FP), AX
 	FSAVE	0(AX)				/* no WAIT */
-	FPOFF
+	FPOFF(l2)
 	RET
 
-TEXT fpx87restore0(SB), $0			/* enable and restore state */
+TEXT fpx87restore(SB), $0			/* enable and restore state */
 	FPON
 	MOVL	p+0(FP), AX
 	FRSTOR	0(AX)
 	WAIT
 	RET
 
+TEXT fpstatus(SB), $0				/* get floating point status */
+	FSTSW	AX
+	RET
+
+TEXT fpenv(SB), $0				/* save state without waiting */
+	MOVL	p+0(FP), AX
+	FSTENV	0(AX)				/* also masks FP exceptions */
+	RET
+
 TEXT fpclear(SB), $0				/* clear pending exceptions */
 	FPON
 	FCLEX					/* no WAIT */
-	FPOFF
+	FPOFF(l3)
 	RET
 
-TEXT fpssesave(SB), $0				/* save state and disable */
+TEXT fpssesave0(SB), $0				/* save state and disable */
 	MOVL	p+0(FP), AX
-	FXSAVE	0(AX)				/* no WAIT */
-	FPOFF
+	FXSAVE					/* no WAIT */
+	FPOFF(l4)
 	RET
 
-TEXT fpsserestore(SB), $0			/* enable and restore state */
+TEXT fpsserestore0(SB), $0			/* enable and restore state */
 	FPON
 	MOVL	p+0(FP), AX
-	FXRSTOR	0(AX)
+	FXRSTOR
 	WAIT
-	RET
-
-TEXT ldmxcsr(SB), $0				/* Load MXCSR */
-	LDMXCSR	mxcsr+0(FP)
 	RET
 
 /*
@@ -648,30 +661,31 @@ TEXT splhi(SB), $0
 shi:
 	PUSHFL
 	POPL	AX
-	TESTL	$0x200, AX
+	TESTL	$IF, AX
 	JZ	alreadyhi
 	MOVL	$(MACHADDR+0x04), CX 		/* save PC in m->splpc */
 	MOVL	(SP), BX
 	MOVL	BX, (CX)
-	CLI
 alreadyhi:
+	CLI
 	RET
 
 TEXT spllo(SB), $0
 slo:
 	PUSHFL
 	POPL	AX
-	TESTL	$0x200, AX
+	TESTL	$IF, AX
 	JNZ	alreadylo
+	STI
 	MOVL	$(MACHADDR+0x04), CX		/* clear m->splpc */
 	MOVL	$0, (CX)
-	STI
 alreadylo:
+	STI
 	RET
 
 TEXT splx(SB), $0
 	MOVL	s+0(FP), AX
-	TESTL	$0x200, AX
+	TESTL	$IF, AX
 	JNZ	slo
 	JMP	shi
 
@@ -681,47 +695,33 @@ TEXT spldone(SB), $0
 TEXT islo(SB), $0
 	PUSHFL
 	POPL	AX
-	ANDL	$0x200, AX			/* interrupt enable flag */
+	ANDL	$IF, AX			/* IF on is spllo */
+	RET
+
+/*
+ * Miscellany
+ */
+TEXT bsr(SB), $0
+	BSRL	word+0(FP), AX		/* return bit index of leftmost 1 bit */
 	RET
 
 /*
  * Test-And-Set
  */
 TEXT tas(SB), $0
-TEXT _tas(SB), $0
 	MOVL	$0xDEADDEAD, AX
 	MOVL	lock+0(FP), BX
 	XCHGL	AX, (BX)			/* lock->key */
 	RET
-
-TEXT mb386(SB), $0
-	POPL	AX				/* return PC */
-	PUSHFL
-	PUSHL	CS
-	PUSHL	AX
-	IRETL
 
 TEXT mb586(SB), $0
 	XORL	AX, AX
 	CPUID
 	RET
 
-TEXT sfence(SB), $0
-	BYTE $0x0f
-	BYTE $0xae
-	BYTE $0xf8
-	RET
-
-TEXT lfence(SB), $0
-	BYTE $0x0f
-	BYTE $0xae
-	BYTE $0xe8
-	RET
-
+/* others: sfence 0xf, 0xae, 0xf8; lfence 0xf, 0xae, 0xe8 */
 TEXT mfence(SB), $0
-	BYTE $0x0f
-	BYTE $0xae
-	BYTE $0xf0
+	BYTE $0x0f; BYTE $0xae; BYTE $0xf0
 	RET
 
 TEXT xchgw(SB), $0
@@ -736,16 +736,24 @@ TEXT cmpswap486(SB), $0
 	MOVL	new+8(FP), CX
 	LOCK
 	BYTE $0x0F; BYTE $0xB1; BYTE $0x0B	/* CMPXCHGL CX, (BX) */
-	JNZ didnt
+	JNZ	didnt
 	MOVL	$1, AX
 	RET
 didnt:
 	XORL	AX,AX
 	RET
 
+TEXT aadd(SB), 1, $-4			/* long aadd(long*, long addend); */
+	MOVL	arg+0(FP), BX
+	MOVL	addend+4(FP), DX
+	MOVL	DX, AX
+	LOCK; BYTE $0x0f; BYTE $0xc1; BYTE $0x03/* XADDL AX, (BX) */
+	ADDL	DX, AX
+	RET
+
 TEXT mul64fract(SB), $0
 /*
- * Multiply two 64-bit number s and keep the middle 64 bits from the 128-bit result
+ * Multiply two 64-bit numbers & keep the middle 64 bits from the 128-bit result
  * See ../port/tod.c for motivation.
  */
 	MOVL	r+0(FP), CX
@@ -791,244 +799,69 @@ TEXT setlabel(SB), $0
 	RET
 
 /*
+ * void monitor(void* address, ulong extensions, ulong hints);
+ * void mwait(ulong extensions, ulong hints);
+ *
+ * Note: extensions and hints are only 32-bits.
+ * There are no extensions or hints defined yet for MONITOR,
+ * but MWAIT can have both.
+ * These functions and prototypes may change.
+ */
+TEXT monitor(SB), 1, $-4
+	MOVL	address+0(FP), AX
+	MOVL	extensions+4(FP), CX		/* (c|sh)ould be 0 currently */
+	MOVL	hints+8(FP), DX			/* (c|sh)ould be 0 currently */
+	MONITOR
+	RET
+
+TEXT mwait(SB), 1, $-4
+	MOVL	extensions+0(FP), CX
+	MOVL	hints+4(FP), AX
+	MWAIT
+	RET
+
+/*
  * Attempt at power saving. -rsc
+ * Only used on old uniprocessors that lack monitor/mwait.
  */
 TEXT halt(SB), $0
 	CLI
 	CMPL	nrdy(SB), $0
 	JEQ	_nothingready
 	STI
-	RET
+	RET			/* some process is ready; try to run it */
 
 _nothingready:
-	STI
+	STI			/* interrupts on: service before rescheduling */
 	HLT
 	RET
 
-TEXT mwait(SB), $0
-	MOVL	addr+0(FP), AX
-	MOVL	(AX), CX
-	ORL	CX, CX
-	JNZ	_mwaitdone
-	XORL	DX, DX
-	BYTE $0x0f; BYTE $0x01; BYTE $0xc8	/* MONITOR */
-	MOVL	(AX), CX
-	ORL	CX, CX
-	JNZ	_mwaitdone
-	XORL	AX, AX
-	BYTE $0x0f; BYTE $0x01; BYTE $0xc9	/* MWAIT */
-_mwaitdone:
-	RET
-
-#define RDRANDAX	BYTE $0x0f; BYTE $0xc7; BYTE $0xf0
-
-TEXT rdrand32(SB), $-4
-_rloop32:
-	RDRANDAX
-	JCC	_rloop32
-	RET
-
-TEXT rdrandbuf(SB), $0
-	MOVL	buf+0(FP), DI
-	MOVL	cnt+4(FP), CX
-	CLD
-	MOVL	CX, DX
-	SHRL	$2, CX
-	CMPL	CX, $0
-	JE	_rndleft
-_rnddwords:
-	CALL	rdrand32(SB)
-	STOSL
-	LOOP _rnddwords
-_rndleft:
-	MOVL	DX, CX
-	ANDL	$3, CX
-	CMPL	CX, $0
-	JE	_rnddone
-_rndbytes:
-	CALL rdrand32(SB)
-	STOSB
-	LOOP _rndbytes
-_rnddone:
-	RET
-
-/* debug register access */
-
-TEXT putdr(SB), $0
-	MOVL	p+0(FP), SI
-	MOVL	28(SI), AX
-	MOVL	AX, DR7
-_putdr01236:
-	MOVL	0(SI), AX
-	MOVL	AX, DR0
-	MOVL	4(SI), AX
-	MOVL	AX, DR1
-	MOVL	8(SI), AX
-	MOVL	AX, DR2
-	MOVL	12(SI), AX
-	MOVL	AX, DR3
-	MOVL	24(SI), AX
-	MOVL	AX, DR6
-	RET
-
-TEXT putdr01236(SB), $0
-	MOVL p+0(FP), SI
-	JMP _putdr01236
-
-TEXT getdr6(SB), $0
-	MOVL	DR6, AX
-	RET
-
-TEXT putdr6(SB), $0
-	MOVL	p+0(FP), AX
-	MOVL	AX, DR6
-	RET
-	
-TEXT putdr7(SB), $0
-	MOVL	p+0(FP), AX
-	MOVL	AX, DR7
-	RET
-
-/* VMX instructions */
-TEXT vmxon(SB), $0
-	/* VMXON 4(SP) */
-	BYTE	$0xf3; BYTE $0x0f; BYTE $0xc7; BYTE $0x74; BYTE $0x24; BYTE $0x04
-	JMP	_vmout
-
-TEXT vmxoff(SB), $0
-	BYTE	$0x0f; BYTE $0x01; BYTE $0xc4
-	JMP	_vmout
-
-TEXT vmclear(SB), $0
-	/* VMCLEAR 4(SP) */
-	BYTE	$0x66; BYTE $0x0f; BYTE $0xc7; BYTE $0x74; BYTE $0x24; BYTE $0x04
-	JMP	_vmout
-
-TEXT vmlaunch(SB), $0
-	MOVL	$0x6C14, DI
-	MOVL	SP, DX
-	BYTE	$0x0f; BYTE $0x79; BYTE $0xfa /* VMWRITE DX, DI */
-	JBE	_vmout
-	MOVL	$0x6C16, DI
-	MOVL	$vmrestore(SB), DX
-	BYTE	$0x0f; BYTE $0x79; BYTE $0xfa /* VMWRITE DX, DI */
-	JBE	_vmout
-	
-	MOVL	resume+4(FP), AX
-	TESTL	AX, AX
-	MOVL	ureg+0(FP), DI
-	MOVL	4(DI), SI
-	MOVL	8(DI), BP
-	MOVL	16(DI), BX
-	MOVL	20(DI), DX
-	MOVL	24(DI), CX
-	MOVL	28(DI), AX
-	MOVL	0(DI), DI
-	JNE	_vmresume
-	BYTE	$0x0f; BYTE $0x01; BYTE	$0xc2 /* VMLAUNCH */
-	JMP	_vmout
-_vmresume:
-	BYTE	$0x0f; BYTE $0x01; BYTE $0xc3 /* VMRESUME */
-	JMP _vmout
-
-TEXT vmrestore(SB), $0
-	PUSHL	DI
-	MOVL	ureg+0(FP), DI
-	POPL	0(DI)
-	MOVL	SI, 4(DI)
-	MOVL	BP, 8(DI)
-	MOVL	BX, 16(DI)
-	MOVL	DX, 20(DI)
-	MOVL	CX, 24(DI)
-	MOVL	AX, 28(DI)
-	XORL	AX, AX
-	RET
-
-TEXT vmptrld(SB), $0
-	/* VMPTRLD 4(SP) */
-	BYTE $0x0f; BYTE $0xc7; BYTE $0x74; BYTE $0x24; BYTE $0x04
-	JMP _vmout
-
-TEXT vmwrite(SB), $0
-	MOVL addr+0(FP),DI
-	MOVL val+4(FP),DX
-	/* VMWRITE DX, DI */
-	BYTE $0x0f; BYTE $0x79; BYTE $0xfa
-	JMP _vmout
-
-TEXT vmread(SB), $0
-	MOVL addr+0(FP),DI
-	MOVL valp+4(FP),SI
-	/* VMREAD (SI), DI */
-	BYTE $0x0f; BYTE $0x78; BYTE $0x3e
-	JMP _vmout
-
-TEXT invept(SB), $0
-	MOVL type+0(FP), AX
-	/* INVEPT AX, 8(SP) */
-	BYTE $0x66; BYTE $0x0f; BYTE $0x38; BYTE $0x80; BYTE $0x44; BYTE $0x24; BYTE $0x08
-	JMP _vmout
-
-TEXT invvpid(SB), $0
-	MOVL type+0(FP), AX
-	/* INVVPID AX, 8(SP) */
-	BYTE $0x66; BYTE $0x0f; BYTE $0x38; BYTE $0x81; BYTE $0x44; BYTE $0x24; BYTE $0x08
-	JMP _vmout
-
-_vmout:
-	JC _vmout1
-	JZ _vmout2
-	XORL AX, AX
-	RET
-_vmout1:
-	MOVL $-1, AX
-	RET
-_vmout2:
-	MOVL $-2, AX
-	RET
-
-/*
- *  Used to get to the first process:
- * 	set up an interrupt return frame and IRET to user level.
- */
-TEXT touser(SB), $0
-	PUSHL	$(UDSEL)			/* old ss */
-	MOVL	sp+0(FP), AX			/* old sp */
-	PUSHL	AX
-	MOVL	$0x200, AX			/* interrupt enable flag */
-	PUSHL	AX				/* old flags */
-	PUSHL	$(UESEL)			/* old cs */
-	PUSHL	$(UTZERO+32)			/* old pc */
-	MOVL	$(UDSEL), AX
-	MOVW	AX, DS
-	MOVW	AX, ES
-	MOVW	AX, GS
-	MOVW	AX, FS
-	IRETL
-
 /*
  * Interrupt/exception handling.
- * Each entry in the vector table calls either _strayintr or _strayintrx depending
- * on whether an error code has been automatically pushed onto the stack
- * (_strayintrx) or not, in which case a dummy entry must be pushed before retrieving
- * the trap type from the vector table entry and placing it on the stack as part
- * of the Ureg structure.
+ * Each entry in the vector table calls either _strayintr or _strayintrx
+ * depending on whether an error code has been automatically pushed onto the
+ * stack (_strayintrx) or not, in which case a dummy entry must be pushed
+ * before retrieving the trap type from the vector table entry and placing it
+ * on the stack as part of the Ureg structure.
+ * SP points to Ureg->pc at entry.
+ * Ureg->di through Ureg->trap get filled in here.
  * The size of each entry in the vector table (6 bytes) is known in trapinit().
  */
 TEXT _strayintr(SB), $0
-	PUSHL	AX			/* save AX */
+	PUSHL	AX			/* save AX as ecode */
 	MOVL	4(SP), AX		/* return PC from vectortable(SB) */
-	JMP	intrcommon
-
+	ORL	AX, AX			/* peculiar code to force short JMP, */
+	JNE	_intrcommon		/* and prevent code motion by 8l */
 TEXT _strayintrx(SB), $0
 	XCHGL	AX, (SP)		/* swap AX with vectortable CALL PC */
-intrcommon:
+_intrcommon:
+TEXT intrcommon(SB), $0
+	/* we expect address of trap type in AX & saved AX on stack */
 	PUSHL	DS			/* save DS */
 	PUSHL	$(KDSEL)
-	POPL	DS			/* fix up DS */
+	POPL	DS			/* fix up DS; now safe to use data seg */
 	MOVBLZX	(AX), AX		/* trap type -> AX */
 	XCHGL	AX, 4(SP)		/* exchange trap type with saved AX */
-
 	PUSHL	ES			/* save ES */
 	PUSHL	$(KDSEL)
 	POPL	ES			/* fix up ES */
@@ -1043,38 +876,14 @@ intrcommon:
 TEXT forkret(SB), $0
 	POPL	AX
 	POPAL
-TEXT _forkretpopgs(SB), $0
 	POPL	GS
-TEXT _forkretpopfs(SB), $0
 	POPL	FS
-TEXT _forkretpopes(SB), $0
 	POPL	ES
-TEXT _forkretpopds(SB), $0
 	POPL	DS
 	ADDL	$8, SP			/* pop error code and trap type */
-TEXT _forkretiret(SB), $0
 	IRETL
 
-/*
- * This is merely _strayintr optimised to vector
- * to syscall() without going through trap().
- */
-TEXT _syscallintr(SB), $0
-	PUSHL	$VectorSYSCALL		/* trap type */
-
-	PUSHL	DS
-	PUSHL	ES
-	PUSHL	FS
-	PUSHL	GS
-	PUSHAL
-	MOVL	$(KDSEL), AX
-	MOVW	AX, DS
-	MOVW	AX, ES
-
-	PUSHL	SP			/* Ureg* argument to syscall */
-	PUSHL	$forkret(SB)		/* return pc */
-	JMPF	syscall(SB)
-
+/* very stereotyped; much repetition from here on. */
 TEXT vectortable(SB), $0
 	CALL _strayintr(SB); BYTE $0x00		/* divide error */
 	CALL _strayintr(SB); BYTE $0x01		/* debug exception */
@@ -1095,7 +904,7 @@ TEXT vectortable(SB), $0
 	CALL _strayintr(SB); BYTE $0x10		/* coprocessor error */
 	CALL _strayintrx(SB); BYTE $0x11	/* alignment check */
 	CALL _strayintr(SB); BYTE $0x12		/* machine check */
-	CALL _strayintr(SB); BYTE $0x13		/* simd error */
+	CALL _strayintr(SB); BYTE $0x13
 	CALL _strayintr(SB); BYTE $0x14
 	CALL _strayintr(SB); BYTE $0x15
 	CALL _strayintr(SB); BYTE $0x16
@@ -1108,7 +917,7 @@ TEXT vectortable(SB), $0
 	CALL _strayintr(SB); BYTE $0x1D
 	CALL _strayintr(SB); BYTE $0x1E
 	CALL _strayintr(SB); BYTE $0x1F
-	CALL _strayintr(SB); BYTE $0x20		/* VectorLAPIC */
+	CALL _strayintr(SB); BYTE $0x20		/* VectorPIC */
 	CALL _strayintr(SB); BYTE $0x21
 	CALL _strayintr(SB); BYTE $0x22
 	CALL _strayintr(SB); BYTE $0x23
@@ -1124,7 +933,7 @@ TEXT vectortable(SB), $0
 	CALL _strayintr(SB); BYTE $0x2D
 	CALL _strayintr(SB); BYTE $0x2E
 	CALL _strayintr(SB); BYTE $0x2F
-	CALL _strayintr(SB); BYTE $0x30
+	CALL _strayintr(SB); BYTE $0x30		/* VectorLAPIC */
 	CALL _strayintr(SB); BYTE $0x31
 	CALL _strayintr(SB); BYTE $0x32
 	CALL _strayintr(SB); BYTE $0x33
@@ -1140,8 +949,8 @@ TEXT vectortable(SB), $0
 	CALL _strayintr(SB); BYTE $0x3D
 	CALL _strayintr(SB); BYTE $0x3E
 	CALL _strayintr(SB); BYTE $0x3F
-	CALL _syscallintr(SB); BYTE $0x40	/* VectorSYSCALL */
-	CALL _strayintr(SB); BYTE $0x41
+	CALL _syscallintr(SB); BYTE $VectorSYSCALL
+	CALL _strayintr(SB); BYTE $0x41		/* VectorAPIC */
 	CALL _strayintr(SB); BYTE $0x42
 	CALL _strayintr(SB); BYTE $0x43
 	CALL _strayintr(SB); BYTE $0x44
@@ -1204,7 +1013,7 @@ TEXT vectortable(SB), $0
 	CALL _strayintr(SB); BYTE $0x7D
 	CALL _strayintr(SB); BYTE $0x7E
 	CALL _strayintr(SB); BYTE $0x7F
-	CALL _strayintr(SB); BYTE $0x80		/* Vector[A]PIC */
+	CALL _strayintr(SB); BYTE $0x80
 	CALL _strayintr(SB); BYTE $0x81
 	CALL _strayintr(SB); BYTE $0x82
 	CALL _strayintr(SB); BYTE $0x83

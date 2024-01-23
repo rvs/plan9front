@@ -5,38 +5,195 @@
 #include	"fns.h"
 #include	"../port/error.h"
 
-static void
-faulterror(char *s, Chan *c)
+int
+fault(ulong addr, int read)
 {
-	char buf[ERRMAX];
+	Segment *s;
+	char *sps;
 
-	if(c != nil)
-		snprint(buf, sizeof buf, "sys: %s accessing %s: %s", s, chanpath(c), up->errstr);
-	else
-		snprint(buf, sizeof buf, "sys: %s", s);
-	if(up->nerrlab) {
-		if(up->kp == 0)
-			postnote(up, 1, buf, NDebug);
-		error(s);
+	if(up == nil)
+		panic("fault: nil up");
+	if(up->nlocks.ref)
+		print("fault: addr %#p: nlocks %ld\n", addr, up->nlocks.ref);
+
+	sps = up->psstate;
+	up->psstate = "Fault";
+	spllo();
+
+	m->pfault++;
+	for(;;) {
+		s = seg(up, addr, 1);		/* leaves s->lk qlocked if seg != nil */
+		if(s == 0) {
+			up->psstate = sps;
+			return -1;
+		}
+
+		if(!read && (s->type&SG_RONLY)) {
+			qunlock(&s->lk);
+			up->psstate = sps;
+			return -1;
+		}
+
+		if(fixfault(s, addr, read, 1) == 0)	/* qunlocks s->lk */
+			break;
 	}
-	pprint("suicide: %s\n", buf);
-	pexit(s, 1);
+
+	up->psstate = sps;
+	return 0;
 }
 
 static void
-pio(Segment *s, uintptr addr, uintptr soff, Page **p)
+faulterror(char *s, Chan *c, int freemem)
+{
+	char buf[ERRMAX];
+
+	if(c && c->path){
+		snprint(buf, sizeof buf, "sys: %s accessing %s: %s",
+			s, c->path->s, up->errstr);
+		s = buf;
+	}
+	if(up->nerrlab) {
+		postnote(up, 1, s, NDebug);
+		error(s);
+	}
+	pexit(s, freemem);
+}
+
+void	(*checkaddr)(ulong, Segment *, Page *);
+ulong	addr2check;
+
+int
+fixfault(Segment *s, ulong addr, int read, int doputmmu)
+{
+	int type;
+	int ref;
+	Pte **p, *etp;
+	ulong mmuphys=0, soff;
+	Page **pg, *lkp, *new;
+	Page *(*fn)(Segment*, ulong);
+
+	addr &= ~(BY2PG-1);
+	soff = addr-s->base;
+	p = &s->map[soff/PTEMAPMEM];
+	if(*p == 0)
+		*p = ptealloc();
+
+	etp = *p;
+	pg = &etp->pages[(soff&(PTEMAPMEM-1))/BY2PG];
+	type = s->type&SG_TYPE;
+
+	if(pg < etp->first)
+		etp->first = pg;
+	if(pg > etp->last)
+		etp->last = pg;
+
+	switch(type) {
+	default:
+		panic("fault");
+		break;
+
+	case SG_TEXT: 			/* Demand load */
+		if(pagedout(*pg))
+			pio(s, addr, soff, pg);
+
+		mmuphys = PPN((*pg)->pa) | PTERONLY|PTEVALID;
+		(*pg)->modref = PG_REF;
+		break;
+
+	case SG_BSS:
+	case SG_SHARED:			/* Zero fill on demand */
+	case SG_STACK:
+		if(*pg == 0) {
+			new = newpage(1, &s, addr);
+			if(s == 0)
+				return -1;
+
+			*pg = new;
+		}
+		goto common;
+
+	case SG_DATA:
+	common:			/* Demand load/pagein/copy on write */
+		if(pagedout(*pg))
+			pio(s, addr, soff, pg);
+
+		/*
+		 *  It's only possible to copy on write if
+		 *  we're the only user of the segment.
+		 */
+		if(read && conf.copymode == 0 && s->ref == 1) {
+			mmuphys = PPN((*pg)->pa)|PTERONLY|PTEVALID;
+			(*pg)->modref |= PG_REF;
+			break;
+		}
+
+		lkp = *pg;
+		lock(lkp);
+
+		if(lkp->image == &swapimage)
+			ref = lkp->ref + swapcount(lkp->daddr);
+		else
+			ref = lkp->ref;
+		if(ref == 1 && lkp->image){
+			/* save a copy of the original for the image cache */
+			duppage(lkp);
+			ref = lkp->ref;
+		}
+		unlock(lkp);
+		if(ref > 1){
+			new = newpage(0, &s, addr);
+			if(s == 0)
+				return -1;
+			*pg = new;
+			copypage(lkp, *pg);
+			putpage(lkp);
+		}
+		mmuphys = PPN((*pg)->pa) | PTEWRITE | PTEVALID;
+		(*pg)->modref = PG_MOD|PG_REF;
+		break;
+
+	case SG_PHYSICAL:
+		if(*pg == 0) {
+			fn = s->pseg->pgalloc;
+			if(fn)
+				*pg = (*fn)(s, addr);
+			else {
+				new = smalloc(sizeof(Page));
+				new->va = addr;
+				new->pa = s->pseg->pa+(addr-s->base);
+				new->ref = 1;
+				*pg = new;
+			}
+		}
+
+		if (checkaddr && addr == addr2check)
+			(*checkaddr)(addr, s, *pg);
+		mmuphys = PPN((*pg)->pa) |PTEWRITE|PTEUNCACHED|PTEVALID;
+		(*pg)->modref = PG_MOD|PG_REF;
+		break;
+	}
+	qunlock(&s->lk);
+
+	if(doputmmu)
+		putmmu(addr, mmuphys, *pg);
+
+	return 0;
+}
+
+void
+pio(Segment *s, ulong addr, ulong soff, Page **p)
 {
 	Page *new;
 	KMap *k;
 	Chan *c;
 	int n, ask;
 	char *kaddr;
-	uintptr daddr;
+	ulong daddr;
 	Page *loadrec;
 
 retry:
 	loadrec = *p;
-	if(loadrec == nil) {	/* from a text/data image */
+	if(loadrec == 0) {	/* from a text/data image */
 		daddr = s->fstart+soff;
 		new = lookpage(s->image, daddr);
 		if(new != nil) {
@@ -45,11 +202,9 @@ retry:
 		}
 
 		c = s->image->c;
-		ask = BY2PG;
-		if(soff >= s->flen)
-			ask = 0;
-		else if((soff+ask) > s->flen)
-			ask = s->flen-soff;
+		ask = s->flen-soff;
+		if(ask > BY2PG)
+			ask = BY2PG;
 	}
 	else {			/* from a swap image */
 		daddr = swapaddr(loadrec);
@@ -63,306 +218,97 @@ retry:
 		c = swapimage.c;
 		ask = BY2PG;
 	}
-	qunlock(s);
+	qunlock(&s->lk);
 
 	new = newpage(0, 0, addr);
 	k = kmap(new);
 	kaddr = (char*)VA(k);
+
 	while(waserror()) {
 		if(strcmp(up->errstr, Eintr) == 0)
 			continue;
 		kunmap(k);
 		putpage(new);
-		faulterror(Eioload, c);
+		faulterror(Eioload, c, 0);
 	}
+
 	n = devtab[c->type]->read(c, kaddr, ask, daddr);
 	if(n != ask)
-		error(Eshort);
+		faulterror(Eioload, c, 0);
 	if(ask < BY2PG)
 		memset(kaddr+ask, 0, BY2PG-ask);
+
 	poperror();
 	kunmap(k);
-
-	qlock(s);
-	if(loadrec == nil) {	/* This is demand load */
+	qlock(&s->lk);
+	if(loadrec == 0) {	/* This is demand load */
 		/*
 		 *  race, another proc may have gotten here first while
-		 *  s was unlocked
+		 *  s->lk was unlocked
 		 */
-		if(*p == nil) { 
-			/*
-			 *  check page cache again after i/o to reduce double caching
-			 */
-			*p = lookpage(s->image, daddr);
-			if(*p == nil) {
-				incref(new);
-				new->daddr = daddr;
-				cachepage(new, s->image);
-				*p = new;
-			}
+		if(*p == 0) { 
+			new->daddr = daddr;
+			cachepage(new, s->image);
+			*p = new;
 		}
+		else
+			putpage(new);
 	}
 	else {			/* This is paged out */
 		/*
 		 *  race, another proc may have gotten here first
 		 *  (and the pager may have run on that page) while
-		 *  s was unlocked
+		 *  s->lk was unlocked
 		 */
-		if(*p != loadrec) {
-			if(!pagedout(*p)) {
+		if(*p != loadrec){
+			if(!pagedout(*p)){
 				/* another process did it for me */
+				putpage(new);
 				goto done;
-			} else if(*p != nil) {
+			} else {
 				/* another process and the pager got in */
 				putpage(new);
 				goto retry;
-			} else {
-				/* another process segfreed the page */
-				incref(new);
-				k = kmap(new);
-				memset((void*)VA(k), 0, ask);
-				kunmap(k);
-				*p = new;
-				goto done;
 			}
 		}
 
-		incref(new);
 		new->daddr = daddr;
 		cachepage(new, &swapimage);
 		*p = new;
 		putswap(loadrec);
 	}
+
 done:
-	putpage(new);
-	settxtflush(*p, s->flushme);
-}
-
-static int
-fixfault(Segment *s, uintptr addr, int read)
-{
-	Pte **pte, *etp;
-	uintptr soff, mmuphys;
-	Page **pg, *old, *new;
-
-	addr &= ~(BY2PG-1);
-	soff = addr-s->base;
-	pte = &s->map[soff/PTEMAPMEM];
-	if((etp = *pte) == nil)
-		*pte = etp = ptealloc();
-
-	pg = &etp->pages[(soff&(PTEMAPMEM-1))/BY2PG];
-	if(pg < etp->first)
-		etp->first = pg;
-	if(pg > etp->last)
-		etp->last = pg;
-
-	switch(s->type & SG_TYPE) {
-	default:
-		panic("fault");
-		return -1;
-
-	case SG_TEXT: 			/* Demand load */
-		if(pagedout(*pg))
-			pio(s, addr, soff, pg);
-
-		mmuphys = PPN((*pg)->pa) | PTERONLY | PTECACHED | PTEVALID;
-		(*pg)->modref = PG_REF;
-		break;
-
-	case SG_BSS:
-	case SG_SHARED:			/* Zero fill on demand */
-	case SG_STACK:
-		if(*pg == nil) {
-			new = newpage(1, &s, addr);
-			if(s == nil)
-				return -1;
-			*pg = new;
-		}
-		/* wet floor */
-	case SG_DATA:			/* Demand load/pagein/copy on write */
-		if(pagedout(*pg))
-			pio(s, addr, soff, pg);
-
-		/*
-		 *  It's only possible to copy on write if
-		 *  we're the only user of the segment.
-		 */
-		if(read && conf.copymode == 0 && s->ref == 1) {
-			mmuphys = PPN((*pg)->pa) | PTERONLY | PTECACHED | PTEVALID;
-			(*pg)->modref |= PG_REF;
-			break;
-		}
-
-		old = *pg;
-		if(old->image == &swapimage && (old->ref + swapcount(old->daddr)) == 1)
-			uncachepage(old);
-		if(old->ref > 1 || old->image != nil) {
-			new = newpage(0, &s, addr);
-			if(s == nil)
-				return -1;
-			settxtflush(new, s->flushme);
-			*pg = new;
-			copypage(old, *pg);
-			putpage(old);
-		}
-		/* wet floor */
-	case SG_STICKY:			/* Never paged out */
-		mmuphys = PPN((*pg)->pa) | PTEWRITE | PTECACHED | PTEVALID;
-		(*pg)->modref |= up->privatemem? PG_PRIV|PG_MOD|PG_REF: PG_MOD|PG_REF;
-		break;
-
-	case SG_FIXED:			/* Never paged out */
-		mmuphys = PPN((*pg)->pa) | PTEWRITE | PTEUNCACHED | PTEVALID;
-		(*pg)->modref |= up->privatemem? PG_PRIV|PG_MOD|PG_REF: PG_MOD|PG_REF;
-		break;
-	}
-
-#ifdef PTENOEXEC
-	if((s->type & SG_NOEXEC) != 0 || s->flushme == 0)
-		mmuphys |= PTENOEXEC;
-#endif
-
-	qunlock(s);
-
-	putmmu(addr, mmuphys, *pg);
-
-	return 0;
-}
-
-static void
-mapphys(Segment *s, uintptr addr, int attr)
-{
-	uintptr mmuphys;
-	Page pg = {0};
-
-	addr &= ~(BY2PG-1);
-	pg.ref = 1;
-	pg.va = addr;
-	pg.pa = s->pseg->pa+(addr-s->base);
-	settxtflush(&pg, s->flushme);
-
-	mmuphys = PPN(pg.pa) | PTEVALID;
-	if((attr & SG_RONLY) == 0)
-		mmuphys |= PTEWRITE;
-	else
-		mmuphys |= PTERONLY;
-
-#ifdef PTENOEXEC
-	if((attr & SG_NOEXEC) != 0 || s->flushme == 0)
-		mmuphys |= PTENOEXEC;
-#endif
-
-#ifdef PTEDEVICE
-	if((attr & SG_DEVICE) != 0)
-		mmuphys |= PTEDEVICE;
-	else
-#endif
-	if((attr & SG_CACHED) == 0)
-		mmuphys |= PTEUNCACHED;
-	else
-		mmuphys |= PTECACHED;
-
-	qunlock(s);
-
-	putmmu(addr, mmuphys, &pg);
-}
-
-int
-fault(uintptr addr, uintptr pc, int read)
-{
-	Segment *s;
-	char *sps;
-	int pnd, attr;
-
-	if(up == nil)
-		panic("fault: nil up");
-	if(up->nlocks){
-		Lock *l = up->lastlock;
-		print("fault: nlocks %d, proc %lud %s, addr %#p, lock %#p, lpc %#p\n", 
-			up->nlocks, up->pid, up->text, addr, l, l ? l->pc : 0);
-	}
-
-	pnd = up->notepending;
-	sps = up->psstate;
-	up->psstate = "Fault";
-
-	m->pfault++;
-	for(;;) {
-		spllo();
-
-		s = seg(up, addr, 1);		/* leaves s locked if seg != nil */
-		if(s == nil) {
-			up->psstate = sps;
-			return -1;
-		}
-
-		attr = s->type;
-		if((attr & SG_TYPE) == SG_PHYSICAL)
-			attr |= s->pseg->attr;
-
-		if((attr & SG_FAULT) != 0
-		|| read? ((attr & SG_NOEXEC) != 0 || s->flushme == 0) && (addr & -BY2PG) == (pc & -BY2PG):
-			 (attr & SG_RONLY) != 0) {
-			qunlock(s);
-			up->psstate = sps;
-			if(up->kp && up->nerrlab)	/* for segio */
-				error(Eio);
-			return -1;
-		}
-
-		if((attr & SG_TYPE) == SG_PHYSICAL){
-			mapphys(s, addr, attr);
-			break;
-		}
-
-		if(fixfault(s, addr, read) == 0)
-			break;
-
-		splhi();
-		switch(up->procctl){
-		case Proc_exitme:
-		case Proc_exitbig:
-			procctl();
-		}
-	}
-
-	up->psstate = sps;
-	up->notepending |= pnd;
-
-	return 0;
+	if(s->flushme)
+		memset((*p)->cachectl, PG_TXTFLUSH, sizeof((*p)->cachectl));
 }
 
 /*
- * Called only in a system call
+ * Called only in a system call (or FP emulation)
  */
 int
-okaddr(uintptr addr, ulong len, int write)
+okaddr(ulong addr, ulong len, int write)
 {
 	Segment *s;
 
-	if((long)len >= 0 && len <= -addr) {
-		for(;;) {
-			s = seg(up, addr, 0);
-			if(s == nil || (write && (s->type&SG_RONLY)))
-				break;
-
-			if(addr+len > s->top) {
-				len -= s->top - addr;
-				addr = s->top;
-				continue;
-			}
-			return 1;
+	/* second test is paranoia only needed on 64-bit systems */
+	if((long)len >= 0 && addr+len >= addr)
+		while ((s = seg(up, addr, 0)) != nil &&
+		    (!write || !(s->type&SG_RONLY))) {
+			if((uvlong)addr+len <= s->top)
+				return 1;
+			len -= s->top - addr;
+			addr = s->top;
 		}
-	}
+	pprint("suicide: invalid address %#lux/%lud in sys call pc=%#lux\n",
+		addr, len, userpc());
 	return 0;
 }
 
 void
-validaddr(uintptr addr, ulong len, int write)
+validaddr(ulong addr, ulong len, int write)
 {
 	if(!okaddr(addr, len, write)){
-		pprint("suicide: invalid address %#p/%lud in sys call pc=%#p\n", addr, len, userpc());
 		postnote(up, 1, "sys: bad address in syscall", NDebug);
 		error(Ebadarg);
 	}
@@ -372,20 +318,18 @@ validaddr(uintptr addr, ulong len, int write)
  * &s[0] is known to be a valid address.
  */
 void*
-vmemchr(void *s, int c, ulong n)
+vmemchr(void *s, int c, int n)
 {
-	uintptr a;
-	ulong m;
+	int m;
+	ulong a;
 	void *t;
 
-	a = (uintptr)s;
-	for(;;){
-		m = BY2PG - (a & (BY2PG-1));
-		if(n <= m)
-			break;
+	a = (ulong)s;
+	while(PGROUND(a) != PGROUND(a+n-1)){
 		/* spans pages; handle this page */
+		m = BY2PG - (a & (BY2PG-1));
 		t = memchr((void*)a, c, m);
-		if(t != nil)
+		if(t)
 			return t;
 		a += m;
 		n -= m;
@@ -398,34 +342,35 @@ vmemchr(void *s, int c, ulong n)
 }
 
 Segment*
-seg(Proc *p, uintptr addr, int dolock)
+seg(Proc *p, ulong addr, int dolock)
 {
 	Segment **s, **et, *n;
 
 	et = &p->seg[NSEG];
 	for(s = p->seg; s < et; s++) {
-		if((n = *s) == nil)
+		n = *s;
+		if(n == 0)
 			continue;
 		if(addr >= n->base && addr < n->top) {
 			if(dolock == 0)
 				return n;
 
-			qlock(n);
+			qlock(&n->lk);
 			if(addr >= n->base && addr < n->top)
 				return n;
-			qunlock(n);
+			qunlock(&n->lk);
 		}
 	}
 
-	return nil;
+	return 0;
 }
 
-extern void checkmmu(uintptr, uintptr);
-
+extern void checkmmu(ulong, ulong);
 void
 checkpages(void)
 {
-	uintptr addr, off;
+	int checked;
+	ulong addr, off;
 	Pte *p;
 	Page *pg;
 	Segment **sp, **ep, *s;
@@ -433,21 +378,24 @@ checkpages(void)
 	if(up == nil)
 		return;
 
+	checked = 0;
 	for(sp=up->seg, ep=&up->seg[NSEG]; sp<ep; sp++){
-		if((s = *sp) == nil)
+		s = *sp;
+		if(s == nil)
 			continue;
-		qlock(s);
-		if(s->mapsize > 0){
-			for(addr=s->base; addr<s->top; addr+=BY2PG){
-				off = addr - s->base;
-				if((p = s->map[off/PTEMAPMEM]) == nil)
-					continue;
-				pg = p->pages[(off&(PTEMAPMEM-1))/BY2PG];
-				if(pagedout(pg))
-					continue;
-				checkmmu(addr, pg->pa);
-			}
+		qlock(&s->lk);
+		for(addr=s->base; addr<s->top; addr+=BY2PG){
+			off = addr - s->base;
+			p = s->map[off/PTEMAPMEM];
+			if(p == 0)
+				continue;
+			pg = p->pages[(off&(PTEMAPMEM-1))/BY2PG];
+			if(pg == 0 || pagedout(pg))
+				continue;
+			checkmmu(addr, pg->pa);
+			checked++;
 		}
-		qunlock(s);
+		qunlock(&s->lk);
 	}
+	print("%ld %s: checked %d page table entries\n", up->pid, up->text, checked);
 }

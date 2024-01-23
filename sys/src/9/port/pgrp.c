@@ -9,17 +9,38 @@ enum {
 	Whinesecs = 10,		/* frequency of out-of-resources printing */
 };
 
-uvlong
-nextmount(void)
-{
-	static uvlong next = 0;
-	static Lock lk;
-	uvlong n;
+static Ref pgrpid;
+static Ref mountid;
 
-	lock(&lk);
-	n = ++next;
-	unlock(&lk);
-	return n;
+void
+pgrpnote(ulong noteid, char *a, long n, int flag)
+{
+	Proc *p, *ep;
+	char buf[ERRMAX];
+
+	if(n >= ERRMAX-1)
+		error(Etoobig);
+
+	memmove(buf, a, n);
+	buf[n] = 0;
+	p = proctab(0);
+	ep = p+conf.nproc;
+	for(; p < ep; p++) {
+		if(p->state == Dead)
+			continue;
+		if(up != p && p->noteid == noteid && p->kp == 0) {
+			qlock(&p->debug);
+			if(p->pid == 0 || p->noteid != noteid){
+				qunlock(&p->debug);
+				continue;
+			}
+			if(!waserror()) {
+				postnote(p, 0, buf, flag);
+				poperror();
+			}
+			qunlock(&p->debug);
+		}
+	}
 }
 
 Pgrp*
@@ -29,6 +50,7 @@ newpgrp(void)
 
 	p = smalloc(sizeof(Pgrp));
 	p->ref = 1;
+	p->pgrpid = incref(&pgrpid);
 	return p;
 }
 
@@ -52,34 +74,43 @@ closergrp(Rgrp *r)
 void
 closepgrp(Pgrp *p)
 {
-	Mhead **h, **e, *f;
-	Mount *m;
+	Mhead **h, **e, *f, *next;
 
-	if(decref(p))
+	if(decref(p) != 0)
 		return;
+
+	qlock(&p->debug);
+	wlock(&p->ns);
+	p->pgrpid = -1;
 
 	e = &p->mnthash[MNTHASH];
 	for(h = p->mnthash; h < e; h++) {
-		while((f = *h) != nil){
-			*h = f->hash;
+		for(f = *h; f; f = next) {
 			wlock(&f->lock);
-			m = f->mount;
+			cclose(f->from);
+			mountfree(f->mount);
 			f->mount = nil;
+			next = f->hash;
 			wunlock(&f->lock);
-			mountfree(m);
 			putmhead(f);
 		}
 	}
+	wunlock(&p->ns);
+	qunlock(&p->debug);
 	free(p);
 }
 
-static void
+void
 pgrpinsert(Mount **order, Mount *m)
 {
 	Mount *f;
 
-	m->order = nil;
-	for(f = *order; f != nil; f = f->order) {
+	m->order = 0;
+	if(*order == 0) {
+		*order = m;
+		return;
+	}
+	for(f = *order; f; f = f->order) {
 		if(m->mountid < f->mountid) {
 			m->order = f;
 			*order = m;
@@ -96,30 +127,25 @@ pgrpinsert(Mount **order, Mount *m)
 void
 pgrpcpy(Pgrp *to, Pgrp *from)
 {
-	Mount *n, *m, **link, *order;
-	Mhead *f, **l, *mh;
 	int i;
+	Mount *n, *m, **link, *order;
+	Mhead *f, **tom, **l, *mh;
 
-	wlock(&to->ns);
-	rlock(&from->ns);
-	order = nil;
+	wlock(&from->ns);
+	order = 0;
+	tom = to->mnthash;
 	for(i = 0; i < MNTHASH; i++) {
-		l = &to->mnthash[i];
-		for(f = from->mnthash[i]; f != nil; f = f->hash) {
+		l = tom++;
+		for(f = from->mnthash[i]; f; f = f->hash) {
 			rlock(&f->lock);
 			mh = newmhead(f->from);
 			*l = mh;
 			l = &mh->hash;
 			link = &mh->mount;
-			for(m = f->mount; m != nil; m = m->next) {
-				n = smalloc(sizeof(Mount));
-				n->mountid = m->mountid;
-				n->mflag = m->mflag;
-				n->to = m->to;
-				incref(n->to);
-				if(m->spec != nil)
-					kstrdup(&n->spec, m->spec);
-				pgrpinsert(&order, n);
+			for(m = f->mount; m; m = m->next) {
+				n = newmount(mh, m->to, m->mflag, m->spec);
+				m->copy = n;
+				pgrpinsert(&order, m);
 				*link = n;
 				link = &n->next;
 			}
@@ -129,10 +155,11 @@ pgrpcpy(Pgrp *to, Pgrp *from)
 	/*
 	 * Allocate mount ids in the same sequence as the parent group
 	 */
-	for(m = order; m != nil; m = m->order)
-		m->mountid = nextmount();
-	runlock(&from->ns);
-	wunlock(&to->ns);
+	lock(&mountid);
+	for(m = order; m; m = m->order)
+		m->copy->mountid = mountid.ref++;
+	unlock(&mountid);
+	wunlock(&from->ns);
 }
 
 Fgrp*
@@ -144,8 +171,7 @@ dupfgrp(Fgrp *f)
 
 	new = smalloc(sizeof(Fgrp));
 	if(f == nil){
-		new->flag = smalloc(DELTAFD*sizeof(new->flag[0]));
-		new->fd = smalloc(DELTAFD*sizeof(new->fd[0]));
+		new->fd = smalloc(DELTAFD*sizeof(Chan*));
 		new->nfd = DELTAFD;
 		new->ref = 1;
 		return new;
@@ -157,16 +183,9 @@ dupfgrp(Fgrp *f)
 	i = new->nfd%DELTAFD;
 	if(i != 0)
 		new->nfd += DELTAFD - i;
-	new->fd = malloc(new->nfd*sizeof(new->fd[0]));
+	new->fd = malloc(new->nfd*sizeof(Chan*));
 	if(new->fd == nil){
 		unlock(f);
-		free(new);
-		error("no memory for fgrp");
-	}
-	new->flag = malloc(new->nfd*sizeof(new->flag[0]));
-	if(new->flag == nil){
-		unlock(f);
-		free(new->fd);
 		free(new);
 		error("no memory for fgrp");
 	}
@@ -174,10 +193,9 @@ dupfgrp(Fgrp *f)
 
 	new->maxfd = f->maxfd;
 	for(i = 0; i <= f->maxfd; i++) {
-		if((c = f->fd[i]) != nil){
+		if(c = f->fd[i]){
 			incref(c);
 			new->fd[i] = c;
-			new->flag[i] = f->flag[i];
 		}
 	}
 	unlock(f);
@@ -191,7 +209,10 @@ closefgrp(Fgrp *f)
 	int i;
 	Chan *c;
 
-	if(f == nil || decref(f))
+	if(f == 0)
+		return;
+
+	if(decref(f) != 0)
 		return;
 
 	/*
@@ -200,19 +221,18 @@ closefgrp(Fgrp *f)
 	 */
 	up->closingfgrp = f;
 	for(i = 0; i <= f->maxfd; i++)
-		if((c = f->fd[i]) != nil){
+		if(c = f->fd[i]){
 			f->fd[i] = nil;
 			cclose(c);
 		}
 	up->closingfgrp = nil;
 
 	free(f->fd);
-	free(f->flag);
 	free(f);
 }
 
 /*
- * Called from interrupted() because up is in the middle
+ * Called from sleep because up is in the middle
  * of closefgrp and just got a kill ctl message.
  * This usually means that up has wedged because
  * of some kind of deadly embrace with mntclose
@@ -235,7 +255,7 @@ forceclosefgrp(void)
 
 	f = up->closingfgrp;
 	for(i = 0; i <= f->maxfd; i++)
-		if((c = f->fd[i]) != nil){
+		if(c = f->fd[i]){
 			f->fd[i] = nil;
 			ccloseq(c);
 		}
@@ -243,18 +263,19 @@ forceclosefgrp(void)
 
 
 Mount*
-newmount(Chan *to, int flag, char *spec)
+newmount(Mhead *mh, Chan *to, int flag, char *spec)
 {
 	Mount *m;
 
 	m = smalloc(sizeof(Mount));
 	m->to = to;
+	m->head = mh;
 	incref(to);
-	m->mountid = nextmount();
+	m->mountid = incref(&mountid);
 	m->mflag = flag;
-	if(spec != nil)
+	if(spec != 0)
 		kstrdup(&m->spec, spec);
-	setmalloctag(m, getcallerpc(&to));
+
 	return m;
 }
 
@@ -263,30 +284,28 @@ mountfree(Mount *m)
 {
 	Mount *f;
 
-	while((f = m) != nil) {
-		m = m->next;
-		cclose(f->to);
-		free(f->spec);
-		free(f);
+	while(m) {
+		f = m->next;
+		cclose(m->to);
+		m->mountid = 0;
+		free(m->spec);
+		free(m);
+		m = f;
 	}
 }
 
 void
 resrcwait(char *reason)
 {
-	static ulong lastwhine;
 	ulong now;
 	char *p;
+	static ulong lastwhine;
 
-	if(up == nil)
-		panic("resrcwait: %s", reason);
+	if(up == 0)
+		panic("resrcwait");
 
 	p = up->psstate;
-	if(reason != nil) {
-		if(waserror()){
-			up->psstate = p;
-			nexterror();
-		}
+	if(reason) {
 		up->psstate = reason;
 		now = seconds();
 		/* don't tie up the console with complaints */
@@ -295,9 +314,7 @@ resrcwait(char *reason)
 			print("%s\n", reason);
 		}
 	}
-	tsleep(&up->sleep, return0, 0, 100+nrand(200));
-	if(reason != nil) {
-		up->psstate = p;
-		poperror();
-	}
+
+	tsleep(&up->sleep, return0, 0, 300);
+	up->psstate = p;
 }

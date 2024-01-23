@@ -1,0 +1,185 @@
+# mkfile to build pc boot-loader kernels: pxe loaders (from pxe + pbs) &
+#	disk loaders (from disk + usb) using ../pc
+CONF=boot
+CONFLIST=boot bootpbs load loadusb
+CRAPLIST=bootmain bootpbs
+EXTRACOPIES=fsstand # pxe0
+
+objtype=386
+</$objtype/mkfile
+p=9
+BIN=/$objtype
+BASE=`{pbd | sed 's/(boot|exp).*$//'}
+x=`{cp boot bootpbs}
+
+# assume we've been decompressed into place by our header.
+# BOOTBASE must match expand.c's Kerneladdr|KZERO; +0x20 allows for a.out header
+BOOTBASE=0x80900020
+# KZERO & APBOOTSTRAP must match def'ns in ../pc/mem.h
+KZERO=0x80000000
+# set START, KTZERO from BOOTBASE
+# START could be empty (if compressed) or l16r.$O (if uncompressed)
+<|bootcfg
+
+# we use -I../`{pbd} instead of -I. so that we always pick up headers
+# from pcboot first, then pc, no matter where we find the source file.
+CFLAGS=$CFLAGS -. -I../`{pbd} -I../$BASE -I../port -I../ip
+# requires modified 8a that understands -.
+AFLAGS=$AFLAGS -. -I../`{pbd} -I../$BASE
+
+DEVS=`{rc ../port/mkdevlist $CONF}
+
+PORT=\
+	alarm.$O\
+	alloc.$O\
+	allocb.$O\
+	auth.$O\
+	awaitbit.$O\
+	byteserial.$O\
+	chan.$O\
+	dev.$O\
+	latin1.$O\
+	logpow.$O\
+	page.$O\
+	parse.$O\
+	pgrp.$O\
+	portclock.$O\
+	print.$O\
+	proc.$O\
+	qio.$O\
+	qlock.$O\
+	rdb.$O\
+	rebootcmd.$O\
+	segment.$O\
+	sum.$O\
+	taslock.$O\
+	tod.$O\
+	watermarks.$O\
+	xalloc.$O\
+
+OBJ=\
+	l.$O\
+	plan9l.$O\
+	apu.$O\
+	cga.$O\
+	fault.$O\
+	i8253.$O\
+	i8259.$O\
+	kbd.$O\
+	main.$O\
+	memmap.$O\
+	memory.$O\
+	mmu.$O\
+	nommudebug.$O\
+	multiboot.$O\
+	restart.$O\
+	trap.$O\
+	$CONF.root.$O\
+	$CONF.rootc.$O\
+	$DEVS\
+	$PORT\
+
+ETHER=`{echo ../$BASE/devether.c ../$BASE/ether*.c | sed 's/\.c/.'$O'/g'}
+
+# link the kernel and make a self-decompressing (lunzip) version too.
+$p$CONF:DQ: $CONF.c $OBJ $LIB /$objtype/expand-pxe /$objtype/expand-pbs acid
+	$CC $CFLAGS '-DKERNDATE='`{date -n} $CONF.c
+	echo linking $target^'*'
+	# for assembler output, add -a >$target.list
+	$LD -o $target^debug -T$KTZERO $OBJ $CONF.$O
+	size $target^debug
+	nm -n $target^debug | grep '(_start32|_multibootheader)$'
+	# generate a self-decompressing binary too (assumes START=)
+	if (~ $CONF boot)
+		sfx=pxe
+	if not
+		sfx=pbs
+	{ cat /$objtype/expand-$sfx; strzip <$target^debug } >$target
+	echo
+
+# don't strip the compressed kernels -- too frustrating when that's all you have!
+$p%.gz:D:	$p%
+	gzip -9 <$p$stem >$p$stem.gz
+$p%.lz:D:	$p%
+	lzip -9 <$p$stem >$p$stem.lz
+
+/$objtype/expand-pxe /$objtype/expand-pbs: ../pcexp/expand.c ../pcexp/expand.l.s
+	@ { cd ../pcexp && mk install}
+
+# creating $p$CONF also creates $p$CONF^debug, out of mk's sight
+install:V:	$p$CONF			# $p$CONF.gz
+	cp $p$CONF $p$CONF^debug /$objtype/ &
+	for(i in $EXTRACOPIES)
+		{ 9fs $i && cp $p$CONF $p$CONF^debug /n/$i/$objtype &&
+			echo -n $i... & }
+	wait
+	echo
+
+<../port/portmkfile
+
+PCFILES=`{../port/mkfilelist ../pc}
+^($PCFILES)\.$O:R:	'../pc/\1.c'
+	$CC $CFLAGS -I. ../pc/$stem1.c
+^($PCFILES)\.$O:R:	'../pc/\1.s'
+	$AS $AFLAGS -I. ../pc/$stem1.s
+
+<|../port/mkbootrules $CONF
+
+%.clean:V:
+	rm -f 8.* bootmain bootmain.c bootpbs bootpbs.c sd53c8xx-fw.h
+	rm -f $stem.c [9bz]$stem [9bz]$stem.gz \
+		boot$stem.* reboot.h apbootstrap.h 9boot* 9load* *.list
+
+%.$O:		/$objtype/include/ureg.h /sys/include/pool.h ../port/netif.h
+%.$O:		../port/sd.h ../ip/ip.h dosfs.h pxe.h
+l.$O:		../pc/lreal.s
+$ETHER: 	../$BASE/etherif.h ../$BASE/ethermii.h
+ether2000.$O ether8003.$O ether8390.$O etherec2t.$O: ../$BASE/ether8390.h
+l.$O lhdr.$O l32p.$O l32v.$O l64p.$O: /sys/src/boot/pc/x16.h ../pc/mem.h
+sd%.$O:		/sys/include/disk.h
+auth.$O:	/sys/include/authsrv.h
+bootld.$O:	/sys/include/a.out.h /sys/src/libmach/elf.h
+devcons.$O:	/sys/include/authsrv.h
+devfloppy.$O:	floppy.h
+inflate.$O:	/sys/include/flate.h
+main.$O:	reboot.h apbootstrap.h
+memory.$O memmap.$O: ../$BASE/memmap.h
+sd53c8xx.$O:	sd53c8xx-fw.h
+trap.$O:	/sys/include/tos.h
+
+init.h:
+	>$target
+
+reboot.h:D:	../$BASE/rebootcode.s
+	$AS ../$BASE/rebootcode.s
+	# -T address must be REBOOTADDR
+	$LD -l -s -T0x800 -R4 -o reboot.out rebootcode.$O
+	{echo 'uchar rebootcode[]={'
+	 xd -1x reboot.out |
+		sed -e '1,2d' -e 's/^[0-9a-f]+ //' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
+	 echo '};'} > reboot.h
+
+apbootstrap.h:	../$BASE/apbootstrap.s ../pc/mem.h
+	$AS $prereq
+	APBOOTSTRAP=`{echo $KZERO+0x1000'=X' | dbcalc}
+	$LD -o apbootstrap.out -T$APBOOTSTRAP -R4 -l -s apbootstrap.$O
+	{echo 'uchar apbootstrap[]={'
+	 xd -1x apbootstrap.out |
+		sed -e '1,2d' -e 's/^[0-9a-f]+ //' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
+	 echo '};'} > $target
+
+sd53c8xx-fw.h:	../$BASE/sd53c8xx.n
+	aux/na $prereq > $target
+
+acid:V:
+	8c -a $CFLAGS ../$BASE/i8253.c >acid
+
+%.checkether:VQ:
+	for (i in ether*.c){
+		x=`{echo $i | sed 's/\.c//'}
+		if(! ~ $x ether8390 && ! grep -s '^	'^$x^'([ 	]|$)' $stem)
+			echo $x not included in $stem
+	}
+	exit 0
+
+<callsmkfile

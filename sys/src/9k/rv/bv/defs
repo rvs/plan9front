@@ -1,0 +1,4 @@
+# pre-release beagle v
+KTZERO=0xffffffc080020000	# sv39 but skip first 128K @ 2GB
+PAUart0=0x12440000
+CONFDEF=-DERRATUM_CIP_1200

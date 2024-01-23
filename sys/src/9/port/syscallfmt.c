@@ -9,26 +9,23 @@
 
 #include "/sys/src/libc/9syscall/sys.h"
 
-// WE ARE OVERRUNNING SOMEHOW
 static void
 fmtrwdata(Fmt* f, char* a, int n, char* suffix)
 {
-	int i;
+	int i, c;
 	char *t;
 
 	if(a == nil){
 		fmtprint(f, "0x0%s", suffix);
 		return;
 	}
-	validaddr((uintptr)a, n, 0);
+	validaddr((ulong)a, n, 0);
 	t = smalloc(n+1);
+	for(i = 0; i < n; i++) {
+		c = a[i];
+		t[i] = c > 0x20 && c < 0x7f? c: '.';
+	}
 	t[n] = 0;
-	for(i = 0; i < n; i++)
-		if(a[i] > 0x20 && a[i] < 0x7f)	/* printable ascii? */
-			t[i] = a[i];
-		else
-			t[i] = '.';
-
 	fmtprint(f, " %#p/\"%s\"%s", a, t, suffix);
 	free(t);
 }
@@ -36,18 +33,17 @@ fmtrwdata(Fmt* f, char* a, int n, char* suffix)
 static void
 fmtuserstring(Fmt* f, char* a, char* suffix)
 {
-	char *t, *e;
 	int n;
+	char *t;
 
 	if(a == nil){
 		fmtprint(f, "0/\"\"%s", suffix);
 		return;
 	}
-	validaddr((uintptr)a, 1, 0);
-	n = 1<<16;
-	e = vmemchr(a, 0, n);
-	if(e != nil)
-		n = e - a;
+	validaddr((ulong)a, 1, 0);
+	n = (char*)vmemchr(a, 0, 0x7fffffff) - a + 1;
+	if (n < 1)
+		return;
 	t = smalloc(n+1);
 	memmove(t, a, n);
 	t[n] = 0;
@@ -56,67 +52,60 @@ fmtuserstring(Fmt* f, char* a, char* suffix)
 }
 
 void
-syscallfmt(ulong syscallno, uintptr pc, va_list list)
+syscallfmt(int syscallno, ulong pc, va_list list)
 {
+	int i;
 	long l;
+	vlong vl;
 	Fmt fmt;
 	void *v;
-	vlong vl;
-	uintptr p;
-	int i[2], len;
 	char *a, **argv;
 
 	fmtstrinit(&fmt);
 	fmtprint(&fmt, "%uld %s ", up->pid, up->text);
 
 	if(syscallno >= nsyscall)
-		fmtprint(&fmt, " %uld ", syscallno);
+		fmtprint(&fmt, " %d ", syscallno);
 	else
 		fmtprint(&fmt, "%s ", sysctab[syscallno]?
 			sysctab[syscallno]: "huh?");
 
-	fmtprint(&fmt, "%p ", pc);
+	fmtprint(&fmt, "%ulx ", pc);
+	if(up->syscalltrace != nil)
+		free(up->syscalltrace);
+
 	switch(syscallno){
 	case SYSR1:
-		p = va_arg(list, uintptr);
-		fmtprint(&fmt, "%#p", p);
+		fmtprint(&fmt, "%#p", va_arg(list, uintptr));
 		break;
 	case _ERRSTR:					/* deprecated */
 	case CHDIR:
 	case EXITS:
 	case REMOVE:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, "");
+		fmtuserstring(&fmt, va_arg(list, char*), "");
 		break;
 	case BIND:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%#ux",  i[0]);
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtprint(&fmt, "%#ux", va_arg(list, int));
 		break;
 	case CLOSE:
 	case NOTED:
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%d", i[0]);
+		fmtprint(&fmt, "%d", va_arg(list, int));
 		break;
 	case DUP:
-		i[0] = va_arg(list, int);
-		i[1] = va_arg(list, int);
-		fmtprint(&fmt, "%d %d", i[0], i[1]);
+		i = va_arg(list, int);
+		fmtprint(&fmt, "%d %d", i, va_arg(list, int));
 		break;
 	case ALARM:
-		l = va_arg(list, unsigned long);
-		fmtprint(&fmt, "%#lud ", l);
+		fmtprint(&fmt, "%#lud ", va_arg(list, ulong));
 		break;
 	case EXEC:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, "");
+		fmtuserstring(&fmt, va_arg(list, char*), "");
 		argv = va_arg(list, char**);
-		evenaddr((uintptr)argv);
+		validalign((uintptr)argv, sizeof(char*));
 		for(;;){
-			validaddr((uintptr)argv, sizeof(char**), 0);
+			validaddr((ulong)argv, sizeof(char**), 0);
 			a = *(char **)argv;
 			if(a == nil)
 				break;
@@ -128,204 +117,154 @@ syscallfmt(ulong syscallno, uintptr pc, va_list list)
 	case _FSESSION:					/* deprecated */
 	case _FSTAT:					/* deprecated */
 	case _FWSTAT:					/* obsolete */
-		i[0] = va_arg(list, int);
-		a = va_arg(list, char*);
-		fmtprint(&fmt, "%d %#p", i[0], a);
+		i = va_arg(list, int);
+		fmtprint(&fmt, "%d %#p", i, va_arg(list, char*));
 		break;
 	case FAUTH:
-		i[0] = va_arg(list, int);
-		a = va_arg(list, char*);
-		fmtprint(&fmt, "%d", i[0]);
-		fmtuserstring(&fmt, a, "");
+		fmtprint(&fmt, "%d", va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), "");
 		break;
 	case SEGBRK:
 	case RENDEZVOUS:
-		v = va_arg(list, void*);
-		fmtprint(&fmt, "%#p ", v);
-		v = va_arg(list, void*);
-		fmtprint(&fmt, "%#p", v);
+		fmtprint(&fmt, "%#p ", va_arg(list, void*));
+		fmtprint(&fmt, "%#p", va_arg(list, void*));
 		break;
 	case _MOUNT:					/* deprecated */
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%d ", i[0]);
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%#ux ", i[0]);
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, "");
+		fmtprint(&fmt, "%d ", va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtprint(&fmt, "%#ux ", va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), "");
 		break;
 	case OPEN:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%#ux", i[0]);
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtprint(&fmt, "%#ux", va_arg(list, int));
 		break;
 	case OSEEK:					/* deprecated */
-		i[0] = va_arg(list, int);
+		i = va_arg(list, int);
 		l = va_arg(list, long);
-		i[1] = va_arg(list, int);
-		fmtprint(&fmt, "%d %ld %d", i[0], l, i[1]);
+		fmtprint(&fmt, "%d %ld %d", i, l, va_arg(list, int));
 		break;
 	case SLEEP:
-		l = va_arg(list, long);
-		fmtprint(&fmt, "%ld", l);
+		fmtprint(&fmt, "%ld", va_arg(list, long));
 		break;
 	case _STAT:					/* obsolete */
 	case _WSTAT:					/* obsolete */
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		a = va_arg(list, char*);
-		fmtprint(&fmt, "%#p", a);
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtprint(&fmt, "%#p", va_arg(list, char*));
 		break;
 	case RFORK:
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%#ux", i[0]);
+		fmtprint(&fmt, "%#ux", va_arg(list, int));
 		break;
 	case PIPE:
 	case BRK_:
-		v = va_arg(list, int*);
-		fmtprint(&fmt, "%#p", v);
+		fmtprint(&fmt, "%#p", va_arg(list, int*));
 		break;
 	case CREATE:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		i[0] = va_arg(list, int);
-		i[1] = va_arg(list, int);
-		fmtprint(&fmt, "%#ux %#ux", i[0], i[1]);
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		i = va_arg(list, int);
+		fmtprint(&fmt, "%#ux %#ux", i, va_arg(list, int));
 		break;
 	case FD2PATH:
 	case FSTAT:
 	case FWSTAT:
-		i[0] = va_arg(list, int);
+		i = va_arg(list, int);
 		a = va_arg(list, char*);
-		l = va_arg(list, unsigned long);
-		fmtprint(&fmt, "%d %#p %lud", i[0], a, l);
+		fmtprint(&fmt, "%d %#p %lud", i, a, va_arg(list, ulong));
 		break;
 	case NOTIFY:
 	case SEGDETACH:
 	case _WAIT:					/* deprecated */
-		v = va_arg(list, void*);
-		fmtprint(&fmt, "%#p", v);
+		fmtprint(&fmt, "%#p", va_arg(list, void*));
 		break;
 	case SEGATTACH:
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%d ", i[0]);
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		/*FALLTHROUGH*/
+		fmtprint(&fmt, "%d ", va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		/* fall through */
 	case SEGFREE:
 	case SEGFLUSH:
 		v = va_arg(list, void*);
-		l = va_arg(list, unsigned long);
-		fmtprint(&fmt, "%#p %lud", v, l);
+		fmtprint(&fmt, "%#p %lud", v, va_arg(list, ulong));
 		break;
 	case UNMOUNT:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, "");
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtuserstring(&fmt, va_arg(list, char*), "");
 		break;
 	case SEMACQUIRE:
 	case SEMRELEASE:
 		v = va_arg(list, int*);
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%#p %d", v, i[0]);
+		fmtprint(&fmt, "%#p %d", v, va_arg(list, int));
 		break;
 	case TSEMACQUIRE:
-		v = va_arg(list, int*);
-		l = va_arg(list, ulong);
-		fmtprint(&fmt, "%#p %ld", v, l);
+		v = va_arg(list, long*);
+		fmtprint(&fmt, "%#p %ld", v, va_arg(list, ulong));
 		break;
 	case SEEK:
 		v = va_arg(list, vlong*);
-		i[0] = va_arg(list, int);
+		i = va_arg(list, int);
 		vl = va_arg(list, vlong);
-		i[1] = va_arg(list, int);
-		fmtprint(&fmt, "%#p %d %#llux %d", v, i[0], vl, i[1]);
+		fmtprint(&fmt, "%#p %d %#llux %d", v, i, vl, va_arg(list, int));
 		break;
 	case FVERSION:
-		i[0] = va_arg(list, int);
-		i[1] = va_arg(list, int);
-		fmtprint(&fmt, "%d %d ", i[0], i[1]);
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		l = va_arg(list, unsigned long);
-		fmtprint(&fmt, "%lud", l);
+		i = va_arg(list, int);
+		fmtprint(&fmt, "%d %d ", i, va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtprint(&fmt, "%lud", va_arg(list, ulong));
 		break;
 	case WSTAT:
 	case STAT:
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		/*FALLTHROUGH*/
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		/* fall through */
 	case ERRSTR:
 	case AWAIT:
 		a = va_arg(list, char*);
-		l = va_arg(list, unsigned long);
-		fmtprint(&fmt, "%#p %lud", a, l);
+		fmtprint(&fmt, "%#p %lud", a, va_arg(list, ulong));
 		break;
 	case MOUNT:
-		i[0] = va_arg(list, int);
-		i[1] = va_arg(list, int);
-		fmtprint(&fmt, "%d %d ", i[0], i[1]);
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, " ");
-		i[0] = va_arg(list, int);
-		fmtprint(&fmt, "%#ux ", i[0]);
-		a = va_arg(list, char*);
-		fmtuserstring(&fmt, a, "");
+		i = va_arg(list, int);
+		fmtprint(&fmt, "%d %d ", i, va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), " ");
+		fmtprint(&fmt, "%#ux ", va_arg(list, int));
+		fmtuserstring(&fmt, va_arg(list, char*), "");
 		break;
 	case _READ:					/* deprecated */
 	case PREAD:
-		i[0] = va_arg(list, int);
+		i = va_arg(list, int);
 		v = va_arg(list, void*);
-		l = va_arg(list, long);
-		fmtprint(&fmt, "%d %#p %ld", i[0], v, l);
-		if(syscallno == PREAD){
-			vl = va_arg(list, vlong);
-			fmtprint(&fmt, " %lld", vl);
-		}
+		fmtprint(&fmt, "%d %#p %ld", i, v, va_arg(list, long));
+		if(syscallno == PREAD)
+			fmtprint(&fmt, " %lld", va_arg(list, vlong));
 		break;
 	case _WRITE:					/* deprecated */
 	case PWRITE:
-		i[0] = va_arg(list, int);
+		fmtprint(&fmt, "%d ", va_arg(list, int));
 		v = va_arg(list, void*);
 		l = va_arg(list, long);
-		fmtprint(&fmt, "%d ", i[0]);
-		len = MIN(l, 64);
-		fmtrwdata(&fmt, v, len, " ");
+		fmtrwdata(&fmt, v, MIN(l, 64), " ");
 		fmtprint(&fmt, "%ld", l);
-		if(syscallno == PWRITE){
-			vl = va_arg(list, vlong);
-			fmtprint(&fmt, " %lld", vl);
-		}
+		if(syscallno == PWRITE)
+			fmtprint(&fmt, " %lld", va_arg(list, vlong));
 		break;
-	case _NSEC:
-		if(sizeof(uintptr) == sizeof(vlong))
-			break;
-		v = va_arg(list, vlong*);
-		fmtprint(&fmt, "%#p", v);
+	case NSEC:
+		fmtprint(&fmt, "%#p", va_arg(list, vlong*));
 		break;
 	}
 
-	a = fmtstrflush(&fmt);
-	qlock(&up->debug);
-	free(up->syscalltrace);
-	up->syscalltrace = a;
-	qunlock(&up->debug);
+	up->syscalltrace = fmtstrflush(&fmt);
 }
 
 void
-sysretfmt(ulong syscallno, va_list list, uintptr ret, uvlong start, uvlong stop)
+sysretfmt(int syscallno, va_list list, long ret, uvlong start, uvlong stop)
 {
+	int i;
 	long l;
 	void* v;
 	Fmt fmt;
-	vlong vl;
-	int i, len;
 	char *a, *errstr;
 
 	fmtstrinit(&fmt);
+
+	if(up->syscalltrace)
+		free(up->syscalltrace);
 
 	errstr = "\"\"";
 	switch(syscallno){
@@ -339,13 +278,12 @@ sysretfmt(ulong syscallno, va_list list, uintptr ret, uvlong start, uvlong stop)
 		break;
 	case AWAIT:
 		a = va_arg(list, char*);
-		l = va_arg(list, unsigned long);
+		l = va_arg(list, ulong);
 		if(ret > 0){
 			fmtuserstring(&fmt, a, " ");
-			fmtprint(&fmt, "%lud = %ld", l, (long)ret);
-		}
-		else{
-			fmtprint(&fmt, "%#p/\"\" %lud = %ld", a, l, (long)ret);
+			fmtprint(&fmt, "%lud = %ld", l, ret);
+		}else{
+			fmtprint(&fmt, "%#p/\"\" %lud = %ld", a, l, ret);
 			errstr = up->syserrstr;
 		}
 		break;
@@ -355,13 +293,12 @@ sysretfmt(ulong syscallno, va_list list, uintptr ret, uvlong start, uvlong stop)
 		if(syscallno == _ERRSTR)
 			l = 64;
 		else
-			l = va_arg(list, unsigned long);
+			l = va_arg(list, ulong);
 		if(ret > 0){
 			fmtuserstring(&fmt, a, " ");
-			fmtprint(&fmt, "%lud = %ld", l, (long)ret);
-		}
-		else{
-			fmtprint(&fmt, "\"\" %lud = %ld", l, (long)ret);
+			fmtprint(&fmt, "%lud = %ld", l, ret);
+		}else{
+			fmtprint(&fmt, "\"\" %lud = %ld", l, ret);
 			errstr = up->syserrstr;
 		}
 		break;
@@ -369,57 +306,40 @@ sysretfmt(ulong syscallno, va_list list, uintptr ret, uvlong start, uvlong stop)
 		i = va_arg(list, int);
 		USED(i);
 		a = va_arg(list, char*);
-		l = va_arg(list, unsigned long);
+		l = va_arg(list, ulong);
 		if(ret > 0){
 			fmtuserstring(&fmt, a, " ");
-			fmtprint(&fmt, "%lud = %ld", l, (long)ret);
-		}
-		else{
-			fmtprint(&fmt, "\"\" %lud = %ld", l, (long)ret);
+			fmtprint(&fmt, "%lud = %ld", l, ret);
+		}else{
+			fmtprint(&fmt, "\"\" %lud = %ld", l, ret);
 			errstr = up->syserrstr;
 		}
 		break;
 	case _READ:
 	case PREAD:
-		i = va_arg(list, int);
+		i = va_arg(list, int);		/* fd */
 		USED(i);
 		v = va_arg(list, void*);
-		l = va_arg(list, long);
-		if(ret > 0){
-			len = MIN(ret, 64);
-			fmtrwdata(&fmt, v, len, "");
-		}
+		if(ret > 0)
+			fmtrwdata(&fmt, v, MIN(ret, 64), "");
 		else{
 			fmtprint(&fmt, "/\"\"");
 			errstr = up->syserrstr;
 		}
-		fmtprint(&fmt, " %ld", l);
-		if(syscallno == PREAD){
-			vl = va_arg(list, vlong);
-			fmtprint(&fmt, " %lld", vl);
-		}
-		fmtprint(&fmt, " = %ld", (long)ret);
-		break;
-	case _NSEC:
-		if(sizeof(uintptr) == sizeof(vlong)){
-			fmtprint(&fmt, " = %lld", (vlong)ret);
-			break;
-		}
-		/* wet floor */
+		fmtprint(&fmt, " %ld", va_arg(list, long));
+		if(syscallno == PREAD)
+			fmtprint(&fmt, " %lld", va_arg(list, vlong));
+		/* fall through */
+	default:
 	case ALARM:
+	case NSEC:
 	case _WRITE:
 	case PWRITE:
-	default:
-		if((long)ret == -1)
+		if(ret == -1)
 			errstr = up->syserrstr;
-		fmtprint(&fmt, " = %ld", (long)ret);
+		fmtprint(&fmt, " = %ld", ret);
 		break;
 	}
 	fmtprint(&fmt, " %s %#llud %#llud\n", errstr, start, stop);
-
-	a = fmtstrflush(&fmt);
-	qlock(&up->debug);
-	free(up->syscalltrace);
-	up->syscalltrace = a;
-	qunlock(&up->debug);
+	up->syscalltrace = fmtstrflush(&fmt);
 }

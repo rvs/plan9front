@@ -1,0 +1,4 @@
+# tinyemu in Sv39
+# must match KTZERO in mem.h
+CONFDEF=-DTINYEMU -DMACHINITIAL=1
+LDFLAGS=-c			# uncompressed is much faster on tinyemu

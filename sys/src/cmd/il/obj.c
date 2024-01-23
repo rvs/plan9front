@@ -12,12 +12,25 @@ char	thechar		= 'i';
 char	*thestring 	= "riscv";
 
 /*
- *	-H1						is headerless
+ *	-H1 -R4				is headerless (-R8 for jl)
  *	-H2 -T4128 -R4096		is plan9 format
- *	-H5 -T0x4000A0 -R4		is elf executable
+ *	-H5 -T4128 -R4			is elf executable (-R8 for jl)
  */
 
 int little;
+
+static int
+isundef(char *symb)
+{
+	int h;
+	Sym *s;
+
+	for(h=0; h<nelem(hash); h++)
+		for(s = hash[h]; s != S; s = s->link)
+			if(strcmp(s->name, symb) == 0)
+				return 1;
+	return 0;
+}
 
 void
 main(int argc, char *argv[])
@@ -125,8 +138,10 @@ main(int argc, char *argv[])
 		break;
 	case 2:	/* plan 9 */
 		HEADR = 32L;
+		if (thechar == 'j' && debug['X'])
+			HEADR += sizeof(vlong);	/* for virtual entry addr. */
 		if(INITTEXT == -1)
-			INITTEXT = 4128;
+			INITTEXT = 4096 + HEADR;
 		if(INITDAT == -1)
 			INITDAT = 0;
 		if(INITRND == -1)
@@ -199,8 +214,11 @@ main(int argc, char *argv[])
 
 	while(*argv)
 		objfile(*argv++);
-	if(!debug['l'])
+	if(!debug['l']) {
 		loadlib();
+		if (0 && !isundef("_fltused"))	/* TODO: no fp use? */
+			objfile("-lnofp");
+	}
 	firstp = firstp->link;
 	if(firstp == P)
 		goto out;
@@ -223,8 +241,8 @@ out:
 	if(debug['v']) {
 		Bprint(&bso, "%5.2f cpu time\n", cputime());
 		Bprint(&bso, "%ld memory used\n", thunk);
-		Bprint(&bso, "%d sizeof adr\n", sizeof(Adr));
-		Bprint(&bso, "%d sizeof prog\n", sizeof(Prog));
+		Bprint(&bso, "%lld sizeof adr\n", (vlong)sizeof(Adr));
+		Bprint(&bso, "%lld sizeof prog\n", (vlong)sizeof(Prog));
 	}
 	Bflush(&bso);
 	errorexit();
@@ -673,7 +691,7 @@ ldobj(int f, long c, char *pn)
 	char **nfilen;
 
 	if((files&15) == 0){
-		nfilen = malloc((files+16)*sizeof(char*));
+		nfilen = mallocz((files+16)*sizeof(char*), 1);
 		memmove(nfilen, filen, files*sizeof(char*));
 		free(filen);
 		filen = nfilen;
@@ -950,6 +968,7 @@ loop:
 			}
 		}
 		p->to.offset = autosize;
+		//autosize += ptrsize;
 		s = p->from.sym;
 		if(s == S) {
 			diag("TEXT must have a name\n%P", p);

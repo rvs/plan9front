@@ -19,8 +19,8 @@ enum {					/* registers */
 	Lsr		= 5,		/* Line Status */
 	Msr		= 6,		/* Modem Status */
 	Scr		= 7,		/* Scratch Pad */
-	Mdr		= 8,		/* Mode Def'n (omap rw) */
-//	Usr		= 31,		/* Uart Status Register; missing in omap? */
+//	Mdr		= 8,		/* Mode Def'n (omap rw) */
+	Usr		= 31,		/* Uart Status Register; present in ts? */
 	Dll		= 0,		/* Divisor Latch LSB */
 	Dlm		= 1,		/* Divisor Latch MSB */
 };
@@ -76,7 +76,7 @@ enum {					/* Mcr */
 	Dtr		= 0x01,		/* Data Terminal Ready */
 	Rts		= 0x02,		/* Ready To Send */
 	Out1		= 0x04,		/* no longer in use */
-//	Ie		= 0x08,		/* IRQ Enable (cd_sts_ch on omap) */
+	Ie		= 0x08,		/* IRQ Enable (cd_sts_ch on omap) */
 	Dm		= 0x10,		/* Diagnostic Mode loopback */
 };
 
@@ -101,12 +101,6 @@ enum {					/* Msr */
 	Ri		= 0x40,		/* Ring Indicator */
 	Dcd		= 0x80,		/* Carrier Detect */
 };
-
-enum {					/* Mdr */
-	Modemask	= 7,
-	Modeuart	= 0,
-};
-
 
 typedef struct Ctlr {
 	u32int*	io;
@@ -387,7 +381,7 @@ i8250bits(Uart* uart, int bits)
 static int
 i8250baud(Uart* uart, int baud)
 {
-#ifdef notdef				/* don't change the speed */
+#ifdef CHANGE_SPEED		/* don't change the speed; u-boot set it */
 	ulong bgc;
 	Ctlr *ctlr;
 	extern int i8250freq;	/* In the config file */
@@ -418,8 +412,6 @@ i8250break(Uart* uart, int ms)
 {
 	Ctlr *ctlr;
 
-	if (up == nil)
-		panic("i8250break: nil up");
 	/*
 	 * Send a break.
 	 */
@@ -428,8 +420,18 @@ i8250break(Uart* uart, int ms)
 
 	ctlr = uart->regs;
 	csr8w(ctlr, Lcr, Brk);
-	tsleep(&up->sleep, return0, 0, ms);
+	if (up == nil)
+		delay(ms);
+	else
+		tsleep(&up->sleep, return0, 0, ms);
 	csr8w(ctlr, Lcr, 0);
+}
+
+static void
+emptyoutstage(Uart *uart, int n)
+{
+	_uartputs((char *)uart->op, n);
+	uart->op = uart->oe = uart->ostage;
 }
 
 static void
@@ -438,8 +440,25 @@ i8250kick(Uart* uart)
 	int i;
 	Ctlr *ctlr;
 
+	if(/* uart->cts == 0 || */ uart->blocked)
+		return;
+
+	if(noprint) {			/* early: uart might not be enabled */
+		if (uart->oq == nil || uart->op == nil)
+			return;
+		if (uart->op < uart->oe)
+			emptyoutstage(uart, uart->oe - uart->op);
+		while ((i = uartstageoutput(uart)) > 0)
+			emptyoutstage(uart, i);
+		return;
+	}
+
 	/* nothing more to send? then disable xmit intr */
 	ctlr = uart->regs;
+	if (uart->oq == nil)
+		panic("i8250kick: nil uart oq");
+	if (uart->op == nil)
+		panic("i8250kick: nil uart op");
 	if (uart->op >= uart->oe && qlen(uart->oq) == 0 &&
 	    csr8r(ctlr, Lsr) & Temt) {
 		ctlr->sticky[Ier] &= ~Ethre;
@@ -462,6 +481,12 @@ i8250kick(Uart* uart)
 		ctlr->sticky[Ier] |= Ethre;
 		csr8w(ctlr, Ier, 0);			/* intr when done */
 	}
+}
+
+void
+serialkick(void)
+{
+	uartkick(&i8250uart[CONSOLE]);
 }
 
 static void
@@ -556,15 +581,9 @@ i8250disable(Uart* uart)
 static void
 i8250enable(Uart* uart, int ie)
 {
-	int mode;
 	Ctlr *ctlr;
 
 	ctlr = uart->regs;
-
-	/* omap only: set uart/irda/cir mode to uart */
-	mode = csr8r(ctlr, Mdr);
-	csr8o(ctlr, Mdr, (mode & ~Modemask) | Modeuart);
-
 	ctlr->sticky[Lcr] = Wls8;		/* no parity */
 	csr8w(ctlr, Lcr, 0);
 
@@ -606,8 +625,7 @@ i8250enable(Uart* uart, int ie)
 			ctlr->iena = 1;
 		}
 		ctlr->sticky[Ier] = Erda;
-//		ctlr->sticky[Mcr] |= Ie;		/* not on omap */
-		ctlr->sticky[Mcr] = 0;
+		ctlr->sticky[Mcr] |= Ie;
 	}
 	else{
 		ctlr->sticky[Ier] = 0;
@@ -654,18 +672,25 @@ i8250putc(Uart* uart, int c)
 	int i;
 	Ctlr *ctlr;
 
+	if (noprint) {			/* too early; use brute force */
+		int s;
+
+		while (!(((ulong *)PHYSCONS)[Lsr] & Thre))
+			;
+		s = splhi();
+		while (!(((ulong *)PHYSCONS)[Lsr] & Thre))
+			;
+		((ulong *)PHYSCONS)[Thr] = c;
+		splx(s);
+		return;
+	}
+
 	ctlr = uart->regs;
 	for(i = 0; !(csr8r(ctlr, Lsr) & Thre) && i < 128; i++)
 		delay(1);
 	csr8o(ctlr, Thr, (uchar)c);
 	for(i = 0; !(csr8r(ctlr, Lsr) & Thre) && i < 128; i++)
 		delay(1);
-}
-
-void
-uartconsinit(void)
-{
-	consuart = &i8250uart[0];
 }
 
 PhysUart i8250physuart = {
@@ -687,3 +712,67 @@ PhysUart i8250physuart = {
 	.getc		= i8250getc,
 	.putc		= i8250putc,
 };
+
+static void
+i8250dumpregs(Ctlr* ctlr)
+{
+	int dlm, dll;
+	int _uartprint(char*, ...);
+
+	csr8w(ctlr, Lcr, Dlab);
+	dlm = csr8r(ctlr, Dlm);
+	dll = csr8r(ctlr, Dll);
+	csr8w(ctlr, Lcr, 0);
+
+	_uartprint("dlm %#ux dll %#ux\n", dlm, dll);
+}
+
+Uart*	uartenable(Uart *p);
+
+int
+i8250console(void)
+{
+	Uart *uart = &i8250uart[CONSOLE];
+
+	if(uartenable(uart) != nil /* && uart->console */){
+		// iprint("i8250console: enabling console uart\n");
+		kbdq = uart->iq;
+		serialoq = uart->oq;
+		uart->putc = kbdcr2nl;
+		uart->opens++;
+		consuart = uart;
+	}
+	uartctl(uart, "b115200 l8 pn r1 s1 i1");
+	if(kbdq == nil)
+		panic("i8250console: nil kbdq");
+	if(serialoq == nil)
+		panic("i8250console: nil serialoq");
+	return 0;
+}
+
+void
+_uartputs(char* s, int n)
+{
+	char *e;
+
+	for(e = s+n; s < e; s++){
+		if(*s == '\n')
+			i8250putc(&i8250uart[CONSOLE], '\r');
+		i8250putc(&i8250uart[CONSOLE], *s);
+	}
+}
+
+int
+_uartprint(char* fmt, ...)
+{
+	int n;
+	va_list arg;
+	char buf[PRINTSIZE];
+
+	va_start(arg, fmt);
+	n = vseprint(buf, buf+sizeof(buf), fmt, arg) - buf;
+	va_end(arg);
+	_uartputs(buf, n);
+
+	return n;
+}

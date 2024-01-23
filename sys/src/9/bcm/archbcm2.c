@@ -12,6 +12,7 @@
 #include "arm.h"
 
 #include "../port/netif.h"
+#include "etherif.h"
 
 typedef struct Mbox Mbox;
 typedef struct Mboxes Mboxes;
@@ -20,12 +21,11 @@ typedef struct Mboxes Mboxes;
 
 Soc soc = {
 	.dramsize	= 0x3F000000, 	/* was 1024*MiB, but overlaps with physio */
-	.busdram	= 0xC0000000,
-	.iosize		= 16*MiB,
-	.virtio		= VIRTIO,
 	.physio		= 0x3F000000,
+	.busdram	= 0xC0000000,
 	.busio		= 0x7E000000,
 	.armlocal	= 0x40000000,
+	.oscfreq	= 19200000,
 	.l1ptedramattrs = Cached | Buffered | L1wralloc | L1sharable,
 	.l2ptedramattrs = Cached | Buffered | L2wralloc | L2sharable,
 };
@@ -123,11 +123,14 @@ cputype2name(char *buf, int size)
 	case 0xd03:
 		p = seprint(buf, buf + size, "Cortex-A53");
 		break;
+	case 0xd08:
+		p = seprint(buf, buf + size, "Cortex-A72");
+		break;
 	default:
 		p = seprint(buf, buf + size, "Unknown-%#x", part);
 		break;
 	}
-	seprint(p, buf + size, " r%ldp%ld",
+	seprint(p, buf + size, " r%dp%d",
 		(r >> 20) & MASK(4), r & MASK(4));
 	return buf;
 }
@@ -147,6 +150,7 @@ getncpus(void)
 {
 	int n, max;
 	char *p;
+
 	n = 4;
 	if(n > MAXMACH)
 		n = MAXMACH;
@@ -221,10 +225,43 @@ archbcm2link(void)
 	addclock0link(wdogfeed, HZ);
 }
 
+int
+archether(unsigned ctlrno, Ether *ether)
+{
+	switch(ctlrno){
+	case 0:
+		ether->type = "usb";
+		break;
+	case 1:
+		ether->type = "4330";
+		break;
+	default:
+		return 0;
+	}
+	ether->ctlrno = ctlrno;
+	ether->irq = -1;
+	ether->nopt = 0;
+	ether->maxmtu = 9014;
+	return 1;
+}
+
+int
+l2ap(int ap)
+{
+	return (AP(0, (ap)));
+}
+
+int
+cmpswap(long *addr, long old, long new)
+{
+	return cas((ulong*)addr, old, new);
+}
+
 void
 cpustart(int cpu)
 {
 	Mboxes *mb;
+	void machon(int);
 
 	up = nil;
 	machinit();
@@ -232,11 +269,11 @@ cpustart(int cpu)
 	mb->clr[cpu].doorbell = 1;
 	trapinit();
 	clockinit();
-	mmuinit1(0);
+	mmuinit1();
 	timersinit();
 	cpuidprint();
 	archreset();
-	active.machs[m->machno] = 1;
+	machon(m->machno);
 	unlock(&startlock[cpu]);
 	schedinit();
 	panic("schedinit returned");

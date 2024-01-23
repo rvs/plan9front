@@ -1,790 +1,1499 @@
+/*
+ * driver for NVM Express 1.1 interface to PCI-Express solid state disk
+ * (i.e., flash memory).
+ *
+ * currently the controller is in the drive, so there's no multiplexing
+ * of drives through the controller.  multiple namespaces (actually number
+ * spaces) are assumed to refer to different views of the same disk
+ * (different block sizes).
+ *
+ * many features of NVME are ignored in the interest of simplicity and speed.
+ * many of them are intended to jump on a bandwagon (e.g., VMs) or check a box.
+ * using interrupts rather than polling costs us about 4% in large-block
+ * sequential read performance.
+ */
 #include "u.h"
 #include "../port/lib.h"
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
-#include "ureg.h"
 #include "../port/error.h"
-
 #include "../port/sd.h"
 
-typedef struct WS WS;
-typedef struct CQ CQ;
-typedef struct SQ SQ;
-typedef struct Ctlr Ctlr;
+#define PAGEOF(ctlr, p) ((uintptr)(p) & ~((uintptr)(ctlr)->pgsz-1))
 
-struct WS
-{
-	u32int	cdw0;
-	ushort	status;
-	Rendez	*sleep;
-	WS	**link;
-	SQ	*queue;
-};
+#define QFULL(qp)	((qp)->qidx.hd == qidxplus1((qp), (qp)->qidx.tl))
+#define QEMPTY(qp)	((qp)->qidx.hd == (qp)->qidx.tl)
 
-struct CQ
-{
-	u32int	head;
-	u32int	mask;
-	u32int	shift;
-	u32int	*base;
-	Ctlr	*ctlr;
-};
+#define nvmeadmissue(ctlr, op, nsid, buf) \
+	nvmeissue(ctlr, &ctlr->qpair[Qadmin], nil, op, nsid, buf, 0)
 
-struct SQ
-{
-	u32int	tail;
-	u32int	mask;
-	u32int	shift;
-	u32int	*base;
-	WS	**wait;
-	Ctlr	*ctlr;
-	Lock;
-};
-
-struct Ctlr
-{
-	QLock;
-
-	Lock	intr;
-	u32int	ints;
-	u32int	irqc[2];
-
-	Pcidev	*pci;
-	u32int	*reg;
-
-	u64int	cap;
-	uchar	*ident;
-	u32int	*nsid;
-	int	nnsid;
-
-	u32int	mps;		/* mps = 1<<mpsshift */
-	u32int	mpsshift;
-	u32int	dstrd;
-
-	u32int	nsq;
-
-	CQ	cq[1+1];
-	SQ	sq[1+MAXMACH];
-
-	Ctlr	*next;
-};
-
-/* controller registers */
 enum {
-	Cap0,
-	Cap1,
-	Ver,
-	IntMs,
-	IntMc,
-	CCfg,
+	/* fundamental constants */
+	Qadmin,			/* queue-pair ordinals; Qadmin fixed at 0 */
+	Qio,
+	Nqueues,
 
-	CSts = 0x1C/4,
-	Nssr,
-	AQAttr,
-	ASQBase0,
-	ASQBase1,
-	ACQBase0,
-	ACQBase1,
+	Vall = 1<<Qadmin | 1<<Qio,	/* all interesting vectors */
 
-	DBell = 0x1000/4,
+	Subq = 0,
+	Complq,
+	Qtypes,
+
+	Nsunused = 0,
+	Nsall	= ~0ul,
+
+	Idns	= 0,
+	Idctlr,
+	Idnsids,
+
+	Minsect	= 512,
+
+	/* tunable parameters */
+	Debugintr = 0,
+	Debugns = 0,
+	Measure	= 1,			/* flag: measure transfer times */
+
+	Timeout = 20*1000,	/* adjust to taste. started at 2000 ms. */
+
+	/*
+	 * NVME page size must be >= sector size.  anything over 8K only
+	 * benefits bulk copies and benchmarks.
+	 */
+	Startpgsz = Sdalign,	/* on samsung sm951, 4k ≤ page_size ≤ 128MB */
+
+	Qlen	= 32,	/* defaults; queue lengths must be powers of 2 < 4K */
+	Cqlen	= 16,
+
+	NCtlr	= 8,	/* each takes a pci-e or m.2 slot */
+	NCtlrdrv= 1,
+	NDrive	= NCtlr * NCtlrdrv,
+
+	Reserved = (ushort)~0,		/* placeholder cmdid */
 };
 
-static u32int*
-qcmd(WS *ws, Ctlr *ctlr, int adm, u32int opc, u32int nsid, void *data, ulong len)
+/* admin commands */
+enum Adminops {
+	Admmkiosq	= 1,	/* create i/o submission q */
+	Admmkiocq	= 5,	/* create i/o completion q */
+	Admid		= 6,	/* identify */
+};
+
+/* I/O commands */
+enum Opcode {
+	Cmdflush	= 0,
+	Cmdwrite	= 1,
+	Cmdread		= 2,
+	Cmdwriteuncorr	= 4,
+	Cmdcompare	= 5,
+	Cmddsm		= 9,
+};
+
+typedef struct Cmd Cmd;
+typedef struct Completion Completion;
+typedef struct Ctlr Ctlr;
+typedef struct Ctlrid Ctlrid;
+typedef struct Doorbell Doorbell;
+typedef struct Lbafmt Lbafmt;
+typedef struct Nsid Nsid;
+typedef struct Nvindx Nvindx;
+typedef struct Qpair Qpair;
+typedef struct Regs Regs;
+typedef struct Transfer Transfer;
+
+extern SDifc sdnvmeifc;
+
+struct Nvindx {
+	ushort	hd;		/* remove at this index */
+	ushort	tl;		/* add at this index */
+};
+
+struct Qpair {
+	Cmd	*q;		/* base of Cmd array */
+	Nvindx	qidx;
+	short	sqlen;
+	uchar	writelast;	/* flag: read or write in last cmd? */
+
+	Completion *cmpl;	/* base of Completion array */
+	Nvindx	cidx;
+	short	cqlen;
+	uchar	phase;		/* initial phase bit setting in cmpl */
+};
+
+/* these are reused and never freed */
+struct Transfer {
+	Transfer *next;
+	Rendez;
+	uvlong	stcyc;		/* cycles at enqueue */
+	int	status;		/* from completion */
+	ulong	qtm;		/* time at enqueue */
+	ushort	cmdid;		/* 0 means available */
+	uchar	done;		/* flag for rendezvous */
+	uchar	rdwr;
+	uchar	machno;		/* cpu of enqueue, thus stcyc */
+};
+
+struct Ctlr {
+	Regs*	regs;		/* memory-mapped I/O registers */
+	SDev*	sdev;
+	Intrcommon;
+	uintptr	port;		/* physical addr of I/O registers */
+
+	int	pgsz;		/* size of an `nvme page' */
+	int	minpgsz;
+	int	mdts;		/* actual value, not log2; unit minpgsz */
+	short	sqlen;		/* sub q len */
+	short	cqlen;		/* compl q len */
+	int	stride;	/* bytes from base of one doorbell reg. to the next */
+
+	/* per controller */
+	QLock;			/* serialise q notifications */
+	Rendez;			/* q empty/full notifications */
+	Lock;			/* intr svc */
+	Lock	issuelock;	/* inflight & q heads & tail mostly */
+	Lock	xfrlock;
+	Lock	shutlock;
+	short	inflight;	/* count of xfrs in progress */
+	int	intrsena;	/* interrupts we care about */
+	Transfer *xfrs;		/* transfers in flight or done */
+	Qpair	qpair[Nqueues];	/* use a single admin queue pair */
+
+	/* per-drive scalars, since there is only one drive */
+	vlong	sectors;	/* total, copy to SDunits */
+	int	secsize;	/* sector size, copy to SDunits */
+	int	ns;		/* namespace index in Nsid->lbafmt */
+	/* stats */
+	/* high water marks of read, write queues: 2 & 3, so far. */
+	short	maxqlen[2];
+	uvlong	count[3];	/* number of xfers */
+	uvlong	totus[3];	/* sum of (µs per xfer) */
+	uvlong	implaus[3];	/* number of implausible cycle counts */
+
+	/* per-drive arrays */
+	char	serial[20+1];
+	char	model[40+1];
+	char	fw[8+1];
+};
+
+struct Regs {
+	uvlong	cap;		/* controller capabilities */
+	ulong	vs;		/* version */
+	/* intm* bits are actually vector number offsets */
+	ulong	intmset;	/* intr mask set: bit # is i/o completion q # */
+	ulong	intmclr;	/* intr mask clear: " */
+	ulong	cc;		/* controller configuration */
+	ulong	nssrc;		/* reset, iff cap.nssrs set */
+	ulong	csts;		/* controller status */
+	ulong	_rsvd2;		/* reserved */
+	ulong	aqa;		/* admin queue attributes */
+	uvlong	asq;		/* admin submit queue base address */
+	uvlong	acq;		/* admin completion queue base address */
+	uchar	_pad0[0x1000 - 0x38];
+	/* this is the nominal doorbell layout, with stride of 4 */
+	struct Doorbell {
+		ulong	sqtl;	/* submission queue tail */
+		ulong	cqhd;	/* completion queue head */
+	} doorbell[Nqueues];
+};
+
+/*
+ * making the doorbell stride variable at run time requires changing the
+ * declaration and addressing of the Regs->doorbell array, making it clunkier.
+ * supposedly non-zero strides are only desirable in VMs, for efficiency.
+ */
+/* clunky doorbell register addressing for any stride */
+/* instead of &ctlr->regs->doorbell[qid].sqtl */
+#define doorbellsqtl(ctlr, qp) (ulong *)\
+	((char *)(ctlr)->regs->doorbell + (ctlr)->stride*(Qtypes*(qp) + Subq))
+/* instead of &ctlr->regs->doorbell[qid].cqhd */
+#define doorbellcqhd(ctlr, qp) (ulong *)\
+	((char *)(ctlr)->regs->doorbell + (ctlr)->stride*(Qtypes*(qp) + Complq))
+
+enum {
+	/* cap */
+	Nssrs		= 1ull << 36,
+
+	/* cc */
+	Enable		= 1 << 0,
+	Cssnvm		= 0 << 4,	/* nvm command set */
+	Cssmask		= 7 << 4,
+	Shnnone		= 0 << 14,	/* shutdown style */
+	Shnnormal	= 1 << 14,
+	Shnabrupt	= 2 << 14,
+	Shnmask		= 3 << 14,
+
+	/* csts */
+	Rdy		= 1 << 0,	/* okay to add to sub. q */
+	Cfs		= 1 << 1,	/* controller fatal status */
+	Shstnormal	= 0 << 2,	/* shutdown status */
+	Shstoccur	= 1 << 2,
+	Shstcmplt	= 2 << 2,
+	Shstmask	= 3 << 2,
+	Nssro		= 1 << 4,
+};
+
+struct Cmd {
+	/* common 40-byte header */
+	uchar	opcode;		/* command dword 0 */
+	uchar	flags;
+	ushort	cmdid;
+	ulong	nsid;
+	ulong	cdw2[2];	/* not used */
+	uvlong	metadata;
+	uvlong	prp1;		/* buffer memory address */
+	uvlong	prp2;		/* zero, buffer addr, or prp list addr */
+	union {
+		ulong	cdw10[6]; /* admin: command dwords 10-15 */
+		struct {	/* nvm i/o */
+			uvlong	slba;
+			ushort	length;
+			ushort	control;
+			ulong	dsmgmt;
+			/* rest are for end-to-end protection only */
+			ulong	reftag;
+			ushort	apptag;
+			ushort	appmask;
+		};
+	};
+};
+
+enum {
+	/* cdw10[1] for Admmkiocq */
+	Ien	= 1<<1,		/* intr enabled */
+	Pc	= 1<<0,		/* physically contiguous */
+};
+
+struct Completion {
+	ulong	specific;
+	ulong	_pad;
+	ushort	sqhd;
+	ushort	sqid;
+	ushort	cmdid;
+	ushort	stsphs;		/* status + 1 phase bit */
+};
+
+enum {
+	Phase	= 1,		/* phase bit in stsphs */
+};
+
+struct Ctlrid {			/* identify cmd, cns=1 */
+	ushort	pcivid;
+	ushort	pcissvid;
+	char	serial[20];	/* space-padded, unterminated strings */
+	char	model[40];
+	char	fw[8];
+	char	_72_[77-72];
+	uchar	mdts;		/* log2(max data xfr size), unit: min pg sz */
+				/* 0 is unlimited */
+	char	_78_[516-78];	/* ... lots of uninteresting stuff ... */
+	ulong	nns;		/* number of namespaces present */
+
+	char	_520_[526-520];	/* ... lots of uninteresting stuff ... */
+	/* after 1.1 */
+	ushort	awun;		/* atomic write unit */
+	/* ... lots of uninteresting stuff through offset 4095 */
+};
+
+struct Nsid {			/* identify cmd, cns=0 */
+	uvlong	size;		/* in logical blocks */
+	uvlong	cap;
+	uvlong	used;
+	uchar	feat;		/* option feature bits */
+	uchar	nlbafmts;	/* elements in lbafmt */
+	uchar	fmtlbasz;	/* low 4 bits index lbafmt */
+	uchar	mdcap;
+	uchar	dpc;		/* end-to-end data protection stuff */
+	uchar	dps;
+	uchar	optnmic;
+	uchar	optrescap;	/* reservation capabilities */
+
+	/* after 1.1 */
+	uchar	fpi;
+	uchar	dlfeat;
+	/* atomicity */
+	ushort	nawun;		/* atomic write size; see awun */
+	ushort	nawupf;		/* " under power failure */
+	ushort	nacwu;		/* compare-&-swap size */
+	ushort	nabsn;		/* boundary size */
+	ushort	nabspf;		/* " under power failure */
+	ushort	nabo;		/* boundary offset */
+	/* end atomicity */
+	ushort	noiob;		/* optimal i/o boundary */
+	/* end after 1.1 */
+	uchar	_pad0[128-48];	/* uninteresting stuff */
+
+	struct Lbafmt {
+		ushort	mdsize;
+		uchar	lglbasize; /* log2(lba size) */
+		uchar	relperf;
+	} lbafmt[16];
+	/* ... uninteresting stuff through offset 4095 */
+};
+
+CTASSERT(sizeof(Cmd) == 64, cmd_wrong_size);
+CTASSERT(sizeof(Completion) == 16, compl_wrong_size);
+
+static Lock clocklck;
+static int clockrunning;
+static ulong iosttck;		/* tick of most recently-started i/o */
+static int nctlrs;
+static Ctlr *ctlrs[NCtlr];
+
+static void
+cidxincr(Ctlr *ctlr, Qpair *qp)
 {
-	u32int cid, *e;
-	u64int pa;
-	SQ *sq;
+	if (++qp->cidx.hd >=  ctlr->cqlen) {
+		qp->cidx.hd = 0;
+		qp->phase ^= Phase;
+	}
+}
 
-	if(!adm){
-	Retry:
-		splhi();
-		sq = &ctlr->sq[1+(m->machno % ctlr->nsq)];
-		if(conf.nmach > ctlr->nsq)
-			lock(sq);
-	} else {
-		qlock(ctlr);
-		sq = &ctlr->sq[0];
-	}
-	ws->sleep = &up->sleep;
-	ws->queue = sq;
-	ws->link = &sq->wait[sq->tail & sq->mask];
-	while(*ws->link != nil){
-		/* should be very rare */
-		if(!adm){
-			if(conf.nmach > ctlr->nsq)
-				unlock(sq);
-			sched();
-			goto Retry;
-		}
-		sched();
-	}
-	*ws->link = ws;
+#ifdef unused
+static void
+isfatal(Regs *regs, char *where)
+{
+	if (regs->csts & Cfs)
+		panic("nvme: fatal controller error %s", where);
+}
+#endif
 
-	e = &sq->base[((cid = sq->tail++) & sq->mask)<<4];
-	e[0] = opc | cid<<16;
-	e[1] = nsid;
-	e[2] = 0;
-	e[3] = 0;
-	e[4] = 0;
-	e[5] = 0;
-	if(len > 0){
-		dmaflush(1, data, len);
-		pa = PCIWADDR(data);
-		e[6] = pa;
-		e[7] = pa>>32;
-		if(len > ctlr->mps - (pa & ctlr->mps-1))
-			pa += ctlr->mps - (pa & ctlr->mps-1);
-		else
-			pa = 0;
-	} else {
-		e[6] = 0;
-		e[7] = 0;
-		pa = 0;
+static Transfer *
+findxfr(Ctlr *ctlr, int cmdid)
+{
+	Transfer *xfr;
+
+	for (xfr = ctlr->xfrs; xfr; xfr = xfr->next)
+		if (xfr->cmdid == cmdid)
+			return xfr;
+	return nil;
+}
+
+/*
+ * cqhd is head of the completion queue.
+ * mark its transfer done, notify anybody waiting for it.
+ */
+static void
+completexfr(Ctlr *ctlr, Completion *cqhd, int qid)
+{
+	Transfer *xfr;
+
+	if (Debugintr)
+		iprint("intr q %d cmdid %d...", qid, cqhd->cmdid);
+	xfr = findxfr(ctlr, cqhd->cmdid);
+	if (xfr == nil)
+		panic("sd%C0: nvmeinterrupt: unexpected completion cmd id %d",
+			ctlr->sdev->idno, cqhd->cmdid);
+	if (xfr->qtm && TK2MS(sys->ticks) - xfr->qtm >= Timeout)
+		iprint("sd%C0: nvmeinterrupt: completed cmd id %d but "
+			"took more than %d s.\n",
+			ctlr->sdev->idno, cqhd->cmdid, Timeout/1000);
+
+	/* cycle-based measurements */
+	if (Measure) {
+		uint rdwr;
+		uvlong cycs;
+
+		/*
+		 * if xfr->stcyc was set on another cpu, with a slightly staggered cycle
+		 * counter, cycs may be wrong, including negative or too big.
+		 */
+		cycles(&cycs);
+		cycs -= xfr->stcyc;
+		rdwr = xfr->rdwr;
+		if (xfr->machno == m->machno && cycs < m->cpuhz && rdwr < 3) {
+			ctlr->totus[rdwr] += cycs / m->cpumhz;
+			ctlr->count[rdwr]++;
+		} else
+			ctlr->implaus[rdwr]++;
 	}
-	e[8] = pa;
-	e[9] = pa>>32;
-	return e;
+
+	xfr->status = cqhd->stsphs & ~Phase;
+	xfr->done = 1;
+	xfr->qtm = 0;
+	wakeup(xfr);		/* notify of completion */
+}
+
+/* advance sub. q head to completion's, notify waiters */
+static void
+advancesqhd(Ctlr *ctlr, Qpair *qp, Completion *cqhd, int qid)
+{
+	if (Debugintr)
+		iprint("sw q %d sqhd set to %d...", qid, cqhd->sqhd);
+	qp->qidx.hd = cqhd->sqhd;
+	wakeup(ctlr);		/* notify of sqhd advance */
+}
+
+/*
+ * advance compl. q head, notify ctlr., which will extinguish intr source
+ * (by acknowledging this completion) and remove cqhd from the compl. q.
+ */
+static void
+advancecqhd(Ctlr *ctlr, Qpair *qp, int qid)
+{
+	cidxincr(ctlr, qp);
+	if (Debugintr)
+		iprint("doorbell q %d cqhd set to %d\n", qid, qp->cidx.hd);
+	*doorbellcqhd(ctlr, qid) = qp->cidx.hd;
+	coherence();
+}
+
+/*
+ * Act on and clear the interrupt(s).
+ * In order to share PCI IRQs, just ignore spurious interrupts.
+ * Advances queue head indices past completed operations.
+ */
+static Intrsvcret
+nvmeinterrupt(Ureg *, void* arg)
+{
+	int qid, ndone, donepass; /* qid's not a great name (see path.qid) */
+	ulong causes;
+	Completion *cqhd;
+	Ctlr *ctlr;
+	Qpair *qp;
+	Regs *regs;
+
+	ctlr = arg;
+	regs = ctlr->regs;
+	causes = regs->intmset;
+	USED(causes);
+	ilock(&ctlr->issuelock); /* keep other cpus out of intr svc, indices */
+	if (ctlr->inflight == 0) {	/* not expecting an interrupt? */
+		/* probably lost a race with polling: nothing to do */
+		iunlock(&ctlr->issuelock);
+		return Intrnotforme;
+	}
+
+	ndone = 0;
+	do {
+		donepass = 0;
+		for (qid = Nqueues - 1; qid >= 0; qid--) /* scan i/o q 1st */
+			for (qp = &ctlr->qpair[qid]; ; ) {
+				cqhd = &qp->cmpl[qp->cidx.hd];
+				if ((cqhd->stsphs & Phase) == qp->phase)
+					break;
+				completexfr(ctlr, cqhd, qid);
+				advancesqhd(ctlr, qp, cqhd, qid);
+				/*
+				 * toggles qp->phase if qp->cidx.hd wraps when
+				 * incr'd.
+				 */
+				advancecqhd(ctlr, qp, qid);
+				if (--ctlr->inflight < 0)
+					iprint("nvmeinterrupt: inflight botch\n");
+				ndone++, donepass++;
+			}
+	} while (donepass > 0);
+	/* unmask intr. sources of interest iff transfers are in flight */
+	if (ctlr->inflight == 0) {
+		iosttck = 0;
+		ctlr->intrsena = 0;
+	} else
+		regs->intmclr = Vall;
+	iunlock(&ctlr->issuelock);
+	if (ndone > 0)
+		return Intrforme;
+	else
+		return Intrnotforme;
+}
+
+/* return cmd id other than zero and Reserved */
+static int
+cidalloc(void)
+{
+	int thisid;
+	static int cid;
+	static Lock cidlck;
+
+	ilock(&cidlck);
+	++cid;
+	if ((ushort)cid == 0 || (ushort)cid == Reserved)
+		cid = 1;
+	thisid = cid;
+	iunlock(&cidlck);
+	return thisid;
 }
 
 static void
-nvmeintr(Ureg *, void *arg)
+mkadmcmd(Ctlr *ctlr, Cmd *cmd, int op)
 {
-	u32int phaseshift, *e;
-	WS *ws, **wp;
-	Ctlr *ctlr;
-	SQ *sq;
-	CQ *cq;
+	/* we are using single-message msi */
+	switch (op) {
+	case Admmkiocq:
+		cmd->cdw10[0] = (ctlr->cqlen - 1)<<16 | Qio;
+		cmd->cdw10[1] = Ien | Pc;	/* vector 0 since no msi-x */
+		break;
+	case Admmkiosq:
+		cmd->cdw10[0] = (ctlr->sqlen - 1)<<16 | Qio;
+		cmd->cdw10[1] = Qio<<16 | Pc;	/* completion q id */
+		break;
+	case Admid:
+		if (cmd->nsid == Nsall) {
+			cmd->cdw10[0] = Idctlr;
+			cmd->nsid = 0;
+		} else
+			cmd->cdw10[0] = Idns;
+		break;
+	}
+}
 
-	ctlr = arg;
-	if(ctlr->ints == 0)
+/* fill in submission queue entry *cmd */
+static void
+mkcmd(Ctlr *ctlr, Cmd *cmd, SDreq *r, int op, ulong nsid, void *buf, int qid,
+	vlong lba)
+{
+	long count;
+	ulong pgsz, dlen;
+	uintptr addr;
+	SDunit *unit;
+
+	memset(cmd, 0, sizeof *cmd);
+	cmd->opcode = op;
+	cmd->cmdid = cidalloc();
+	cmd->nsid = nsid;
+	addr = (uintptr)buf;			/* will be Sdalign-ed */
+	dlen = (r? r->dlen: 512);
+	if (addr != 0) {
+		if (addr < KZERO)
+			print("nvme mkcmd: %#p not kernel virtual address\n",
+				addr);
+		/* each prp entry points to at most an nvme page */
+		cmd->prp1 = PCIWADDR((void *)addr);	/* must be Sdalign-ed */
+		pgsz = ctlr->pgsz;
+		assert(dlen <= 2*pgsz);
+		if (r && dlen > pgsz && dlen <= 2*pgsz)
+			cmd->prp2 = PAGEOF(ctlr, cmd->prp1) + pgsz;
+		else
+			cmd->prp2 = 0;
+	}
+	if (qid == Qadmin) {
+		mkadmcmd(ctlr, cmd, op);	/* uncommon case */
 		return;
+	}
 
-	ilock(&ctlr->intr);
-	ctlr->reg[IntMs] = ctlr->ints;
-	for(cq = &ctlr->cq[nelem(ctlr->cq)-1]; cq >= ctlr->cq; cq--){
-		if(cq->base == nil)
-			continue;
-		phaseshift = 16 - cq->shift;
-		for(;;){
-			e = &cq->base[(cq->head & cq->mask)<<2];
-			dmaflush(0, e, 32);
-			if(((e[3] ^ (cq->head << phaseshift)) & 0x10000) == 0)
-				break;
-
-			if(0) iprint("nvmeintr: cq%d [%.4ux] %.8ux %.8ux %.8ux %.8ux\n",
-				(int)(cq - ctlr->cq), cq->head & cq->mask,
-				e[0], e[1], e[2], e[3]);
-
-			sq = &ctlr->sq[e[2] >> 16];
-			wp = &sq->wait[e[3] & sq->mask];
-			if((ws = *wp) != nil && ws->link == wp){
-				Rendez *z = ws->sleep;
-				ws->cdw0 = e[0];
-				ws->status = e[3]>>17;
-				*wp = nil;
-				wakeup(z);
+	if (op != Cmdread && op != Cmdwrite && op != Cmdflush)
+		panic("sdnvme: bad cmd %d", op);
+	cmd->slba = lba;
+	count = 0;
+	cmd->length = (ushort)(count - 1);	/* sectors */
+	if (r) {
+		assert(r->data == buf);
+		unit = r->unit;
+		if (unit) {
+			count = dlen / unit->secsize;
+			if (count <= 0) {
+				print("nvmeissue: sector count %ld for i/o of length %ld\n",
+					count, dlen);
+				return;
 			}
-			ctlr->reg[DBell + ((cq-ctlr->cq)*2+1 << ctlr->dstrd)] = ++cq->head & cq->mask;
+			assert(unit->secsize * count <= dlen);
 		}
 	}
-	ctlr->reg[IntMc] = ctlr->ints;
-	iunlock(&ctlr->intr);
+	assert(nsid);
+	cmd->length = (ushort)(count - 1);	/* sectors */
 }
 
-static int
-wdone(void *arg)
+static void
+updmaxqlen(Ctlr *ctlr, Qpair *qp)
 {
-	WS *ws = arg;
-	return *ws->link != ws;
+	int qlen;
+	short *qlenp;
+
+	qlen = (qp->qidx.tl + qp->sqlen - qp->qidx.hd) % qp->sqlen;
+	qlenp = &ctlr->maxqlen[qp->writelast];
+	if (qlen > *qlenp)
+		*qlenp = qlen;
 }
 
-static u32int
-wcmd(WS *ws, u32int *e)
+/*
+ * send a command via the submission queue.
+ * call with ctlr->issuelock held.
+ * advances submission queue's tail index.
+ */
+static void
+sendcmd(Ctlr *ctlr, Qpair *qp, Cmd *qtl, Transfer *xfr)
 {
-	SQ *sq = ws->queue;
-	Ctlr *ctlr = sq->ctlr;
+	int qid;
 
-	if(e != nil){
-		dmaflush(1, e, 64);
-	}
-	coherence();
-	ctlr->reg[DBell + ((sq-ctlr->sq)*2+0 << ctlr->dstrd)] = sq->tail & sq->mask;
-	if(sq > ctlr->sq) {
-		assert(sq == &ctlr->sq[1+(m->machno % ctlr->nsq)]);
-		if(conf.nmach > ctlr->nsq)
-			unlock(sq);
-		spllo();
-	} else
-		qunlock(sq->ctlr);
-	while(waserror())
-		;
-	tsleep(ws->sleep, wdone, ws, 5);
-	while(!wdone(ws)){
-		nvmeintr(nil, ctlr);
-		tsleep(ws->sleep, wdone, ws, 10);
-	}
-	poperror();
-	return ws->status;
-}
-
-void
-checkstatus(u32int status, char *info)
-{
-	if(status == 0)
-		return;
-	snprint(up->genbuf, sizeof(up->genbuf), "%s: status %ux", info, status);
-	error(up->genbuf);
-}
-
-static long
-nvmebio(SDunit *u, int lun, int write, void *a, long count, uvlong lba)
-{
-	u32int nsid, s, n, m, *e;
-	Ctlr *ctlr;
-	uchar *p;
-	WS ws;
-
-	USED(lun);
-
-	ctlr = u->dev->ctlr;
-	nsid = ctlr->nsid[u->subno];
-	s = u->secsize;
-	p = a;
-	while(count > 0){
-		m = (2*ctlr->mps - ((uintptr)p & ctlr->mps-1)) / s;
-		if((n = count) > m)
-			n = m;
-		e = qcmd(&ws, ctlr, 0, write ? 0x01 : 0x02, nsid, p, n*s);
-		e[10] = lba;
-		e[11] = lba>>32;
-		e[12] = n-1;
-		e[13] = (count>n)<<6;	/* sequential request */
-		e[14] = 0;
-		e[15] = 0;
-		checkstatus(wcmd(&ws, e), write ? "write" : "read");
-		p += n*s;
-		count -= n;
-		lba += n;
-	}
-	if(!write){
-		dmaflush(0, a, p - (uchar*)a);
-	}
-	return p - (uchar*)a;
-}
-
-static int
-nvmerio(SDreq *r)
-{
-	int i, count, rw;
-	uvlong lba;
-	SDunit *u;
-
-	u = r->unit;
-	if(r->cmd[0] == 0x35 || r->cmd[0] == 0x91)
-		return sdsetsense(r, SDok, 0, 0, 0);
-	if((i = sdfakescsi(r)) != SDnostatus)
-		return r->status = i;
-	if((i = sdfakescsirw(r, &lba, &count, &rw)) != SDnostatus)
-		return i;
-	r->rlen = nvmebio(u, r->lun, rw == SDwrite, r->data, count, lba);
-	return r->status = SDok;
-}
-
-static u64int
-get64(uchar *p)
-{
-	return p[0] | p[1]<<8 | p[2]<<16 | p[3]<<24
-		| (u64int)p[4]<<32
-		| (u64int)p[5]<<40
-		| (u64int)p[6]<<48
-		| (u64int)p[7]<<56;
-}
-
-static long
-readsmart(SDunit *u, Chan *, void *a, long n, vlong off)
-{
-	Ctlr *ctlr = u->dev->ctlr;
-	char *buf, *p, *e;
-	uchar *info;
-	u32int nsid, *q;
-	WS ws;
-
-	buf = smalloc(READSTR);
-	if(waserror()){
-		free(buf);
-		nexterror();
-	}
-	p = buf;
-	e = buf + READSTR;
-
-	info = mallocalign(0x1000, ctlr->mps, 0, 0);
-	if(info == nil)
-		error(Enomem);
-	if(waserror()){
-		free(info);
-		nexterror();
-	}
+	xfr->done = 0;
+	xfr->cmdid = qtl->cmdid;
+	xfr->qtm = TK2MS(sys->ticks);
+	qid = qp - ctlr->qpair;
+	if (Debugintr)
+		iprint("issue q %d cmdid %d...", qid, xfr->cmdid);
 
 	/*
-	 * Log Page Attributes (LPA) Bit0: If set to '1' then te controller
-	 * supports SMART / Health information log page on a per namespace basis.
+	 * Notify controller of new submission queue entry,
+	 * which triggers execution of it.
 	 */
-	nsid = (ctlr->ident[261] & 1) != 0 ? ctlr->nsid[u->subno] : 0xffffffff;
+	updmaxqlen(ctlr, qp);
+	if (Measure) {
+		cycles(&xfr->stcyc);
+		xfr->machno = m->machno;
+	} else
+		xfr->stcyc = 0;
 
-	q = qcmd(&ws, ctlr, 1, 0x02, nsid, info, 0x1000);
-	q[10] = (512/4)<<16 | 0x2;
-	q[11] = 0;
-	q[12] = 0;
-	q[13] = 0;
-	q[14] = 0;
-	checkstatus(wcmd(&ws, q), "read SMART/health info");
-	dmaflush(0, info, 0x1000);
+	ctlr->inflight++;
+	iosttck = sys->ticks;
+	*doorbellsqtl(ctlr, qid) = qp->qidx.tl;		/* start i/o */
+	coherence();
+	ctlr->regs->intmclr = ctlr->intrsena = Vall;	/* unmask intrs */
+}
 
-	p = seprint(p, e, "Critical Warning:\t");
-	if(info[0]&(1<<0))
-		p = seprint(p, e, "Available Spare,");
-	if(info[0]&(1<<1))
-		p = seprint(p, e, "Temperature Exceeded,");
-	if(info[0]&(1<<2))
-		p = seprint(p, e, "Reliability Degraded,");
-	if(info[0]&(1<<3))
-		p = seprint(p, e, "Read only mode,");
-	if(info[0]&(1<<4))
-		p = seprint(p, e, "Backup failed,");
-	p[-1] = '\n';
+static int
+doneio(void* arg)
+{
+	return ((Transfer *)arg)->done;
+}
 
-	p = seprint(p, e, "Temperature:\t%d\n", (info[2]<<8 | info[1]) - 273);
+static uint
+qidxplus1(Qpair *qp, uint idx)
+{
+	if (++idx >= qp->sqlen)
+		idx = 0;
+	return idx;
+}
 
-	p = seprint(p, e, "Available Spare:\t%d%%\n", info[3]);
-	p = seprint(p, e, "Available Spare Threshold:\t%d%%\n", info[4]);
+static int
+qnotfull(void *arg)
+{
+	return !QFULL((Qpair *)arg);
+}
 
-	p = seprint(p, e, "Percentage Used:\t%d%%\n", info[5]);
+static int
+qempty(void *arg)
+{
+	return QEMPTY((Qpair *)arg);
+}
 
-	p = seprint(p, e, "Data Units Read:\t%llud\n", get64(info+32));
-	p = seprint(p, e, "Data Units Written:\t%llud\n", get64(info+48));
-	p = seprint(p, e, "Host Read Commands:\t%llud\n", get64(info+64));
-	p = seprint(p, e, "Host Write Commands:\t%llud\n", get64(info+80));
-	p = seprint(p, e, "Controller Busy Time:\t%llud:%.2d\n", get64(info+96)/60, (int)(get64(info+96)%60));
-	p = seprint(p, e, "Power Cycles:\t%llud\n", get64(info+112));
-	p = seprint(p, e, "Power On Hours:\t%llud\n", get64(info+128));
-	p = seprint(p, e, "Unsafe Shutdowns:\t%llud\n", get64(info+144));
-	p = seprint(p, e, "Media Errors:\t%llud\n", get64(info+160));
-	USED(p);
+static Transfer *
+getfreexfr(Ctlr *ctlr)
+{
+	Transfer *xfr;
 
-	free(info);
+	ilock(&ctlr->xfrlock);			/* allocate xfr */
+	xfr = findxfr(ctlr, 0);
+	if (xfr == nil) {
+		xfr = malloc(sizeof *xfr);
+		if (xfr == nil)
+			panic("nvmeissue: out of memory");
+		xfr->next = ctlr->xfrs;
+		ctlr->xfrs = xfr;	/* add new xfr to chain */
+	}
+	xfr->cmdid = Reserved;
+	xfr->qtm = 0;
+	iunlock(&ctlr->xfrlock);
+	return xfr;
+}
+
+/*
+ * if needed, wait for the sub q to drain a lot or a little.
+ * not infallible, so test afterward under lock.
+ */
+static void
+qdrain(Ctlr *ctlr, Qpair *qp, SDreq *r)
+{
+	if (QFULL(qp)) {
+		qlock(ctlr);			/* wait for q space */
+		while (QFULL(qp))
+			sleep(ctlr, qnotfull, qp);
+		qunlock(ctlr);
+	}
+	/*
+	 * don't mix reads and writes in the queue, to avoid read-before-write
+	 * problems.
+	 */
+	if (r && qp->writelast != r->write) {
+		qlock(ctlr);
+		if (qp->writelast != r->write)
+			sleep(ctlr, qempty, qp);  /* changing, so drain */
+		qp->writelast = r->write;
+		qunlock(ctlr);
+	}
+}
+
+/* drain and return with ctlr->issuelock held */
+static void
+qdrainilock(Ctlr *ctlr, Qpair *qp, SDreq *r)
+{
+	int again;
+
+	/* serialise composition of cmd in place at sq tail */
+	do {
+		qdrain(ctlr, qp, r);
+
+		again = 0;
+		ilock(&ctlr->issuelock);
+		/* test again under lock */
+		if (QFULL(qp) || r && qp->writelast != r->write) {
+			/* lost a race; uncommon case */
+			iunlock(&ctlr->issuelock);
+			again = 1;
+		}
+	} while (again);
+	/* issuelock still held */
+}
+
+static void
+prerr(int sts)
+{
+	if (sts)
+		iprint("nvmeissue: cmd error status %#ux: "
+			"code %#ux type %d more %d do-not-retry %d\n", sts,
+			(sts >>  1) & MASK(8), (sts >>  9) & MASK(3),
+			(sts >> 14) & MASK(1), (sts >> 15) & MASK(1));
+}
+
+/*
+ * add new nvme command to tail of submission queue of Qpair,
+ * and wait for it to complete.  return status with phase bit zeroed.
+ */
+static int
+nvmeissue(Ctlr *ctlr, Qpair *qp, SDreq *r, int op, ulong nsid, void *buf,
+	vlong lba)
+{
+	ushort sts;
+	Cmd *qtl;
+	Transfer *xfr;
+
+	xfr = getfreexfr(ctlr);
+	if (op == Cmdread)
+		xfr->rdwr = Read;
+	else if (op == Cmdwrite)
+		xfr->rdwr = Write;
+	else
+		xfr->rdwr = 2;
+
+	/* serialise composition of cmd in place at sq tail */
+	qdrainilock(ctlr, qp, r);
+	/* ctlr->issuelock is now held */
+
+	/* Reserve a space and update sub. q tail index past it. */
+	qtl = &qp->q[qp->qidx.tl];
+	qp->qidx.tl = qidxplus1(qp, qp->qidx.tl);
+
+	/*
+	 * Compose the command struct at the tail of the submission queue.
+	 * mkcmd converts buf to physical address space.
+	 */
+	mkcmd(ctlr, qtl, r, op, nsid, buf, qp - ctlr->qpair, lba);
+	sendcmd(ctlr, qp, qtl, xfr);			/* start cmd */
+	iunlock(&ctlr->issuelock);
+
+	/* this is the only process waiting for this xfr. */
+	while(waserror())
+		;
+	tsleep(xfr, doneio, xfr, Timeout);
 	poperror();
+	if (!xfr->done) {
+		/* we see this with the Samsung 983 DCT. */
+		nvmeinterrupt(nil, ctlr);
+		if (!xfr->done)
+			panic("sd%C0: nvmeissue: cmd id %d didn't complete "
+				"in %d s.", ctlr->sdev->idno, xfr->cmdid,
+				Timeout/1000);
+	}
 
-	n = readstr(off, a, n, buf);
-	free(buf);
-	poperror();
+	sts = xfr->status;
+	xfr->cmdid = 0;				/* xfr available for re-use */
+	if (sts)
+		prerr(sts);
+	return sts;
+}
 
+/* map scsi to nvm opcodes */
+static int
+scsiop2nvme(uchar* cmd)
+{
+	if (isscsiread(*cmd))
+	 	return Cmdread;
+	else if (isscsiwrite(*cmd))
+	 	return Cmdwrite;
+	else {
+		iprint("scsiop2nvme: scsi cmd %#ux unexpected\n", *cmd);
+		return -1;
+	}
+}
+
+static int
+issueios(SDreq *r)
+{
+	int n, max, iostat, nvmcmd;
+	ulong count;			/* sectors */
+	uvlong lba;
+	Ctlr *ctlr;
+	SDunit *unit;
+
+	unit = r->unit;
+	ctlr = unit->dev->ctlr;
+	nvmcmd = scsiop2nvme(r->cmd);
+	if (nvmcmd == -1)
+		error("nvme: scsi cmd unexpected");
+	scsilbacount(r->cmd, r->clen, &lba, &count);
+	if(count * unit->secsize > r->dlen)
+		count = r->dlen / unit->secsize;
+	max = 2*ctlr->pgsz / unit->secsize;	/* needs 1 or 2 prp addrs */
+	/* to do this in generality, need to allocate a prp list page */
+	if (0)
+		max = (ctlr->mdts? ctlr->mdts * ctlr->minpgsz: 128*KB) /
+			unit->secsize;
+	iostat = 0;
+
+	for (; count > 0; count -= n){
+		n = MIN(count, max);
+		r->dlen = n * unit->secsize;
+		iostat = nvmeissue(ctlr, &ctlr->qpair[Qio], r, nvmcmd,
+			ctlr->ns, r->data, lba);
+		if (iostat)
+			break;
+		lba += n;
+		r->data = (uchar *)r->data + r->dlen;
+	}
+	return iostat;
+}
+
+/*
+ * Issue an I/O (SCSI) command to a controller and wait for it to complete.
+ * The command and its length is contained in r->cmd and r->cmdlen.
+ * If any data is to be returned, r->dlen should be non-zero, and
+ * the returned data will be placed in r->data.
+ */
+static int
+nvmerio(SDreq* r)
+{
+	int i, iostat;
+	ulong origdlen;
+	uchar *origdata;
+	static char info[256];
+
+	if(*r->cmd == ScmdSynccache || *r->cmd == ScmdSynccache16)
+		return sdsetsense(r, SDok, 0, 0, 0);
+
+	/* scsi command to get information about the drive or disk? */
+	if((i = sdfakescsi(r, info, sizeof info)) != SDnostatus){
+		r->status = i;
+		return i;
+	}
+
+	if(r->data == nil)
+		return SDok;
+
+	/*
+	 * Cap the size of individual transfers and repeat if needed.
+	 * Save r->data and r->dlen, and restore them after issueios.
+	 * could call scsibio, which allocates an SDreq.
+	 */
+	origdata = r->data;
+	origdlen = r->dlen;
+
+	assert(r->unit->secsize >= Minsect &&
+		r->unit->secsize <= ((Ctlr *)r->unit->dev->ctlr)->pgsz);
+	iostat = issueios(r);
+
+	r->rlen = (uchar *)r->data - origdata;
+	r->data = origdata;
+	r->dlen = origdlen;
+	r->status = SDok;
+	if (iostat != 0) {
+		r->status = SDeio;
+		/* 3, 0xc, 2: write error, reallocation failed */
+		sdsetsense(r, SDcheck, 3, 0xc, 2);
+	}
+	return r->status;
+}
+
+static int
+nvmerctl(SDunit* unit, char* p, int l)
+{
+	int n;
+	Ctlr *ctlr;
+	Regs *regs;
+
+	if((ctlr = unit->dev->ctlr) == nil)
+		return 0;
+	regs = ctlr->regs;
+	n = snprint(p, l, "config %#lux capabilities %#llux status %#lux\n",
+		regs->cc, regs->cap, regs->csts);
+	/*
+	 * devsd has already generated "inquiry" line using the model,
+	 * so printing ctlr->model here would be redundant.
+	 */
+	n += snprint(p+n, l-n, "serial %s\n", ctlr->serial);
+	if(unit->sectors)
+		n += snprint(p+n, l-n, "geometry %lld %lud\n",
+			unit->sectors, unit->secsize);
 	return n;
 }
 
-static int
-nvmeverify(SDunit *u)
+static uvlong
+nonzerocnt(Ctlr *ctlr, int rdwr)
 {
-	Ctlr *ctlr = u->dev->ctlr;
+	uvlong count;
 
-	if(u->subno >= ctlr->nnsid)
-		return 0;
-	sdaddfile(u, "smart", 0440, eve, readsmart, nil);
-	return 1;
+	count = ctlr->count[rdwr];
+	return count? count: 1;			/* don't divide by zero */
 }
 
-static int
-nvmeonline(SDunit *u)
+/*
+ * must emit exactly one line per controller (sd(3)).
+ *
+ * on a busy fossil, the output was:
+ *	sdo nvme [⋯]: max q lens: rd 2/32 wr 2/32; avg µs: rd 24 wr 10
+ *
+ *	; grep sdo /dev/irqalloc 
+ *	 97  11   19489834 msi sdo (nvme) cpu2 lapic 4
+ *
+ * which suggests that more than one item per queue is rare,
+ * thus one gets most of the benefit we see from a queue depth of 1,
+ * at least with page size of 4K and block size of 8K.
+ */
+static char *
+nvmertopctl(SDev *sdev, char *p, char *e)
 {
-	u32int *e, lbaf;
-	uchar *info, *p;
-	Ctlr *ctlr;
-	WS ws;
-
-	if(u->sectors != 0)
-		return 1;
-
-	ctlr = u->dev->ctlr;
-	if((info = mallocalign(0x1000, ctlr->mps, 0, 0)) == nil)
-		return 0;
-
-	e = qcmd(&ws, ctlr, 1, 0x06, ctlr->nsid[u->subno], info, 0x1000);
-	e[10] = 0; // identify namespace
-	if(wcmd(&ws, e) != 0){
-		free(info);
-		return 0;
-	}
-	dmaflush(0, info, 0x1000);
-	u->sectors = get64(info);
-	p = &info[128 + 4*(info[26]&15)];
-	lbaf = p[0] | p[1]<<8 | p[2]<<16 | p[3]<<24;
-	u->secsize = 1<<((lbaf>>16)&0xFF);
-	free(info);
-
-	memset(u->inquiry, 0, sizeof u->inquiry);
-	u->inquiry[2] = 2;
-	u->inquiry[3] = 2;
-	u->inquiry[4] = sizeof u->inquiry - 4;
-	memmove(u->inquiry+8, ctlr->ident+24, 20);
-
-	return 2;
-}
-
-static char*
-nvmerctl(SDunit *u, char *p, char *e)
-{
+	uvlong rdcnt, wrcnt;
 	Ctlr *ctlr;
 
-	if((ctlr = u->dev->ctlr) == nil || ctlr->ident == nil)
-		return p;
-
-	p = seprint(p, e, "model\t%.40s\n", (char*)ctlr->ident+24);
-	p = seprint(p, e, "serial\t%.20s\n", (char*)ctlr->ident+4);
-	p = seprint(p, e, "firm\t%.8s\n", (char*)ctlr->ident+64);
-	p = seprint(p, e, "geometry %llud %lud\n", u->sectors, u->secsize);
-
-	return p;
-}
-
-static void*
-cqalloc(Ctlr *ctlr, CQ *cq, u32int lgsize)
-{
-	cq->ctlr = ctlr;
-	cq->head = 0;
-	cq->shift = lgsize-4;
-	cq->mask = (1<<cq->shift)-1;
-	if((cq->base = mallocalign(1<<lgsize, ctlr->mps, 0, 0)) == nil)
-		error(Enomem);
-	memset(cq->base, 0, 1<<lgsize);
-	return cq->base;
-}
-
-static void*
-sqalloc(Ctlr *ctlr, SQ *sq, u32int lgsize)
-{
-	sq->ctlr = ctlr;
-	sq->tail = 0;
-	sq->shift = lgsize-6;
-	sq->mask = (1<<sq->shift)-1;
-	if((sq->base = mallocalign(1<<lgsize, ctlr->mps, 0, 0)) == nil)
-		error(Enomem);
-	if((sq->wait = mallocz(sizeof(WS*)*(sq->mask+1), 1)) == nil)
-		error(Enomem);
-	memset(sq->base, 0, 1<<lgsize);
-	return sq->base;
+	ctlr = sdev->ctlr;
+	rdcnt = nonzerocnt(ctlr, Read);
+	wrcnt = nonzerocnt(ctlr, Write);
+	return seprint(p, e, "sd%c nvme regs %#p irq %d: max q lens: rd %d/%d "
+		"wr %d/%d; avg µs: rd %lld wr %lld implaus %lld %lld\n",
+		sdev->idno, ctlr->port, ctlr->irq,
+		ctlr->maxqlen[Read], ctlr->sqlen,
+		ctlr->maxqlen[Write], ctlr->sqlen,
+		ctlr->totus[Read] / rdcnt, ctlr->totus[Write] / wrcnt,
+		ctlr->implaus[Read], ctlr->implaus[Write]);
 }
 
 static void
-setupqueues(Ctlr *ctlr)
+reset(Regs *regs)
 {
-	u32int mqes, lgcqsize, lgsqsize, nsq, st, *e;
-	CQ *cq;
-	SQ *sq;
-	WS ws;
-	int i;
-
-	mqes = 1 + (ctlr->cap & 0xFFFF);
-	if(mqes < 2)
-		mqes = 2;
-	for(lgsqsize = 0; 1<<lgsqsize < mqes; lgsqsize++)
-		;
-	if(lgsqsize > 12-6)
-		lgsqsize = 12-6;
-	nsq = conf.nmach;
-	while((lgcqsize = lgsqsize) > 0){
-		while(nsq >= 1<<lgcqsize)
-			nsq >>= 1;
-		while(1<<lgcqsize < nsq<<lgsqsize)
-			lgcqsize++;
-		if(1<<lgcqsize <= mqes)
-			break;
-		lgsqsize--;
+	if (regs->cc & Enable) {
+		if (awaitbitpat(&regs->csts, Rdy, Rdy) < 0)
+			print("nvme reset timed out awaiting ready\n");
+		regs->cc &= ~Enable;
+		coherence();
 	}
-	lgsqsize += 6;
-	lgcqsize += 4;
-
-	/* CQID1: shared completion queue */
-	cq = &ctlr->cq[1];
-	cqalloc(ctlr, cq, lgcqsize);
-	e = qcmd(&ws, ctlr, 1, 0x05, 0, cq->base, 1<<lgcqsize);
-	e[10] = (cq - ctlr->cq) | cq->mask<<16;
-	e[11] = 3; /* IEN | PC */
-	checkstatus(wcmd(&ws, e), "create completion queue");
-
-	st = 0;
-
-	/* SQID[1..nmach]: submission queue per cpu */
-	for(i=1; i<=nsq; i++){
-		sq = &ctlr->sq[i];
-		sqalloc(ctlr, sq, lgsqsize);
-		e = qcmd(&ws, ctlr, 1, 0x01, 0, sq->base, 1<<lgsqsize);
-		e[10] = i | sq->mask<<16;
-		e[11] = (cq - ctlr->cq)<<16 | 1;	/* CQID<<16 | PC */
-		st = wcmd(&ws, e);
-		if(st != 0){
-			free(sq->base);
-			free(sq->wait);
-			memset(sq, 0, sizeof(*sq));
-			break;
-		}
-	}
-	
-	ctlr->nsq = i - 1;
-	if(ctlr->nsq < 1)
-		checkstatus(st, "create submission queues");
-
-	ilock(&ctlr->intr);
-	ctlr->ints |= 1<<(cq - ctlr->cq);
-	ctlr->reg[IntMc] = ctlr->ints;
-	iunlock(&ctlr->intr);
+	/* else may have previously cleared Enable & be waiting for not ready */
+	if (awaitbitpat(&regs->csts, Rdy, 0) < 0)
+		print("nvme reset timed out awaiting not ready\n");
 }
 
 static void
-identify(Ctlr *ctlr)
+nvmedrive(SDunit *unit)
 {
-	u32int *e;
-	WS ws;
-	
-	if(ctlr->ident == nil)
-		if((ctlr->ident = mallocalign(0x1000, ctlr->mps, 0, 0)) == nil)
-			error(Enomem);
-	if(ctlr->nsid == nil)
-		if((ctlr->nsid = mallocalign(0x1000, ctlr->mps, 0, 0)) == nil)
-			error(Enomem);
-
-	e = qcmd(&ws, ctlr, 1, 0x06, 0, ctlr->ident, 0x1000);
-	e[10] = 1; // identify controller
-	checkstatus(wcmd(&ws, e), "identify controller");
-	dmaflush(0, ctlr->ident, 0x1000);
-
-	e = qcmd(&ws, ctlr, 1, 0x06, 0, ctlr->nsid, 0x1000);
-	e[10] = 2; // namespace list 
-	if(wcmd(&ws, e) == 0) {
-		dmaflush(0, ctlr->nsid, 0x1000);
-	} else
-		ctlr->nsid[0] = 1;	/* assume namespace #1 */
-
-	ctlr->nnsid = 0;
-	while(ctlr->nnsid < 1024 && ctlr->nsid[ctlr->nnsid] != 0)
-		ctlr->nnsid++;
-}
-
-static int
-nvmedisable(SDev *sd)
-{
-	char name[32];
+	uchar *p;
 	Ctlr *ctlr;
-	int i;
 
-	ctlr = sd->ctlr;
+	unit->sense[0] = 0x70;
+	unit->sense[7] = sizeof(unit->sense)-7;
 
-	/* mask interrupts */
-	ilock(&ctlr->intr);
-	ctlr->ints = 0;
-	ctlr->reg[IntMs] = ~ctlr->ints;
-	iunlock(&ctlr->intr);
+	memset(unit->inquiry, 0, sizeof unit->inquiry);
+	unit->inquiry[0] = SDperdisk;
+	unit->inquiry[2] = 2;
+	unit->inquiry[3] = 2;
+	unit->inquiry[4] = sizeof unit->inquiry - 4;
+	p = &unit->inquiry[8];
+	ctlr = unit->dev->ctlr;
+	/* model is smaller than unit->inquiry-8 */
+	strncpy((char *)p, ctlr->model, sizeof ctlr->model);
 
-	/* notify normal power off */
-	ctlr->reg[CCfg] = (ctlr->reg[CCfg] & ~(3<<14)) | 1<<14;
-	for(i = 0; i < 3000; i++){
-		if((ctlr->reg[CSts] & 0xc) == 0x8)
-			break;
-		delay(1);
-	}
-
-	/* disable controller */
-	ctlr->reg[CCfg] = 0;
-	for(i = 0; i < 1000; i++){
-		if((ctlr->reg[CSts] & 1) == 0)
-			break;
-		delay(1);
-	}
-
-	snprint(name, sizeof(name), "%s (%s)", sd->name, sd->ifc->name);
-	intrdisable(ctlr->pci->intl, nvmeintr, ctlr, ctlr->pci->tbdf, name);
-
-	pciclrbme(ctlr->pci);	/* dma disable */
-
-	for(i=0; i<nelem(ctlr->sq); i++){
-		free(ctlr->sq[i].base);
-		free(ctlr->sq[i].wait);
-	}
-	for(i=0; i<nelem(ctlr->cq); i++)
-		free(ctlr->cq[i].base);
-
-	memset(ctlr->sq, 0, sizeof(ctlr->sq));
-	memset(ctlr->cq, 0, sizeof(ctlr->cq));
-
-	free(ctlr->ident);
-	ctlr->ident = nil;
-	free(ctlr->nsid);
-	ctlr->nsid = nil;
-	ctlr->nnsid = 0;
-
-	return 1;
+	unit->secsize = ctlr->secsize;
+	unit->sectors = ctlr->sectors;
+	print("sd%C%d: nvme %,lld sectors: %s fw %s serial %s\n",
+		unit->dev->idno, unit->subno, unit->sectors,
+		ctlr->model, ctlr->fw, ctlr->serial);
 }
 
-static int
-nvmeenable(SDev *sd)
+static void
+pickpgsz(Ctlr *ctlr)
 {
-	char name[32];
+	ulong minpgsz, maxpgsz;
+
+	minpgsz = 1 << (12 + ((ctlr->regs->cap >> 48) & MASK(4)));
+	maxpgsz = 1 << (12 + ((ctlr->regs->cap >> 52) & MASK(4)));
+	ctlr->minpgsz = minpgsz;		/* for Ctlrid->mdts */
+	ctlr->pgsz = MIN(Startpgsz, maxpgsz);
+	if (ctlr->pgsz < minpgsz)
+		ctlr->pgsz = minpgsz;
+	if (Sdalign >= 4*KB && ctlr->pgsz > Sdalign)
+		ctlr->pgsz = Sdalign;
+	if (ctlr->pgsz < 4*KB)			/* sanity */
+		ctlr->pgsz = 4*KB;
+}
+
+static void
+pickqlens(Ctlr *ctlr)
+{
+	ulong mqes;
+
+	mqes = (ctlr->regs->cap & MASK(16)) + 1;  /* max i/o [sc] q len */
+	ctlr->sqlen = MIN(mqes, Qlen);
+	ctlr->cqlen = MIN(mqes, Cqlen);
+}
+
+static SDev*
+nvmeprobe(Pcidev *p)
+{
+	int logstride;
+	uintptr port;
 	Ctlr *ctlr;
-	u64int pa;
-	int to;
+	Regs *regs;
+	SDev *sdev;
+	static int count;
 
-	ctlr = sd->ctlr;
-
-	snprint(name, sizeof(name), "%s (%s)", sd->name, sd->ifc->name);
-	intrenable(ctlr->pci->intl, nvmeintr, ctlr, ctlr->pci->tbdf, name);
-
-	if(waserror()){
-		print("%s: %s\n", name, up->errstr);
-		nvmedisable(sd);
-		sd->nunit = 0;	/* hack: prevent further probing */
-		return 0;
+	assert(p->mem[1].bar == 0);	/* upper 32 bits of 64-bit addr */
+	port = p->mem[0].bar & ~0x0f;
+	regs = vmap(port, p->mem[0].size);
+	if(regs == nil){
+		print("nvmeprobe: phys address %#p in use did=%#ux\n",
+			port, p->did);
+		return nil;
 	}
-	
-	pa = PCIWADDR(cqalloc(ctlr, &ctlr->cq[0], ctlr->mpsshift));
-	dmaflush(1, ctlr->cq[0].base, 1<<ctlr->mpsshift);
-	ctlr->reg[ACQBase0] = pa;
-	ctlr->reg[ACQBase1] = pa>>32;
 
-	pa = PCIWADDR(sqalloc(ctlr, &ctlr->sq[0], ctlr->mpsshift));
-	dmaflush(1, ctlr->sq[0].base, 1<<ctlr->mpsshift);
-	ctlr->reg[ASQBase0] = pa;
-	ctlr->reg[ASQBase1] = pa>>32;
-
-	ctlr->reg[AQAttr] = ctlr->sq[0].mask | ctlr->cq[0].mask<<16;
-
-	/* dma enable */
-	pcisetbme(ctlr->pci);
-
-	/* enable interrupt */
-	ilock(&ctlr->intr);
-	ctlr->ints = 1;
-	ctlr->reg[IntMc] = ctlr->ints;
-	iunlock(&ctlr->intr);
-
-	/* enable controller */
-	ctlr->reg[CCfg] = 1 | (ctlr->mpsshift-12)<<7 | 6<<16 | 4<<20;
-
-	for(to = (ctlr->cap>>24) & 255; to >= 0; to--){
-		tsleep(&up->sleep, return0, nil, 500);
-		if((ctlr->reg[CSts] & 3) == 1)
-			goto Ready;
+	if ((ctlr = malloc(sizeof(Ctlr))) == nil ||
+	    (sdev = malloc(sizeof(SDev))) == nil) {
+		free(ctlr);
+		vunmap(regs, p->mem[0].size);
+		return nil;
 	}
-	if(ctlr->reg[CSts] & 2)
-		error("fatal controller status during initialization");
-	error("controller initialization timeout");
-Ready:
-	identify(ctlr);
-	setupqueues(ctlr);
-	print("%s: using %d submit queues\n", name, ctlr->nsq);
-	poperror();
+	ctlr->regs = regs;
+	ctlr->port = port;
+	ctlr->irq = p->intl;
+	/*
+	 * Attempt to hard-reset the board.
+	 */
+	reset(regs);
+	logstride = ((regs->cap >> 32) & MASK(4));	/* doorbell stride */
+	if (logstride != 0)
+		panic("nvmeprobe: doorbell stride must be 0 (for now), not %d",
+			logstride);
+	ctlr->stride = 1 << (2 + logstride);	/* 2^(2+logstride) */
+	if (0 && regs->cap & Nssrs) {		/* nvm subsys reset avail.? */
+		regs->cc |= Nssro;		/* clear Nssro by setting it */
+		regs->nssrc = 'N'<<24 | 'V'<<16 | 'M'<<8 | 'e';
+		if (awaitbitpat(&regs->csts, Nssro, Nssro) < 0)
+			print("nvme subsys reset timed out awaiting Nssro\n");
+	}
 
-	return 1;
+	pickpgsz(ctlr);
+	pickqlens(ctlr);
+	/* we haven't chosen a namespace yet, so we don't know sector size */
+
+	sdev->ifc = &sdnvmeifc;
+	sdev->idno = 'n';	/* actually assigned in sdadddevs() */
+	sdev->nunit = NCtlrdrv;	/* max. drives (can be number found) */
+	sdev->ctlr = ctlr;		/* cross link */
+	ctlr->sdev = sdev;
+
+	/*
+	 * we (pnp) don't have a `spec' argument, so
+	 * we'll assume that sdn0 goes to the first nvme host
+	 * adapter found, sdo0 to the next, etc.
+	 */
+	print("#S/sd%c: nvme %ld.%ld.%ld: irq %d regs %#p page size %d\n",
+		sdev->idno + count++, regs->vs>>16, (regs->vs>>8) & MASK(8),
+		regs->vs & MASK(8), ctlr->irq, ctlr->port, ctlr->pgsz);
+
+	/* would probe for drives here if there could be more than one. */
+	/* upon return, this many sdev->units will be allocated. */
+	sdev->nunit = 1;
+	return sdev;
 }
 
-static Ctlr*
-nvmepnpctlrs(void)
+static void
+sdevadd(SDev *sdev, SDev **head, SDev **tail)
 {
-	Ctlr *ctlr, *h, *t;
-	Pcidev *p;
-	int i;
-
-	h = t = nil;
-	for(p = nil; p = pcimatch(p, 0, 0);){
-		if(p->ccrb != 1 || p->ccru != 8 || p->ccrp != 2)
-			continue;
-		if(p->mem[0].size == 0 || (p->mem[0].bar & 1) != 0)
-			continue;
-		if((ctlr = malloc(sizeof(*ctlr))) == nil){
-			print("nvme: no memory for Ctlr\n");
-			break;
-		}
-		pcienable(p);
-		ctlr->pci = p;
-		ctlr->reg = vmap(p->mem[0].bar & ~0xF, p->mem[0].size);
-		if(ctlr->reg == nil){
-			print("nvme: can't vmap bar0\n");
-		Bad:
-			if(ctlr->reg != nil)
-				vunmap(ctlr->reg, p->mem[0].size);
-			pcidisable(p);
-			free(ctlr);
-			continue;
-		}
-		ctlr->cap = ctlr->reg[Cap0];
-		ctlr->cap |= (u64int)ctlr->reg[Cap1]<<32;
-
-		/* mask interrupts */
-		ctlr->ints = 0;
-		ctlr->reg[IntMs] = ~ctlr->ints;
-
-		/* disable controller */
-		ctlr->reg[CCfg] = 0;
-
-		if((ctlr->cap&(1ULL<<37)) == 0){
-			print("nvme: doesnt support NVM commactlr set: %ux\n",
-				(u32int)(ctlr->cap>>37) & 0xFF);
-			goto Bad;
-		}
-
-		/* use 64K page size when possible */
-		ctlr->dstrd = (ctlr->cap >> 32) & 15;
-		for(i = (ctlr->cap >> 48) & 15; i < ((ctlr->cap >> 52) & 15); i++){
-			if(i >= 16-12)	/* 64K */
-				break;
-		}
-		ctlr->mpsshift = i+12;
-		ctlr->mps = 1 << ctlr->mpsshift;
-
-		if(h == nil)
-			h = ctlr;
-		else
-			t->next = ctlr;
-		t = ctlr;
-	}
-
-	return h;
+	if(*head != nil)
+		(*tail)->next = sdev;
+	else
+		*head = sdev;
+	*tail = sdev;
 }
 
-SDifc sdnvmeifc;
-
+/*
+ * find all nvme controllers
+ */
 static SDev*
 nvmepnp(void)
 {
-	SDev *s, *h, *t;
 	Ctlr *ctlr;
-	int id;
+	Pcidev *p;
+	SDev *sdev, *head, *tail;
 
-	h = t = nil;
-
-	id = 'N';
-	for(ctlr = nvmepnpctlrs(); ctlr != nil; ctlr = ctlr->next){
-		if((s = malloc(sizeof(*s))) == nil)
-			break;
-		s->ctlr = ctlr;
-		s->idno = id++;
-		s->ifc = &sdnvmeifc;
-		s->nunit = 1024;
-		if(h)
-			t->next = s;
+	p = nil;
+	head = tail = nil;
+	while(p = pcimatch(p, 0, 0)){
+		/* ccrp 2 is NVME */
+		if(p->ccrb != Pcibcstore || p->ccru != Pciscnvm || p->ccrp != 2)
+			continue;
+		if((sdev = nvmeprobe(p)) == nil)
+			continue;
+		ctlr = sdev->ctlr;
+		ctlr->pcidev = p;
+		sdevadd(sdev, &head, &tail);
+		if (nctlrs >= NCtlr)
+			print("too many nvme controllers\n");
 		else
-			h = s;
-		t = s;
+			ctlrs[nctlrs++] = ctlr;
+	}
+	return head;
+}
+
+static void
+allocqpair(Ctlr *ctlr, Qpair *qp)
+{
+	assert(ctlr->pgsz);
+	qp->sqlen = ctlr->sqlen;
+	qp->cqlen = ctlr->cqlen;
+	qp->q    = mallocalign(qp->sqlen * sizeof *qp->q,    ctlr->pgsz, 0, 0);
+	qp->cmpl = mallocalign(qp->cqlen * sizeof *qp->cmpl, ctlr->pgsz, 0, 0);
+	if (qp->q == nil || qp->cmpl == nil)
+		panic("nvmectlrenable: out of memory for queues");
+	qp->writelast = Read;
+}
+
+static void
+configure(Ctlr *ctlr, Qpair *qpadm)
+{
+	Regs *regs = ctlr->regs;
+
+	regs->aqa = (ctlr->cqlen - 1)<<16 | (ctlr->sqlen - 1);
+	regs->asq = PCIWADDR((void *)qpadm->q);
+	regs->acq = PCIWADDR((void *)qpadm->cmpl);
+	regs->cc = log2(sizeof(Completion))<<20 | log2(sizeof(Cmd))<<16 |
+		(log2(ctlr->pgsz)-12) << 7 | Cssnvm;
+	coherence();
+}
+
+static void
+enable(Regs *regs)
+{
+	if (!(regs->cc & Enable)) {
+		if (awaitbitpat(&regs->csts, Rdy, 0) < 0)
+			print("nvme enable timed out awaiting not ready\n");
+		regs->cc |= Enable;
+		coherence();
+	}
+	/* else may have previously set Enable & be waiting for ready */
+	if (awaitbitpat(&regs->csts, Rdy, Rdy) < 0)
+		print("nvme enable timed out awaiting ready\n");
+}
+
+/*
+ * ns numbers start at 1 and are densely-packed.
+ * pick one with 512-byte blocks, return preferred lbafmt via *lbafmtp.
+ */
+static int
+bestns(Ctlr *ctlr, int nns, Nsid *nsid, int *lbafmtp)
+{
+	int i, ns, second, nssecond, lbasize;
+	Lbafmt *lbafmt;
+
+	second = 0;
+	nssecond = 0;
+	*lbafmtp = 0;
+	for (ns = 1; ns <= nns; ns++) {
+		if (nvmeadmissue(ctlr, Admid, ns, nsid) != 0)
+			panic("nvmectlrenable: Admid(%d) failed", ns);
+		for (i = 0; i < nelem(nsid->lbafmt); i++) {
+			lbafmt = &nsid->lbafmt[i];
+			if (lbafmt->lglbasize == 0)	/* end lbafmt list? */
+				break;
+			lbasize = 1 << lbafmt->lglbasize;
+			if (Debugns)
+				print("nvme ns %d: lba %d mdsize %d perf %d\n",
+					ns, lbasize, lbafmt->mdsize,
+					lbafmt->relperf & 3);
+			if (lbafmt->mdsize == 0 && lbasize == Minsect) {
+				*lbafmtp = i;
+				return ns;
+			}
+			/* settle for 4k if that's all there is */
+			if (lbafmt->mdsize == 0 && lbasize == 4096) {
+				second = i;
+				nssecond = ns;
+			}
+		}
+	}
+	if (nssecond)
+		*lbafmtp = second;
+	return second;
+}
+
+/*
+ * copy id string from controller, trim trailing blanks, downcase.
+ * assumes src is unterminated and dest is at least one byte larger.
+ */
+static void
+idcopy(char *dest, char *src, int size)
+{
+	char *p, *pend;
+
+	memmove(dest, src, size);
+	pend = &dest[size];
+	*pend-- = '\0';
+	for (p = pend; p > dest && *p == ' '; p--)
+		*p = '\0';
+	for (p = dest; p <= pend && *p != '\0'; p++)
+		*p = tolower(*p);
+}
+
+static void
+nvmeintron(SDev *sdev)
+{
+	char name[32];
+	Ctlr *ctlr;
+
+	ctlr = sdev->ctlr;
+	snprint(name, sizeof(name), "sd%c (%s)", sdev->idno, sdev->ifc->name);
+	enableintr(ctlr, nvmeinterrupt, ctlr, name);
+	ctlr->regs->intmset = ~0;	/* mask all interrupt sources */
+}
+
+static void
+zeroqhdtls(Qpair *qp)
+{
+	qp->cidx.hd = qp->qidx.tl = 0;
+	qp->cidx.tl = qp->qidx.hd = 0;	/* paranoia */
+	coherence();
+}
+
+static int
+nvmectlrenable(Ctlr* ctlr)
+{
+	int i, nns, gotns;
+	char *idpage;
+	Ctlrid *ctlrid;
+	Lbafmt *lbafmt;
+	Nsid *nsid;
+	Qpair *qpadm, *qpio;
+	Regs *regs = ctlr->regs;
+	SDev *sdev = ctlr->sdev;
+
+	/* we need at least one admin queue and one i/o queue */
+	qpadm = &ctlr->qpair[Qadmin];
+	allocqpair(ctlr, qpadm);
+	qpio = &ctlr->qpair[Qio];
+	allocqpair(ctlr, qpio);
+
+	assert(!(regs->cc & Enable));
+	configure(ctlr, qpadm);	/* must do this while ctlr is disabled */
+	enable(regs);
+	zeroqhdtls(qpadm);		/* paranoia */
+
+	regs->intmset = ~0;		/* mask all interrupt sources */
+	nvmeintron(sdev);
+
+	idpage = mallocalign(BY2PG, ctlr->pgsz, 0, 0);
+	if (idpage == nil)
+		panic("nvmectlrenable: out of memory");
+	if (nvmeadmissue(ctlr, Admid, Nsall, idpage) != 0)
+		panic("nvmectlrenable: Admid(Nsall) failed");
+	ctlrid = (Ctlrid *)idpage;
+	nns = ctlrid->nns;
+
+	/* smuggle hw id strings into ctlr for later printing */
+	idcopy(ctlr->serial, ctlrid->serial, sizeof ctlrid->serial);
+	idcopy(ctlr->model, ctlrid->model, sizeof ctlrid->model);
+	idcopy(ctlr->fw, ctlrid->fw, sizeof ctlrid->fw);
+	if (ctlrid->mdts)
+		ctlr->mdts = 1 << ctlrid->mdts;
+//	iprint("nvme: max xfr size %d\n", ctlr->mdts * ctlr->minpgsz);
+
+	/*
+	 * create first i/o queue with admin queue cmds.
+	 * completion queue must be created first.
+	 */
+	if (nvmeadmissue(ctlr, Admmkiocq, Nsunused, qpio->cmpl) != 0)
+		panic("nvmectlrenable: Admmkiocq failed");
+	if (nvmeadmissue(ctlr, Admmkiosq, Nsunused, qpio->q) != 0)
+		panic("nvmectlrenable: Admmkiosq failed");
+	zeroqhdtls(qpio);		/* paranoia */
+
+	/* find a suitable namespace */
+	nsid = (Nsid *)idpage;
+	gotns = bestns(ctlr, nns, nsid, &i);	/* fills in nsid page */
+	if (gotns == 0)
+		panic("nvmectlrenable: no suitable namespace found");
+	lbafmt = &nsid->lbafmt[i];
+	ctlr->secsize = 1 << lbafmt->lglbasize;	/* remember for SDunit */
+	ctlr->sectors = nsid->cap;		/* remember for SDunit */
+	ctlr->ns = gotns;
+	free(idpage);
+	if (Debugns)
+		print("nvme best ns: %d: sectors %,lld of %d bytes\n",
+			ctlr->ns, ctlr->sectors, ctlr->secsize);
+	return 1;
+}
+
+static void
+freeqpair(Qpair *qp)
+{
+	free(qp->q);
+	free(qp->cmpl);
+	qp->q = nil;
+	qp->cmpl = nil;
+}
+
+static void
+ckstuck(void)
+{
+	int i;
+	static int whined;
+
+	for (i = 0; i < nctlrs; i++)
+		nvmeinterrupt(nil, ctlrs[i]);
+	if (iosttck && sys->ticks - iosttck > 5*HZ && ++whined < 5)
+		iprint("nvme: stuck for 5 s.\n");
+}
+
+/*
+ * activate a single nvme controller, sdev.
+ * upon return, sdev->nunit SDunits will be allocated.
+ */
+static int
+nvmeenable(SDev* sdev)
+{
+	Ctlr *ctlr;
+
+	ctlr = sdev->ctlr;
+	if(ctlr->qpair[Qadmin].q)
+		return 0;
+
+	pcisetbme(ctlr->pcidev);
+	if(!nvmectlrenable(ctlr)) {
+		freeqpair(&ctlr->qpair[Qadmin]);
+		freeqpair(&ctlr->qpair[Qio]);
+		return 0;
 	}
 
-	return h;
+	/* watch for hardware bugs */
+	lock(&clocklck);
+	if (!clockrunning) {
+		addclock0link(ckstuck, 1000);
+		clockrunning = 1;
+	}
+	unlock(&clocklck);
+	return 1;
+}
+
+static void
+nvmeintroff(SDev *sdev)
+{
+	char name[32];
+	Ctlr *ctlr;
+
+	ctlr = sdev->ctlr;
+	ctlr->regs->intmset = ~0;		/* mask all interrupt sources */
+
+	snprint(name, sizeof(name), "sd%c (%s)", sdev->idno, sdev->ifc->name);
+	disableintr(ctlr, nvmeinterrupt, ctlr, name);
+}
+
+/*
+ * returns when all in-flight transfers are done.
+ * call with shutlock & issuelock held.
+ */
+static void
+waitnoxfrs(Ctlr *ctlr)
+{
+	int i;
+
+	for (i = 1000; i-- > 0 && ctlr->inflight > 0; ) {
+		iunlock(&ctlr->shutlock);
+		iunlock(&ctlr->issuelock);
+		delay(1);
+		ilock(&ctlr->issuelock);
+		ilock(&ctlr->shutlock);
+	}
+	if (i <= 0)
+		iprint("sdnvme: %d transfers still in flight after 1 s.\n",
+			ctlr->inflight);
+}
+
+static int
+nvmedisable(SDev* sdev)			/* disable interrupts for this sdev */
+{
+	Ctlr *ctlr;
+
+	ctlr = sdev->ctlr;
+	if (ctlr == nil)
+		return 1;
+	nvmeissue(ctlr, &ctlr->qpair[Qio], nil, Cmdflush, Nsall, nil, 0);
+
+	ilock(&ctlr->issuelock);
+	ilock(&ctlr->shutlock);
+
+	waitnoxfrs(ctlr);
+	nvmeintroff(sdev);
+	pciclrbme(ctlr->pcidev);
+
+	iunlock(&ctlr->shutlock);
+	iunlock(&ctlr->issuelock);
+	return 1;
+}
+
+static void
+nvmeclear(SDev* sdev)			/* clear the interface for this sdev */
+{
+	Ctlr *ctlr;
+
+	ctlr = sdev->ctlr;
+	if (ctlr == nil)
+		return;
+	ilock(&ctlr->issuelock);
+	ilock(&ctlr->shutlock);
+	if (ctlr->regs) {
+		waitnoxfrs(ctlr);
+		reset(ctlr->regs);	/* ctlrs and drives are one-to-one */
+	}
+	iunlock(&ctlr->shutlock);
+	iunlock(&ctlr->issuelock);
+}
+
+/*
+ * see if a particular drive exists.
+ * must not set unit->sectors here, but rather in nvmeonline.
+ */
+static int
+nvmeverify(SDunit *unit)
+{
+	if (unit->subno != 0)
+		return 0;
+	return 1;
+}
+
+/*
+ * initialise a drive known to exist.
+ * returns boolean for success.
+ */
+static int
+nvmeonline(SDunit *unit)
+{
+	int r;
+
+	if (unit->subno != 0)		/* not me? */
+		return 0;
+	if (unit->sectors)		/* already inited? */
+		return 1;
+	r = scsionline(unit);
+	if(r == 0)
+		return r;
+	nvmedrive(unit);
+	/*
+	 * could hang around until disks are spun up and thus available as
+	 * nvram, dos file systems, etc.  you wouldn't expect it, but
+	 * the intel 330 sata ssd takes a while to `spin up'.
+	 */
+	return 1;			/* drive ready */
 }
 
 SDifc sdnvmeifc = {
 	"nvme",				/* name */
 
 	nvmepnp,			/* pnp */
+	nil,				/* legacy */
 	nvmeenable,			/* enable */
 	nvmedisable,			/* disable */
 
@@ -794,9 +1503,9 @@ SDifc sdnvmeifc = {
 	nvmerctl,			/* rctl */
 	nil,				/* wctl */
 
-	nvmebio,			/* bio */
+	scsibio,			/* bio */
 	nil,				/* probe */
-	nil,				/* clear */
-	nil,				/* rtopctl */
+	nvmeclear,			/* clear */
+	nvmertopctl,			/* rtopctl */
 	nil,				/* wtopctl */
 };

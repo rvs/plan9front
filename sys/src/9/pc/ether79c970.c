@@ -10,10 +10,10 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 #include "../port/netif.h"
-#include "../port/etherif.h"
+
+#include "etherif.h"
 
 enum {
 	Lognrdre	= 6,
@@ -83,9 +83,8 @@ struct Dre {			/* descriptor ring entry */
 	ulong	addr;
 	ulong	md1;			/* status|bcnt */
 	ulong	md2;			/* rcc|rpc|mcnt */
-	ulong	aux;
+	Block*	bp;
 };
-
 
 enum {					/* md1 */
 	Enp		= 0x01000000,	/* end of packet */
@@ -121,11 +120,9 @@ struct Ctlr {
 	int	init;			/* initialisation in progress */
 	Iblock	iblock;
 
-	Block**	rb;
 	Dre*	rdr;			/* receive descriptor ring */
 	int	rdrx;
 
-	Block**	tb;
 	Dre*	tdr;			/* transmit descriptor ring */
 	int	tdrh;			/* host index into tdr */
 	int	tdri;			/* interface index into tdr */
@@ -207,7 +204,9 @@ ifstat(Ether* ether, void* a, long n, ulong offset)
 	if(n == 0)
 		return 0;
 
-	p = smalloc(READSTR);
+	p = malloc(READSTR);
+	if(p == nil)
+		error(Enomem);
 	len = snprint(p, READSTR, "Rxbuff: %ld\n", ctlr->rxbuff);
 	len += snprint(p+len, READSTR-len, "Crc: %ld\n", ctlr->crc);
 	len += snprint(p+len, READSTR-len, "Oflo: %ld\n", ctlr->oflo);
@@ -230,9 +229,7 @@ ifstat(Ether* ether, void* a, long n, ulong offset)
 static void
 ringinit(Ctlr* ctlr)
 {
-	Block *bp;
 	Dre *dre;
-	int i;
 
 	/*
 	 * Initialise the receive and transmit buffer rings.
@@ -240,26 +237,19 @@ ringinit(Ctlr* ctlr)
 	 *
 	 * This routine is protected by ctlr->init.
 	 */
-	if(ctlr->rb == nil)
-		ctlr->rb = malloc(Nrdre*sizeof(Block*));
 	if(ctlr->rdr == 0){
 		ctlr->rdr = xspanalloc(Nrdre*sizeof(Dre), 0x10, 0);
-		for(i=0; i<Nrdre; i++){
-			bp = iallocb(Rbsize);
-			if(bp == nil)
-				panic("can't allocate ethernet receive ring");
-			ctlr->rb[i] = bp;
-			dre = &ctlr->rdr[i];
-			dre->addr = PADDR(bp->rp);
+		for(dre = ctlr->rdr; dre < &ctlr->rdr[Nrdre]; dre++){
+			dre->bp = iallocb(Rbsize);
+			if(dre->bp == nil)
+				panic("can't allocate ethernet receive ring\n");
+			dre->addr = PADDR(dre->bp->rp);
 			dre->md2 = 0;
 			dre->md1 = Own|(-Rbsize & 0xFFFF);
-			dre->aux = 0;
 		}
 	}
 	ctlr->rdrx = 0;
 
-	if(ctlr->tb == nil)
-		ctlr->tb = malloc(Ntdre*sizeof(Block*));
 	if(ctlr->tdr == 0)
 		ctlr->tdr = xspanalloc(Ntdre*sizeof(Dre), 0x10, 0);
 	memset(ctlr->tdr, 0, Ntdre*sizeof(Dre));
@@ -299,7 +289,7 @@ promiscuous(void* arg, int on)
 
 	ctlr->iow(ctlr, Rap, 15);
 	x = ctlr->ior(ctlr, Rdp) & ~Prom;
-	if(on || ether->nmaddr > 0)
+	if(on)
 		x |= Prom;
 	ctlr->iow(ctlr, Rdp, x);
 	ctlr->iow(ctlr, Rap, 0);
@@ -315,8 +305,19 @@ promiscuous(void* arg, int on)
 static void
 multicast(void* arg, uchar*, int)
 {
-	Ether *ether = arg;
-	promiscuous(arg, ether->prom);
+	promiscuous(arg, 1);
+}
+
+static void
+shutdown(Ether *ether)
+{
+	Ctlr *ctlr;
+
+	ctlr = ether->ctlr;
+	ilock(ctlr);
+	io32r(ctlr, Sreset);
+	io16r(ctlr, Sreset);
+	iunlock(ctlr);
 }
 
 static void
@@ -325,7 +326,6 @@ txstart(Ether* ether)
 	Ctlr *ctlr;
 	Block *bp;
 	Dre *dre;
-	int i;
 
 	ctlr = ether->ctlr;
 
@@ -344,11 +344,8 @@ txstart(Ether* ether)
 		 * There's no need to pad to ETHERMINTU
 		 * here as ApadXmt is set in CSR4.
 		 */
-		i = ctlr->tdrh;
-		if(ctlr->tb[i] != nil)
-			break;
-		dre = &ctlr->tdr[i];
-		ctlr->tb[i] = bp;
+		dre = &ctlr->tdr[ctlr->tdrh];
+		dre->bp = bp;
 		dre->addr = PADDR(bp->rp);
 		dre->md2 = 0;
 		dre->md1 = Own|Stp|Enp|(-BLEN(bp) & 0xFFFF);
@@ -369,14 +366,14 @@ transmit(Ether* ether)
 	iunlock(ctlr);
 }
 
-static void
+static int
 interrupt(Ureg*, void* arg)
 {
 	Ctlr *ctlr;
 	Ether *ether;
-	int csr0, len, i;
+	int csr0, len, loops;
 	Dre *dre;
-	Block *bp, *bb;
+	Block *bp;
 
 	ether = arg;
 	ctlr = ether->ctlr;
@@ -385,6 +382,7 @@ interrupt(Ureg*, void* arg)
 	 * Acknowledge all interrupts and whine about those that shouldn't
 	 * happen.
 	 */
+	loops = 0;
 intrloop:
 	csr0 = ctlr->ior(ctlr, Rdp) & 0xFFFF;
 	ctlr->iow(ctlr, Rdp, Babl|Cerr|Miss|Merr|Rint|Tint|Iena);
@@ -397,17 +395,16 @@ intrloop:
 	//if(csr0 & (Babl|Miss|Merr))
 	//	print("#l%d: csr0 = 0x%uX\n", ether->ctlrno, csr0);
 	if(!(csr0 & (Rint|Tint)))
-		return;
+		return loops > 0? Intrforme: Intrnotforme;
 
+	loops++;
 	/*
 	 * Receiver interrupt: run round the descriptor ring logging
 	 * errors and passing valid receive data up to the higher levels
 	 * until a descriptor is encountered still owned by the chip.
 	 */
 	if(csr0 & Rint){
-		ilock(ctlr);
-		i = ctlr->rdrx;
-		dre = &ctlr->rdr[i];
+		dre = &ctlr->rdr[ctlr->rdrx];
 		while(!(dre->md1 & Own)){
 			if(dre->md1 & RxErr){
 				if(dre->md1 & RxBuff)
@@ -420,13 +417,10 @@ intrloop:
 					ctlr->fram++;
 			}
 			else if(bp = iallocb(Rbsize)){
-				bb = ctlr->rb[i];
-				ctlr->rb[i] = bp;
-				if(bb != nil){
-					len = (dre->md2 & 0x0FFF)-4;
-					bb->wp = bb->rp+len;
-					etheriq(ether, bb);
-				}
+				len = (dre->md2 & 0x0FFF)-4;
+				dre->bp->wp = dre->bp->rp+len;
+				etheriq(ether, dre->bp, 1);
+				dre->bp = bp;
 				dre->addr = PADDR(bp->rp);
 			}
 
@@ -437,20 +431,18 @@ intrloop:
 			dre->md2 = 0;
 			dre->md1 = Own|(-Rbsize & 0xFFFF);
 
-			i = ctlr->rdrx = NEXT(ctlr->rdrx, Nrdre);
-			dre = &ctlr->rdr[i];
+			ctlr->rdrx = NEXT(ctlr->rdrx, Nrdre);
+			dre = &ctlr->rdr[ctlr->rdrx];
 		}
-		iunlock(ctlr);
 	}
 
 	/*
 	 * Transmitter interrupt: wakeup anyone waiting for a free descriptor.
 	 */
 	if(csr0 & Tint){
-		ilock(ctlr);
+		lock(ctlr);
 		while(ctlr->ntq){
-			i = ctlr->tdri;
-			dre = &ctlr->tdr[i];
+			dre = &ctlr->tdr[ctlr->tdri];
 			if(dre->md1 & Own)
 				break;
 	
@@ -467,17 +459,14 @@ intrloop:
 					ctlr->txbuff++;
 				ether->oerrs++;
 			}
-			bp = ctlr->tb[i];
-			if(bp != nil){
-				ctlr->tb[i] = nil;
-				freeb(bp);
-			}
+	
+			freeb(dre->bp);
 	
 			ctlr->ntq--;
 			ctlr->tdri = NEXT(ctlr->tdri, Ntdre);
 		}
 		txstart(ether);
-		iunlock(ctlr);
+		unlock(ctlr);
 	}
 	goto intrloop;
 }
@@ -491,18 +480,15 @@ amd79c970pci(void)
 
 	p = nil;
 	while(p = pcimatch(p, 0x1022, 0x2000)){
-		port = p->mem[0].bar & ~3;
+		port = p->mem[0].bar & ~0x01;
 		if(ioalloc(port, p->mem[0].size, 0, "amd79c970") < 0){
 			print("amd79c970: port 0x%uX in use\n", port);
 			continue;
 		}
 		ctlr = malloc(sizeof(Ctlr));
-		if(ctlr == nil){
-			print("amd79c970: can't allocate memory\n");
-			iofree(port);
-			continue;
-		}
-		ctlr->port = port;
+		if(ctlr == nil)
+			error(Enomem);
+		ctlr->port = p->mem[0].bar & ~0x01;
 		ctlr->pcidev = p;
 
 		if(ctlrhead != nil)
@@ -545,13 +531,10 @@ reset(Ether* ether)
 	ether->port = ctlr->port;
 	ether->irq = ctlr->pcidev->intl;
 	ether->tbdf = ctlr->pcidev->tbdf;
+	pcisetbme(ctlr->pcidev);
+	shutdown(ether);
 	ilock(ctlr);
 	ctlr->init = 1;
-	pcienable(ctlr->pcidev);
-	pcisetbme(ctlr->pcidev);
-
-	io32r(ctlr, Sreset);
-	io16r(ctlr, Sreset);
 
 	if(io16w(ctlr, Rap, 0), io16r(ctlr, Rdp) == 4){
 		ctlr->ior = io16r;
@@ -573,10 +556,7 @@ reset(Ether* ether)
 	switch(x&0xFFFFFFF){
 	case 0x2420003:	/* PCnet/PCI 79C970 */
 	case 0x2621003:	/* PCnet/PCI II 79C970A */
-		ether->mbps = 10;
-		break;
 	case 0x2625003:	/* PCnet-FAST III 79C973 */
-		ether->mbps = 100;
 		break;
 	default:
 		print("#l%d: unknown PCnet card version 0x%.7ux\n",
@@ -617,15 +597,6 @@ reset(Ether* ether)
 		x = ctlr->ior(ctlr, Aprom+4);
 		ether->ea[4] = x;
 		ether->ea[5] = x>>8;
-	}
-
-	/* VMware */
-	x = ether->ea[0]<<16 | ether->ea[1]<<8 | ether->ea[2];
-	switch(x){
-	case 0x0569:
-	case 0x0C29:
-	case 0x5056:
-		ether->mbps = 1000;
 	}
 
 	/*
@@ -673,14 +644,13 @@ reset(Ether* ether)
 	 */
 	ether->attach = attach;
 	ether->transmit = transmit;
+	ether->interrupt = interrupt;
 	ether->ifstat = ifstat;
 
 	ether->arg = ether;
 	ether->promiscuous = promiscuous;
 	ether->multicast = multicast;
-//	ether->shutdown = shutdown;
-
-	intrenable(ether->irq, interrupt, ether, ether->tbdf, ether->name);
+	ether->shutdown = shutdown;
 
 	return 0;
 }

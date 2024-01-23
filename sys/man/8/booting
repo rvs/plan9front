@@ -17,12 +17,58 @@ Be sure to read
 to understand what happens after the kernel is loaded.
 .SS Terminals
 To bootstrap a diskless terminal or a CPU server, a file server must be running.
-.SS PCs
-On a PC, the
+PCs can boot from
+a floppy disk or
+any FAT16 partition.
+On all the terminals, typing two control-T's followed by a lower-case
+.B r
+reboots the machine;
+other methods of rebooting are mentioned for some machines.
+.SS "PCs (386 and amd64)"
+To boot a PC, it may be necessary to get
+.B /386/9boot
+or
+.B /386/9load
+loaded into memory.
+There are many ways to do this.
+A Plan 9 boot floppy prepared by
+.B format
+(see
+.IR prep (8))
+will load
+.B 9load
+when the PC is reset or powered on.
+Other methods are described in 
+.IR 9boot (8).
+.I 9boot
+or
+.I 9load
+then locates and loads a Plan 9 kernel, using configuration information
+from the matching file in
+.B /cfg/pxe
+.RI ( 9boot )
+or the file
+.B plan9.ini
+stored in the
+.B 9fat
+configuration partition or on a DOS file system
+.RI ( 9load ).
+See 
 .IR 9boot (8)
-program is used to load the kernel
-.B /386/9pc
-into memory.
+for details.
+.PP
+Alternatively, name
+.B bootf=/386/9pclz
+or
+.B bootf=/amd64/9k10cpulz
+in the system's
+.I ndb
+entry and it will be loaded directly by PXE,
+and will decompress itself.
+This also works for
+.B amd64
+kernels; see the kernel
+.IR mkfile s.
 .PP
 Once the kernel is booted, it behaves like the others.
 See
@@ -31,50 +77,32 @@ for details.
 .SS CPU Servers
 The Plan 9 CPU servers are multi-user, so they do not request a user name
 when booting.
+On the CPU servers, typing a control-P on the console reboots the machine.
 .SS PC CPU Server
-Proceed as for the PC terminal, but have
-.B service=cpu
-set in
-.IR plan9.ini (8).
-.SS SGI Challenge multiprocessor CPU Server
-The Challenge ROM monitor can boot from the Ethernet.
-To boot from the Ethernet, type
-.IP
-.EX
-.B bootp()/mips/9ch
-.EE
-.PP
-or use the ROM command
-.B setenv
-to set the variable
-.B bootfile
-to that same string and type
-.BR boot .
-To load a different file, tell
-.B bootp
-which file to load,
-and to force the download to come from a particular system,
-.BR bootp()system:file .
-Any arguments after
-.B bootp()file
-are passed to
-.BR /boot .
-If you are running a Plan 9
-.SM BOOTP
-server (see
-.IR dhcpd (8)),
-the file name can be omitted and the
-file specified by the
-.B bootf
-parameter for the machine in
-.B /lib/ndb
-will be downloaded by default.
-.PP
-Once the kernel is loaded,
-it prompts for the Ethernet
-protocol to use to reach the root file server; request the default.
+Proceed as for the PC terminal, but load
+.BR /386/9pccpu ,
+.BR /386/9pccpulz ,
+.BR /386/9pccpudisk ,
+.BR /amd64/9k10cpu ,
+.BR /amd64/9k10cpulz ,
+or
+.BR /amd64/9k10cpudisk .
+.SS PC File Server
+Proceed as for the PC terminal, but load
+.BR /386/9pcfs ,
+.BR /386/9pcfslz ,
+.BR /amd64/9k10fs ,
+or
+.BR /amd64/9k10fslz .
 .
-.SS ARM CPU Servers
+.SS MIPS Routerboard CPU Server
+Configure RouterBOOT via the serial port (115200 baud)
+to always boot from Ethernet via DHCP and TFTP, and arrange to load the ELF executable
+.B /mips/9rb
+in
+.IR ndb (6).
+.
+.SS ARM Systems
 All ARM systems are started by
 .I U-boot
 using similar commands.
@@ -84,13 +112,26 @@ The kernels
 .L bootf
 parameters)
 are
+.TF /arm/9beagl
+.TP
 .L /arm/9gd
-for the Marvell PXA168-based Guruplug Display,
+for the Marvell PXA168-based Guruplug Display
+.TP
 .L /arm/9plug
-for all Marvell Kirkwood plugs (Sheevaplug, Guruplug, Openrd, etc.),
-and
+for other Marvell Kirkwoods (Sheevaplug, Guruplug, Dreamplug, Openrd, etc.)
+.TP
 .L /arm/9beagle
-for TI OMAP3 boards (IGEPv2 from ISEE, Gumstix Overo).
+for TI OMAP3 boards (IGEPv2 from ISEE, Gumstix Overo)
+.TP
+.L /arm/9ts
+for Trimslice systems, which contain the Nvidia Tegra 2
+.TP
+.L /arm/9pi
+.TP
+.L /arm/9picpu
+for Raspberry Pis
+.PD
+.LP
 In the following,
 replace
 .I MAC
@@ -100,6 +141,12 @@ in lower case
 .L ether
 .I ndb
 attribute).
+If loading from a non-Plan-9
+TFTP server,
+replace
+.L %C
+with
+.BI /cfg/pxe/ MAC.
 .PP
 First, establish a
 .I /cfg/pxe
@@ -144,8 +191,8 @@ type this at U-boot once:
 .EX
 setenv bootdelay 2
 # \fItype the next two lines as one\fP
-setenv bootcmd 'bootp; bootp; tftp 0x1000 /cfg/pxe/\fIMAC\fP; bootp;
-	tftp 0x800000; go 0x800000'
+setenv bootcmd 'bootp; bootp; tftp 0x1000 %C; bootp; tftp 0x800000;
+	go 0x800000'
 saveenv
 .EE
 .PP
@@ -155,7 +202,7 @@ do the same but type this after
 instead:
 .IP
 .EX
-\&'dhcp; tftpboot; tftpboot 0x1000 /cfg/pxe/\fIMAC\fP; bootz 0x500000'
+\&'dhcp; tftpboot; tftpboot 0x1000 %C; bootz 0x500000'
 .EE
 .PP
 For Kirkwood Guruplugs,
@@ -163,7 +210,7 @@ type this after
 .LR "setenv bootcmd" :
 .IP
 .EX
-\&'dhcp 0x800000; tftp 0x1000 /cfg/pxe/\fIMAC\fP; go 0x800000'
+\&'dhcp 0x800000; tftp 0x1000 %C; go 0x800000'
 .EE
 .PP
 For IGEPv2 boards,
@@ -171,7 +218,7 @@ type this after
 .LR "setenv bootcmd" :
 .IP
 .EX
-\&'tftp 0x80300000 /cfg/pxe/\fIMAC\fP; dhcp 0x80310000; go 0x80310000'
+\&'tftp 0x80300000 %C; dhcp 0x80310000; go 0x80310000'
 .EE
 .PP
 For Gumstix Overo boards,
@@ -179,18 +226,97 @@ type this after
 .LR "setenv bootcmd" :
 .IP
 .EX
-\&'bootp 0x80310000; bootp 0x80300000 /cfg/pxe/\fIMAC\fP; go 0x80310000'
+\&'bootp 0x80310000; bootp 0x80300000 %C; go 0x80310000'
 .EE
+.PP
+For Trimslice systems,
+type this after
+.LR "setenv bootcmd" :
+.IP
+.EX
+\&'dhcp; dhcp; tftpboot 0x420000; tftpboot 0x410000 %C; go 0x420000'
+.EE
+.PP
+For Raspberry Pis,
+.I gunzip
+the
+.B pi.uboot.sd.img.gz
+named below onto an SD card and insert that into your Pi.
 .PP
 Thereafter, the boards will automatically boot via BOOTP and TFTP
 when reset.
 .
+.SS "RISC-V systems"
+.PP
+These boot with U-boot, per the ARM systems above.
+.PP
+For Microchip Polarfire Icicles
+and Beagle Vs,
+the
+.I bootcmd
+is:
+.IP
+.EX
+\&'dhcp 0x90000000; bootm 0x90000000 - ${fdtcontroladdr}'
+.EE
+.PP
+U-boot on the Icicle lacks the
+.I saveenv
+command, so this has to be typed manually at each boot.
+The
+.I ndb
+.I bootf
+file should be
+.LR /riscv64/9pfcpu.uim
+or
+.LR /riscv64/9bvcpu.uim ,
+which are generated by the kernel
+.IR mkfile .
+.PP
+An alternative on Beagle V is:
+.IP
+.EX
+\&'tftpboot 0x80020000; go 0x80020000'
+.EE
+.PP
+assuming a
+.I bootf
+file of
+.LR /riscv64/9bvcpu.bin .
+.PP
+The Starfive VisionFive 2
+is similar, with this
+.IR bootcmd :
+.IP
+.EX
+\&'dhcp 0x40200000; go 0x40200000'
+.EE
+.PP
+and 
+.I bootf
+file of
+.LR /riscv64/9vfcpu.bin .
+.PP
+Booting the Hifive Unmatched is complicated and unpleasant
+and is not yet described here.
+.
+.SH FILES
+.B /rc/bin/loadcfgpxe
+is run by
+.IR cpurc (8)
+if the kernel was loaded directly by PXE.
+.LP
+.B /arm/pi.sd/uboot.sd.img.gz
+is a compressed bootable SD card image for Raspberry Pi for PXE booting.
+.SH SOURCE
+.B /sys/src/boot
+.br
+.B /sys/src/9/pcboot
+.br
+.B /sys/src/9/pcexp
 .SH "SEE ALSO"
 .IR ndb (6),
 .IR 9boot (8),
 .IR boot (8),
 .IR init (8),
 .IR plan9.ini (8)
-.SH SOURCE
-Sources for the various boot programs are under
-.BR /sys/src/boot .

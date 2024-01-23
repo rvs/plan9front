@@ -1,194 +1,124 @@
+/*
+ * Advanced Programmable Interrupt Controllers (Local and I/O).
+ * the first APIC was the 82489dx and the first I/O APIC was the 82093aa.
+ *
+ * lapic ids tend to be cpu number (possibly plus 1) or
+ * double it (due to hyperthreading?).
+ */
+
 #include "u.h"
 #include "../port/lib.h"
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-
 #include "mp.h"
 
-enum {					/* Local APIC registers */
-	LapicID		= 0x0020,	/* ID */
-	LapicVER	= 0x0030,	/* Version */
-	LapicTPR	= 0x0080,	/* Task Priority */
-	LapicAPR	= 0x0090,	/* Arbitration Priority */
-	LapicPPR	= 0x00A0,	/* Processor Priority */
-	LapicEOI	= 0x00B0,	/* EOI */
-	LapicLDR	= 0x00D0,	/* Logical Destination */
-	LapicDFR	= 0x00E0,	/* Destination Format */
-	LapicSVR	= 0x00F0,	/* Spurious Interrupt Vector */
-	LapicISR	= 0x0100,	/* Interrupt Status (8 registers) */
-	LapicTMR	= 0x0180,	/* Trigger Mode (8 registers) */
-	LapicIRR	= 0x0200,	/* Interrupt Request (8 registers) */
-	LapicESR	= 0x0280,	/* Error Status */
-	LapicICRLO	= 0x0300,	/* Interrupt Command */
-	LapicICRHI	= 0x0310,	/* Interrupt Command [63:32] */
-	LapicTIMER	= 0x0320,	/* Local Vector Table 0 (TIMER) */
-	LapicPCINT	= 0x0340,	/* Performance Counter LVT */
-	LapicLINT0	= 0x0350,	/* Local Vector Table 1 (LINT0) */
-	LapicLINT1	= 0x0360,	/* Local Vector Table 2 (LINT1) */
-	LapicERROR	= 0x0370,	/* Local Vector Table 3 (ERROR) */
-	LapicTICR	= 0x0380,	/* Timer Initial Count */
-	LapicTCCR	= 0x0390,	/* Timer Current Count */
-	LapicTDCR	= 0x03E0,	/* Timer Divide Configuration */
+enum {
+	/* Msrapicbase bits */
+	Lapicbsp= 1<<8,			/* flag: boot cpu? */
+	Lapicx2 = 1<<10,		/* enable x2apic mode */
+	Lapicae	= 1<<11,		/* apic enable */
 };
 
-enum {					/* LapicSVR */
-	LapicENABLE	= 0x00000100,	/* Unit Enable */
-	LapicFOCUS	= 0x00000200,	/* Focus Processor Checking Disable */
-};
+ulong* lapicbase;  /* assume all cpus' lapics are at this virtual address */
 
-enum {					/* LapicICRLO */
-					/* [14] IPI Trigger Mode Level (RW) */
-	LapicDEASSERT	= 0x00000000,	/* Deassert level-sensitive interrupt */
-	LapicASSERT	= 0x00004000,	/* Assert level-sensitive interrupt */
-
-					/* [17:16] Remote Read Status */
-	LapicINVALID	= 0x00000000,	/* Invalid */
-	LapicWAIT	= 0x00010000,	/* In-Progress */
-	LapicVALID	= 0x00020000,	/* Valid */
-
-					/* [19:18] Destination Shorthand */
-	LapicFIELD	= 0x00000000,	/* No shorthand */
-	LapicSELF	= 0x00040000,	/* Self is single destination */
-	LapicALLINC	= 0x00080000,	/* All including self */
-	LapicALLEXC	= 0x000C0000,	/* All Excluding self */
-};
-
-enum {					/* LapicESR */
-	LapicSENDCS	= 0x00000001,	/* Send CS Error */
-	LapicRCVCS	= 0x00000002,	/* Receive CS Error */
-	LapicSENDACCEPT	= 0x00000004,	/* Send Accept Error */
-	LapicRCVACCEPT	= 0x00000008,	/* Receive Accept Error */
-	LapicSENDVECTOR	= 0x00000020,	/* Send Illegal Vector */
-	LapicRCVVECTOR	= 0x00000040,	/* Receive Illegal Vector */
-	LapicREGISTER	= 0x00000080,	/* Illegal Register Address */
-};
-
-enum {					/* LapicTIMER */
-					/* [17] Timer Mode (RW) */
-	LapicONESHOT	= 0x00000000,	/* One-shot */
-	LapicPERIODIC	= 0x00020000,	/* Periodic */
-
-					/* [19:18] Timer Base (RW) */
-	LapicCLKIN	= 0x00000000,	/* use CLKIN as input */
-	LapicTMBASE	= 0x00040000,	/* use TMBASE */
-	LapicDIVIDER	= 0x00080000,	/* use output of the divider */
-};
-
-static uchar lapictdxtab[] = {		/* LapicTDCR */
-	0x0B,	/* divide by 1 */
-	0x00,	/* divide by 2 */
-	0x01,	/* divide by 4 */
-	0x02,	/* divide by 8 */
-	0x03,	/* divide by 16 */
-	0x08,	/* divide by 32 */
-	0x09,	/* divide by 64 */
-	0x0A,	/* divide by 128 */
-};
-
-static ulong* lapicbase;
-
-typedef struct Apictimer Apictimer;
-struct Apictimer
+struct
 {
 	uvlong	hz;
 	ulong	max;
 	ulong	min;
 	ulong	div;
-	int	tdx;
-};
-
-static Apictimer lapictimer[MAXMACH];
+} lapictimer;
 
 static ulong
-lapicr(int r)
+lapicr(uint r)
 {
-	return *(lapicbase+(r/sizeof(*lapicbase)));
+	if(lapicbase == 0)
+		panic("lapicr: no lapic");
+	return lapicbase[r/sizeof *lapicbase];
 }
 
 static void
-lapicw(int r, ulong data)
+lapicw(uint r, ulong data)
 {
-	*(lapicbase+(r/sizeof(*lapicbase))) = data;
-	data = *(lapicbase+(LapicID/sizeof(*lapicbase)));
+	if(lapicbase == 0)
+		panic("lapicw: no lapic");
+	lapicbase[r/sizeof *lapicbase] = data;
+	coherence();
+	data = lapicbase[LapicID/sizeof *lapicbase];	/* force the write? */
 	USED(data);
 }
 
 void
 lapiconline(void)
 {
-	Apictimer *a;
-
-	a = &lapictimer[m->machno];
-
 	/*
 	 * Reload the timer to de-synchronise the processors,
 	 * then lower the task priority to allow interrupts to be
 	 * accepted by the APIC.
 	 */
 	microdelay((TK2MS(1)*1000/conf.nmach) * m->machno);
-	lapicw(LapicTICR, a->max);
+	lapicw(LapicTICR, lapictimer.max);
 	lapicw(LapicTIMER, LapicCLKIN|LapicPERIODIC|(VectorPIC+IrqTIMER));
 
-	/*
-	 * not strickly neccesary, but reported (osdev.org) to be
-	 * required for some machines.
-	 */
-	lapicw(LapicTDCR, lapictdxtab[a->tdx]);
-
-	lapicw(LapicTPR, 0);
+	lapicw(LapicTPR, 0);		/* arch->intron(); */
 }
 
 /*
- *  use the i8253/tsc clock to figure out our lapic timer rate.
+ *  use the i8253 clock to figure out our lapic timer rate.
  */
 static void
 lapictimerinit(void)
 {
 	uvlong x, v, hz;
-	Apictimer *a;
-	int s;
 
-	if(m->machno != 0){
-		lapictimer[m->machno] = lapictimer[0];
-		return;
-	}
-
-	s = splhi();
-	a = &lapictimer[m->machno];
-	a->tdx = 0;
-Retry:
+	v = m->cpuhz/1000;
+	lapicw(LapicTDCR, LapicX1);
 	lapicw(LapicTIMER, ApicIMASK|LapicCLKIN|LapicONESHOT|(VectorPIC+IrqTIMER));
-	lapicw(LapicTDCR, lapictdxtab[a->tdx]);
 
-	x = fastticks(&hz);
-	x += hz/10;
-	lapicw(LapicTICR, 0xffffffff);
-	do{
-		v = fastticks(nil);
-	}while(v < x);
+	if(lapictimer.hz == 0){
+		x = fastticks(&hz);
+		x += hz/10;
+		lapicw(LapicTICR, 0xffffffff);
+		do{
+			v = fastticks(nil);
+		}while(v < x);
 
-	v = (0xffffffffUL-lapicr(LapicTCCR))*10;
-	if(v > hz-(hz/10)){
-		if(v > hz+(hz/10) && a->tdx < nelem(lapictdxtab)-1){
-			a->tdx++;
-			goto Retry;
+		lapictimer.hz = (0xffffffffUL-lapicr(LapicTCCR))*10;
+		lapictimer.max = lapictimer.hz/HZ;
+		lapictimer.min = lapictimer.hz/(100*HZ);
+
+		if(lapictimer.hz > hz-(hz/10)){
+			if(lapictimer.hz > hz+(hz/10))
+				panic("lapic clock %lld > cpu clock > %lld",
+					lapictimer.hz, hz);
+			lapictimer.hz = hz;
 		}
-		v = hz;
+		assert(lapictimer.hz != 0);
+		lapictimer.div = hz/lapictimer.hz;
 	}
+}
 
-	assert(v >= (100*HZ));
+/* force lapic out of x2apic mode if needed, then enable */
+static void
+lapiccfg(void)
+{
+	vlong base;
 
-	a->hz = v;
-	a->div = hz/a->hz;
-	a->max = a->hz/HZ;
-	a->min = a->hz/(100*HZ);
-
-	splx(s);
-
-	v = (v+500000LL)/1000000LL;
-	print("cpu%d: lapic clock at %lludMHz\n", m->machno, v);
+	base = 0;
+	rdmsr(Msrapicbase, &base);
+	if ((base & (Lapicae|Lapicx2)) != Lapicae) {
+		/*
+		 * if enabled in x2apic mode, can't just switch to enabled
+		 * non-x2apic mode: it will GPF.
+		 */
+		if ((base & (Lapicae|Lapicx2)) == (Lapicae|Lapicx2)) {
+			base &= ~(uvlong)(Lapicae|Lapicx2);	/* disable */
+			wrmsr(Msrapicbase, base);
+		}
+		wrmsr(Msrapicbase, base | Lapicae);	/* enable */
+	}
 }
 
 void
@@ -196,14 +126,18 @@ lapicinit(Apic* apic)
 {
 	ulong dfr, ldr, lvt;
 
-	if(lapicbase == 0)
+	if(lapicbase == nil)
 		lapicbase = apic->addr;
+	if(lapicbase == nil) {		/* should never happen */
+		print("lapicinit: no lapic\n");
+		return;
+	}
 
 	/*
 	 * These don't really matter in Physical mode;
 	 * set the defaults anyway.
 	 */
-	if(strncmp(m->cpuidid, "AuthenticAMD", 12) == 0)
+	if(conf.x86type == Amd)
 		dfr = 0xf0000000;
 	else
 		dfr = 0xffffffff;
@@ -211,8 +145,9 @@ lapicinit(Apic* apic)
 
 	lapicw(LapicDFR, dfr);
 	lapicw(LapicLDR, ldr);
-	lapicw(LapicTPR, 0xff);
+	lapicw(LapicTPR, 0xff);			/* arch->introff(); */
 	lapicw(LapicSVR, LapicENABLE|(VectorPIC+IrqSPURIOUS));
+	lapiccfg();
 
 	lapictimerinit();
 
@@ -220,11 +155,12 @@ lapicinit(Apic* apic)
 	 * Some Pentium revisions have a bug whereby spurious
 	 * interrupts are generated in the through-local mode.
 	 */
-	switch(m->cpuidax & 0xFFF){
+	switch(conf.cpuidax & 0xFFF){
 	case 0x526:				/* stepping cB1 */
 	case 0x52B:				/* stepping E0 */
 	case 0x52C:				/* stepping cC0 */
-		wrmsr(0x0E, 1<<14);		/* TR12 */
+		/* ignore interrupt immediately after CLI and before STI */
+		wrmsr(Msrtr12, 1<<14);
 		break;
 	}
 
@@ -240,7 +176,7 @@ lapicinit(Apic* apic)
 
 	lvt = (lapicr(LapicVER)>>16) & 0xFF;
 	if(lvt >= 4)
-		lapicw(LapicPCINT, ApicIMASK);
+		lapicw(LapicPCINT, ApicIMASK|(VectorPIC+IrqPCINT));
 	lapicw(LapicERROR, VectorPIC+IrqERROR);
 	lapicw(LapicESR, 0);
 	lapicr(LapicESR);
@@ -256,7 +192,7 @@ lapicinit(Apic* apic)
 	/*
 	 * Do not allow acceptance of interrupts until all initialisation
 	 * for this processor is done. For the bootstrap processor this can be
-	 * early duing initialisation. For the application processors this should
+	 * early during initialisation. For the application processors this should
 	 * be after the bootstrap processor has lowered priority and is accepting
 	 * interrupts.
 	lapicw(LapicTPR, 0);
@@ -286,43 +222,58 @@ lapicstartap(Apic* apic, int v)
 	}
 }
 
-void
+int
 lapicerror(Ureg*, void*)
 {
 	ulong esr;
 
-	lapicw(LapicESR, 0);
+	lapicw(LapicESR, 0);			/* required by intel */
 	esr = lapicr(LapicESR);
-	switch(m->cpuidax & 0xFFF){
+	switch(conf.cpuidax & 0xFFF){
 	case 0x526:				/* stepping cB1 */
 	case 0x52B:				/* stepping E0 */
 	case 0x52C:				/* stepping cC0 */
-		return;
+		return Intrtrap;
 	}
-	print("cpu%d: lapicerror: 0x%8.8luX\n", m->machno, esr);
-}
-
-void
-lapicspurious(Ureg*, void*)
-{
-	print("cpu%d: lapicspurious\n", m->machno);
+	if (esr == 0) {
+		// print("cpu%d: lapic error trap but no error!\n", m->machno);
+	} else if (!active.exiting)
+		print("cpu%d: lapic error trap: esr %#lux\n", m->machno, esr);
+	return Intrtrap;
 }
 
 int
-lapicisr(int v)
+lapicspurious(Ureg*, void*)
 {
-	ulong isr;
+	static int traps;
 
-	isr = lapicr(LapicISR + (v/32));
+	if (++traps > 1)
+		print("cpu%d: lapic spurious intr\n", m->machno);
+	return Intrtrap;
+}
 
+/*
+ * get in-service interrupt bit for vector v.
+ *
+ * the function's type signature is fixed by Vctl.
+ */
+int
+lapicisr(int av)
+{
+	ulong isr, v;
+
+	v = av;
+	isr = lapicr(LapicISR + v/32);
 	return isr & (1<<(v%32));
 }
 
+/*
+ * dismiss interrupt for vector v (actually the current one).
+ */
 int
 lapiceoi(int v)
 {
 	lapicw(LapicEOI, 0);
-
 	return v;
 }
 
@@ -394,23 +345,38 @@ ioapicinit(Apic* apic, int apicno)
 		ioapicrdtw(apic, v, hi, lo);
 }
 
+unsigned
+lapicid(uintptr lapicaddr)
+{
+	return (*(ulong *)(lapicaddr + LapicID)) >> 24;
+}
+
 void
 lapictimerset(uvlong next)
 {
 	vlong period;
-	Apictimer *a;
+	int x;
 
-	a = &lapictimer[m->machno];
-	period = next - fastticks(nil);
-	period /= a->div;
-	if(period < a->min)
-		period = a->min;
-	else if(period > a->max - a->min)
-		period = a->max;
+	x = splhi();
+	lock(&m->apictimerlock);
+
+	period = lapictimer.max;
+	if(next != 0){
+		if (lapictimer.div == 0)
+			panic("lapictimerset: zero lapictimer.div");
+		period = (next - fastticks(nil)) / lapictimer.div;
+		if(period < lapictimer.min)
+			period = lapictimer.min;
+		else if(period > lapictimer.max - lapictimer.min)
+			period = lapictimer.max;
+	}
 	lapicw(LapicTICR, period);
+
+	unlock(&m->apictimerlock);
+	splx(x);
 }
 
-void
+int
 lapicclock(Ureg *u, void*)
 {
 	/*
@@ -419,6 +385,7 @@ lapicclock(Ureg *u, void*)
 	 */
 	mtrrclock();
 	timerintr(u, 0);
+	return Intrforme;
 }
 
 void
@@ -436,11 +403,41 @@ lapicintroff(void)
 void
 lapicnmienable(void)
 {
-	lapicw(LapicPCINT, ApicNMI);
+	/*
+	 * On the one hand the manual says the vector information
+	 * is ignored if the delivery mode is NMI, and on the other
+	 * a "Receive Illegal Vector" should be generated for a
+	 * vector in the range 0 through 15.
+	 * Some implementations generate the error interrupt if the
+	 * NMI vector is invalid, so always give a valid value.
+	 */
+	if(lapicbase != nil)		/* always true */
+		lapicw(LapicPCINT, ApicNMI|(VectorPIC+IrqPCINT));
+	else
+		print("lapicnmienable: no lapic\n");
 }
 
 void
 lapicnmidisable(void)
 {
-	lapicw(LapicPCINT, ApicIMASK);
+	if(lapicbase != nil)		/* always true */
+		lapicw(LapicPCINT, ApicIMASK|(VectorPIC+IrqPCINT));
+	else
+		print("lapicnmidisable: no lapic\n");
+}
+
+void
+mpresetothers(void)
+{
+	/*
+	 * INIT all excluding self.
+	 */
+	lapicicrw(0, LapicALLEXC|ApicINIT);
+}
+
+void
+nmitoself(void)
+{
+	if(lapicbase != nil)		/* always true */
+		lapicicrw(0, LapicSELF|ApicNMI);
 }

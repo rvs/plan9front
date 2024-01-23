@@ -20,7 +20,8 @@ struct Private {
 static Private pmainpriv;
 static Pool pmainmem = {
 	.name=	"Main",
-	.maxsize=	4*1024*1024,
+	/* overwritten by memory sizing, typically in confinit() */
+	.maxsize=	64*1024*1024,
 	.minarena=	128*1024,
 	.quantum=	32,
 	.alloc=	xalloc,
@@ -38,7 +39,8 @@ static Pool pmainmem = {
 static Private pimagpriv;
 static Pool pimagmem = {
 	.name=	"Image",
-	.maxsize=	16*1024*1024,
+	/* in terminals, overwritten by memory sizing, typically in confinit() */
+	.maxsize=	64*1024*1024,
 	.minarena=	2*1024*1024,
 	.quantum=	32,
 	.alloc=	xalloc,
@@ -53,27 +55,8 @@ static Pool pimagmem = {
 	.private=	&pimagpriv,
 };
 
-static Private psecrpriv;
-static Pool psecrmem = {
-	.name=	"Secrets",
-	.maxsize=	16*1024*1024,
-	.minarena=	64*1024,
-	.quantum=	32,
-	.alloc=	xalloc,
-	.merge=	xmerge,
-	.flags=	POOL_ANTAGONISM,
-
-	.lock=	plock,
-	.unlock=	punlock,
-	.print=	poolprint,
-	.panic=	ppanic,
-
-	.private=	&psecrpriv,
-};
-
 Pool*	mainmem = &pmainmem;
 Pool*	imagmem = &pimagmem;
-Pool*	secrmem = &psecrmem;
 
 /*
  * because we can't print while we're holding the locks, 
@@ -132,15 +115,14 @@ punlock(Pool *p)
 
 	memmove(msg, pv->msg, sizeof msg);
 	iunlock(&pv->lk);
-	iprint("%.*s", sizeof pv->msg, msg);
+	iprint("%.*s", (int)sizeof pv->msg, msg);
 }
 
 void
 poolsummary(Pool *p)
 {
-	print("%s max %llud cur %llud free %llud alloc %llud\n", p->name,
-		(uvlong)p->maxsize, (uvlong)p->cursize,
-		(uvlong)p->curfree, (uvlong)p->curalloc);
+	print("%s max %lud cur %lud free %lud alloc %lud\n", p->name,
+		p->maxsize, p->cursize, p->curfree, p->curalloc);
 }
 
 void
@@ -148,7 +130,6 @@ mallocsummary(void)
 {
 	poolsummary(mainmem);
 	poolsummary(imagmem);
-	poolsummary(secrmem);
 }
 
 /* everything from here down should be the same in libc, libdebugmalloc, and the kernel */
@@ -156,7 +137,7 @@ mallocsummary(void)
 /* - except the code for smalloc(), which lives only in the kernel. */
 
 /*
- * Npadlong is the number of ulong's to leave at the beginning of 
+ * Npadlong is the number of 32-bit longs to leave at the beginning of 
  * each allocated buffer for our own bookkeeping.  We return to the callers
  * a pointer that points immediately after our bookkeeping area.  Incoming pointers
  * must be decremented by that much, and outgoing pointers incremented.
@@ -171,7 +152,7 @@ mallocsummary(void)
 /*	non tracing
  *
 enum {
-	Npadlong = 0,
+	Npadlong	= 0,
 	MallocOffset = 0,
 	ReallocOffset = 0,
 };
@@ -180,7 +161,7 @@ enum {
 
 /* tracing */
 enum {
-	Npadlong = 2,
+	Npadlong	= 2,
 	MallocOffset = 0,
 	ReallocOffset = 1
 };
@@ -191,11 +172,13 @@ smalloc(ulong size)
 {
 	void *v;
 
-	while((v = poolalloc(mainmem, size+Npadlong*sizeof(ulong))) == nil){
-		if(!waserror()){
-			resrcwait(nil);
-			poperror();
-		}
+	for(;;) {
+		v = poolalloc(mainmem, size+Npadlong*sizeof(ulong));
+		if(v != nil)
+			break;
+		if (up == nil)
+			panic("smalloc: nil up");
+		tsleep(&up->sleep, return0, 0, 100);
 	}
 	if(Npadlong){
 		v = (ulong*)v+Npadlong;
@@ -228,14 +211,12 @@ mallocz(ulong size, int clr)
 	void *v;
 
 	v = poolalloc(mainmem, size+Npadlong*sizeof(ulong));
-	if(v == nil)
-		return nil;
-	if(Npadlong){
+	if(Npadlong && v != nil){
 		v = (ulong*)v+Npadlong;
 		setmalloctag(v, getcallerpc(&size));
 		setrealloctag(v, 0);
 	}
-	if(clr)
+	if(clr && v != nil)
 		memset(v, 0, size);
 	return v;
 }
@@ -246,14 +227,13 @@ mallocalign(ulong size, ulong align, long offset, ulong span)
 	void *v;
 
 	v = poolallocalign(mainmem, size+Npadlong*sizeof(ulong), align, offset-Npadlong*sizeof(ulong), span);
-	if(v == nil)
-		return nil;
-	if(Npadlong){
+	if(Npadlong && v != nil){
 		v = (ulong*)v+Npadlong;
 		setmalloctag(v, getcallerpc(&size));
 		setrealloctag(v, 0);
 	}
-	memset(v, 0, size);
+	if(v)
+		memset(v, 0, size);
 	return v;
 }
 
@@ -271,10 +251,10 @@ realloc(void *v, ulong size)
 
 	if(v != nil)
 		v = (ulong*)v-Npadlong;
-	if(Npadlong && size != 0)
+	if(Npadlong !=0 && size != 0)
 		size += Npadlong*sizeof(ulong);
-	nv = poolrealloc(mainmem, v, size);
-	if(nv != nil){
+
+	if(nv = poolrealloc(mainmem, v, size)){
 		nv = (ulong*)nv+Npadlong;
 		setrealloctag(nv, getcallerpc(&v));
 		if(v == nil)
@@ -289,66 +269,51 @@ msize(void *v)
 	return poolmsize(mainmem, (ulong*)v-Npadlong)-Npadlong*sizeof(ulong);
 }
 
-/* secret memory, used to back cryptographic keys and cipher states */
 void*
-secalloc(ulong size)
+calloc(ulong n, ulong szelem)
 {
 	void *v;
-
-	while((v = poolalloc(secrmem, size+Npadlong*sizeof(ulong))) == nil){
-		if(!waserror()){
-			resrcwait(nil);
-			poperror();
-		}
-	}
-	if(Npadlong){
-		v = (ulong*)v+Npadlong;
-		setmalloctag(v, getcallerpc(&size));
-		setrealloctag(v, 0);
-	}
-	memset(v, 0, size);
+	if(v = mallocz(n*szelem, 1))
+		setmalloctag(v, getcallerpc(&n));
 	return v;
 }
 
 void
-secfree(void *v)
+setmalloctag(void *v, ulong pc)
 {
-	if(v != nil)
-		poolfree(secrmem, (ulong*)v-Npadlong);
-}
-
-void
-setmalloctag(void *v, uintptr pc)
-{
+	ulong *u;
 	USED(v, pc);
 	if(Npadlong <= MallocOffset || v == nil)
 		return;
-	((ulong*)v)[-Npadlong+MallocOffset] = (ulong)pc;
+	u = v;
+	u[-Npadlong+MallocOffset] = pc;
 }
 
 void
-setrealloctag(void *v, uintptr pc)
+setrealloctag(void *v, ulong pc)
 {
+	ulong *u;
 	USED(v, pc);
 	if(Npadlong <= ReallocOffset || v == nil)
 		return;
-	((ulong*)v)[-Npadlong+ReallocOffset] = (ulong)pc;
+	u = v;
+	u[-Npadlong+ReallocOffset] = pc;
 }
 
-uintptr
+ulong
 getmalloctag(void *v)
 {
 	USED(v);
 	if(Npadlong <= MallocOffset)
 		return ~0;
-	return (int)((ulong*)v)[-Npadlong+MallocOffset];
+	return ((ulong*)v)[-Npadlong+MallocOffset];
 }
 
-uintptr
+ulong
 getrealloctag(void *v)
 {
 	USED(v);
 	if(Npadlong <= ReallocOffset)
-		return ~0;
-	return (int)((ulong*)v)[-Npadlong+ReallocOffset];
+		return ((ulong*)v)[-Npadlong+ReallocOffset];
+	return ~0;
 }

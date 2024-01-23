@@ -1,8 +1,8 @@
-# pc - 386 pc terminal with local disk
+# pc - a normal pc terminal; see pcall for the kitchen sink
 dev
 	root
 	cons
-	swap
+
 	arch
 	pnp		pci
 	env
@@ -10,165 +10,106 @@ dev
 	proc
 	mnt
 	srv
-	shr
 	dup
 	rtc
+	ssl
 	tls
 	cap
 	kprof
-	fs
-	dtracy
+#	fs
 
 	ether		netif
-	bridge		log
-	ip		arp chandial ip ipv6 ipaux iproute netlog nullmedium pktmedium inferno
+	ip		arp chandial ip ipv6 ipaux iproute netlog nullmedium pktmedium ptclbsum386
 
-	draw		screen vga vgax vgasoft
+	draw		screen vga vgax
 	mouse		mouse
-	kbd
-	vga		pci
+	vga
+#	kbmap
+	kbin
 
 	sd
-	floppy		dma
-	aoe
-	lpt
+#	aoe
 
-	audio		dma
-	pccard		pci
-	i82365		cis
 	uart
 	usb
-	
-	segment
-	vmx
+	wd
 
 link
-	segdesc
-	devpccard	pci
-	devi82365
-	cputemp		pci
-	apm		apmjump
-	ether2000	pci ether8390
-	ether2114x	pci
-	ether589	etherelnk3
+# order of ethernet drivers should match that in ../pcboot/boot so that
+# devices are detected in the same order by bootstraps and kernels
+# and thus given the same controller numbers.  put fastest first.
+# 10 Gb/s
+	etherxgbe	pci
+# gigabit
+	etherigbepci	pci ethermii
+	etherigbe	pci
+	ether8169	pci ethermii
+# 100 Mb/s
+	ether82557	pci
+	ether8139	pci
+	etherelnk3	pci
+	ethervt6105m	pci ethermii
+# dog slow, mainly for use in virtual machines
+	ether2000	ether8390
 	ether79c970	pci
 	ether8003	ether8390
-	ether8139	pci
-	ether8169	pci ethermii
-# should be obsoleted by igbe
-#	ether82543gc	pci
-	ether82557	pci
-	ether82563	pci
-	ether82598	pci
-	ether83815	pci
-	etherx550	pci
-	etherbcm        pci
-	etherdp83820	pci ethermii
-	etherec2t	ether8390
-	etherelnk3	pci
-	etherga620	pci
-	etherigbe	pci ethermii
-	ethervgbe	pci ethermii
-	ethervt6102	pci ethermii
-	ethervt6105m	pci ethermii
-	ethersink
-	ethersmc	pci devi82365 cis
-	etheryuk	pci
-	etherwavelan	wavelan devi82365 cis pci
-	etheriwl	pci wifi
-	etherwpi	pci wifi
-	etherrt2860	pci wifi
-	ethervirtio	pci
-	ethervirtio10	pci
+
 	ethermedium
-	loopbackmedium
 	netdevmedium
-	pcmciamodem
-	usbuhci		pci
-	usbohci		pci
-	usbehci		pci usbehcipc
-	usbxhci		pci usbxhcipci
+	loopbackmedium
 
-	audiosb16	dma
-	audioac97	pci audioac97mix
-	audiohda	pci
+#	usbuhci
+#	usbohci
+	usbehci		usbehcipc
 
-	pmmc		pci
+	x86watchdog
 
 misc
-	pci		pcipc
+	mp		apic mpacpi
 
-	archgeneric	devkbd i8259 i8253
-	archacpi	mp apic squidboy ec hpet
-	archmp		mp apic squidboy
-	mtrr
-
-	sdaoe
-	sdide		pci sdscsi
+	sdata		pci sdscsi
 	sd53c8xx	pci sdscsi
 	sdmylex		pci sdscsi
-	sdiahci		pci sdscsi led
-	sdodin		pci sdscsi led
-	sdvirtio	pci sdscsi
-	sdvirtio10	pci sdscsi
-	sdmmc		pci pmmc
-	sdnvme		pci
-	sdloop
-	sdram
+	sdahci		pci sdscsi
+#	sdaoe
+	sdnvme		pci sdscsi
 
 	uarti8250
-	uartisa
-	uartpci		pci
+#	uartpci		pci
+#	uartisa
 
-	vgasoft		=cur swcursor
-	vga3dfx		+cur
-	vgaark2000pv	+cur
-	vgabt485	=cur
-	vgaclgd542x	+cur
-	vgaclgd546x	+cur
-	vgact65545	+cur
-	vgacyber938x	+cur
-	vgaet4000	+cur
-	vgageode	+cur
-	vgahiqvideo	+cur
 	vgai81x		+cur
-	vgaigfx		+cur
-	vgamach64xx	+cur
-	vgamga2164w	+cur
-	vgamga4xx	+cur
-	vganeomagic	+cur
 	vganvidia	+cur
 	vgaradeon	+cur
 	vgargb524	=cur
 	vgas3		+cur vgasavage
 	vgat2r4		+cur
-	vgatvp3020	=cur
-	vgatvp3026	=cur
-	vgavesa
+	vgavesa		realmode
 	vgavmware	+cur
-	
-	dtracysys
-	dtracytimer
-	dtracydev
 
 ip
 	tcp
 	udp
-	rudp
+#	rudp
 	ipifc
 	icmp
 	icmp6
-	igmp
-	gre
+#	gre
 	ipmux
 	esp
-	il
 
 port
 	int cpuserver = 0;
 
+boot
+	tcp
+
 bootdir
-	/$objtype/bin/paqfs
-	/$objtype/bin/auth/factotum
-	bootfs.paq
-	boot
+	boot$CONF.out boot
+	/386/bin/ip/ipconfig
+	/386/bin/ramfs
+#	/386/bin/auth/factotum
+# compiling usbd in allows early keyboard and partfs use
+#	/386/bin/usb/usbd
+# needed to boot from a usb key and use its fossil
+#	/386/bin/disk/partfs

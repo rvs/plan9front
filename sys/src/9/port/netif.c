@@ -18,9 +18,8 @@ static int parseaddr(uchar*, char*, int);
 void
 netifinit(Netif *nif, char *name, int nfile, ulong limit)
 {
-	if(strlen(name) >= sizeof nif->name)
-		panic("netifinit: name too long: %s", name);
-	strcpy(nif->name, name);
+	strncpy(nif->name, name, KNAMELEN-1);
+	nif->name[KNAMELEN-1] = 0;
 	nif->nfile = nfile;
 	nif->f = xalloc(nfile*sizeof(Netfile*));
 	if (nif->f == nil)
@@ -67,12 +66,12 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 
 	/* second level contains clone plus all the conversations */
 	t = NETTYPE(c->qid.path);
-	if(t == N2ndqid || t == Ncloneqid || t == Naddrqid || t == Nstatqid || t == Nifstatqid){
+	if(t == N2ndqid || t == Ncloneqid || t == Naddrqid || t == Nmtuqid){
 		switch(i) {
 		case DEVDOTDOT:
 			q.type = QTDIR;
 			q.path = 0;
-			devdir(c, q, ".", 0, eve, 0555, dp);
+			devdir(c, q, ".", 0, eve, DMDIR|0555, dp);
 			break;
 		case 0:
 			q.path = Ncloneqid;
@@ -80,7 +79,7 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 			break;
 		case 1:
 			q.path = Naddrqid;
-			devdir(c, q, "addr", 0, eve, 0444, dp);
+			devdir(c, q, "addr", 0, eve, 0666, dp);
 			break;
 		case 2:
 			q.path = Nstatqid;
@@ -90,8 +89,12 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 			q.path = Nifstatqid;
 			devdir(c, q, "ifstats", 0, eve, 0444, dp);
 			break;
+		case 4:
+			q.path = Nmtuqid;
+			devdir(c, q, "mtu", 0, eve, 0444, dp);
+			break;
 		default:
-			i -= 4;
+			i -= 5;
 			if(i >= nif->nfile)
 				return -1;
 			if(nif->f[i] == 0)
@@ -99,7 +102,7 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 			q.type = QTDIR;
 			q.path = NETQID(i, N3rdqid);
 			snprint(up->genbuf, sizeof up->genbuf, "%d", i);
-			devdir(c, q, up->genbuf, 0, eve, 0555, dp);
+			devdir(c, q, up->genbuf, 0, eve, DMDIR|0555, dp);
 			break;
 		}
 		return 1;
@@ -121,7 +124,7 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 		q.type = QTDIR;
 		q.path = N2ndqid;
 		strcpy(up->genbuf, nif->name);
-		devdir(c, q, up->genbuf, 0, eve, 0555, dp);
+		devdir(c, q, up->genbuf, 0, eve, DMDIR|0555, dp);
 		break;
 	case 0:
 		q.path = NETQID(NETID(c->qid.path), Ndataqid);
@@ -132,7 +135,7 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 		devdir(c, q, "ctl", 0, o, perm, dp);
 		break;
 	case 2:
-		q.path = Nstatqid;
+		q.path = NETQID(NETID(c->qid.path), Nstatqid);
 		devdir(c, q, "stats", 0, eve, 0444, dp);
 		break;
 	case 3:
@@ -140,7 +143,7 @@ netifgen(Chan *c, char*, Dirtab *vp, int, int i, Dir *dp)
 		devdir(c, q, "type", 0, eve, 0444, dp);
 		break;
 	case 4:
-		q.path = Nifstatqid;
+		q.path = NETQID(NETID(c->qid.path), Nifstatqid);
 		devdir(c, q, "ifstats", 0, eve, 0444, dp);
 		break;
 	default:
@@ -213,18 +216,24 @@ netifread(Netif *nif, Chan *c, void *a, long n, ulong offset)
 	case Nctlqid:
 		return readnum(offset, a, n, NETID(c->qid.path), NUMSIZE);
 	case Nstatqid:
-		p = smalloc(READSTR);
+		p = malloc(READSTR);
+		if(p == nil)
+			error(Enomem);
 		j = snprint(p, READSTR, "in: %llud\n", nif->inpackets);
 		j += snprint(p+j, READSTR-j, "link: %d\n", nif->link);
 		j += snprint(p+j, READSTR-j, "out: %llud\n", nif->outpackets);
 		j += snprint(p+j, READSTR-j, "crc errs: %d\n", nif->crcs);
 		j += snprint(p+j, READSTR-j, "overflows: %d\n", nif->overflows);
-		j += snprint(p+j, READSTR-j, "soft overflows: %d\n", nif->soverflows);
+		j += snprint(p+j, READSTR-j, "soft overflows: %d\n",
+			nif->soverflows);
 		j += snprint(p+j, READSTR-j, "framing errs: %d\n", nif->frames);
 		j += snprint(p+j, READSTR-j, "buffer errs: %d\n", nif->buffs);
 		j += snprint(p+j, READSTR-j, "output errs: %d\n", nif->oerrs);
 		j += snprint(p+j, READSTR-j, "prom: %d\n", nif->prom);
-		j += snprint(p+j, READSTR-j, "mbps: %d\n", nif->mbps);
+		if (nif->mbps < 1000)
+			j += snprint(p+j, READSTR-j, "Mb/s: %d\n", nif->mbps);
+		else
+			j += snprint(p+j, READSTR-j, "Gb/s: %d\n", nif->mbps/1000);
 		j += snprint(p+j, READSTR-j, "addr: ");
 		for(i = 0; i < nif->alen; i++)
 			j += snprint(p+j, READSTR-j, "%2.2ux", nif->addr[i]);
@@ -233,7 +242,9 @@ netifread(Netif *nif, Chan *c, void *a, long n, ulong offset)
 		free(p);
 		return n;
 	case Naddrqid:
-		p = smalloc(READSTR);
+		p = malloc(READSTR);
+		if(p == nil)
+			error(Enomem);
 		j = 0;
 		for(i = 0; i < nif->alen; i++)
 			j += snprint(p+j, READSTR-j, "%2.2ux", nif->addr[i]);
@@ -245,6 +256,10 @@ netifread(Netif *nif, Chan *c, void *a, long n, ulong offset)
 		return readnum(offset, a, n, f->type, NUMSIZE);
 	case Nifstatqid:
 		return 0;
+	case Nmtuqid:
+		snprint(up->genbuf, sizeof up->genbuf, "%11.ud %11.ud %11.ud\n",
+			nif->minmtu, nif->mtu, nif->maxmtu);
+		return readstr(offset, a, n, up->genbuf);
 	}
 	error(Ebadarg);
 	return -1;	/* not reached */
@@ -288,7 +303,7 @@ long
 netifwrite(Netif *nif, Chan *c, void *a, long n)
 {
 	Netfile *f;
-	int type;
+	int type, mtu;
 	char *p, buf[64];
 	uchar binaddr[Nmaxaddr];
 
@@ -308,7 +323,7 @@ netifwrite(Netif *nif, Chan *c, void *a, long n)
 	qlock(nif);
 	f = nif->f[NETID(c->qid.path)];
 	if((p = matchtoken(buf, "connect")) != 0){
-		type = strtoul(p, 0, 0);
+		type = atoi(p);
 		if(typeinuse(nif, type))
 			error(Einuse);
 		f->type = type;
@@ -332,23 +347,26 @@ netifwrite(Netif *nif, Chan *c, void *a, long n)
 			f->scan = type;
 			nif->scan++;
 		}
+	} else if((p = matchtoken(buf, "mtu")) != 0){
+		mtu = atoi(p);
+		/* zero resets default. */
+		if(mtu != 0 && (mtu < nif->minmtu || mtu > nif->maxmtu))
+			error(Ebadarg);
+		if(nif->hwmtu)
+			nif->mtu = nif->hwmtu(nif->arg, mtu);
+		else
+			nif->mtu = mtu;
 	} else if(matchtoken(buf, "bridge")){
 		f->bridge = 1;
-	} else if(matchtoken(buf, "bypass")){
-		if(nif->bypass != nil)
-			error(Einuse);
-		f->bypass = 1;
-		nif->bypass = f;
 	} else if(matchtoken(buf, "headersonly")){
 		f->headersonly = 1;
-	} else if((p = matchtoken(buf, "addmulti")) != nil){
+	} else if((p = matchtoken(buf, "addmulti")) != 0){
 		if(parseaddr(binaddr, p, nif->alen) < 0)
 			error("bad address");
 		p = netmulti(nif, f, binaddr, 1);
 		if(p)
 			error(p);
-	} else if((p = matchtoken(buf, "delmulti")) != nil
-		||(p = matchtoken(buf, "remmulti")) != nil){
+	} else if((p = matchtoken(buf, "remmulti")) != 0){
 		if(parseaddr(binaddr, p, nif->alen) < 0)
 			error("bad address");
 		p = netmulti(nif, f, binaddr, 0);
@@ -381,10 +399,8 @@ netifwstat(Netif *nif, Chan *c, uchar *db, int n)
 		free(dir);
 		error(Eshortstat);
 	}
-	if(!emptystr(dir[0].uid)){
-		strncpy(f->owner, dir[0].uid, KNAMELEN-1);
-		f->owner[KNAMELEN-1] = 0;
-	}
+	if(!emptystr(dir[0].uid))
+		strncpy(f->owner, dir[0].uid, KNAMELEN);
 	if(dir[0].mode != ~0UL)
 		f->mode = dir[0].mode;
 	free(dir);
@@ -414,12 +430,6 @@ netifclose(Netif *nif, Chan *c)
 	f = nif->f[NETID(c->qid.path)];
 	qlock(f);
 	if(--(f->inuse) == 0){
-		if(f->bypass){
-			qlock(nif);
-			nif->bypass = nil;
-			qunlock(nif);
-			f->bypass = 0;
-		}
 		if(f->prom){
 			qlock(nif);
 			if(--(nif->prom) == 0 && nif->promiscuous != nil)
@@ -486,8 +496,7 @@ netown(Netfile *p, char *o, int omode)
 			return -1;
 		}
 	}
-	strncpy(p->owner, o, KNAMELEN-1);
-	p->owner[KNAMELEN-1] = 0;
+	strncpy(p->owner, o, KNAMELEN);
 	p->mode = 0660;
 	unlock(&netlock);
 	return 0;

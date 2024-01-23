@@ -15,7 +15,7 @@
 
 #include	"ip.h"
 #include	"ipv6.h"
-#include	<libsec.h>
+#include	"libsec.h"
 
 #define BITS2BYTES(bi) (((bi) + BI2BY - 1) / BI2BY)
 #define BYTES2BITS(by)  ((by) * BI2BY)
@@ -145,7 +145,7 @@ struct Espcb
 
 struct Algorithm
 {
-	char 	*name;
+	char	*name;
 	int	keylen;		/* in bits */
 	void	(*init)(Espcb*, char* name, uchar *key, unsigned keylen);
 };
@@ -162,6 +162,7 @@ static	void desespinit(Espcb *ecb, char *name, uchar *k, unsigned n);
 
 static	void nullahinit(Espcb*, char*, uchar *key, unsigned keylen);
 static	void shaahinit(Espcb*, char*, uchar *key, unsigned keylen);
+static	void aesahinit(Espcb*, char*, uchar *key, unsigned keylen);
 static	void md5ahinit(Espcb*, char*, uchar *key, unsigned keylen);
 
 static Algorithm espalg[] =
@@ -171,6 +172,8 @@ static Algorithm espalg[] =
 	"aes_128_cbc",	128,	aescbcespinit,	/* new rfc3602 */
 	"aes_ctr",	128,	aesctrespinit,	/* new rfc3686 */
 	"des_56_cbc",	64,	desespinit,	/* rfc2405, deprecated */
+	/* rc4 was never required, was used in original bandt */
+//	"rc4_128",	128,	rc4espinit,
 	nil,		0,	nil,
 };
 
@@ -178,6 +181,7 @@ static Algorithm ahalg[] =
 {
 	"null",		0,	nullahinit,
 	"hmac_sha1_96",	128,	shaahinit,	/* rfc2404 */
+	"aes_xcbc_mac_96", 128,	aesahinit,	/* new rfc3566 */
 	"hmac_md5_96",	128,	md5ahinit,	/* rfc2403 */
 	nil,		0,	nil,
 };
@@ -261,9 +265,20 @@ espclose(Conv *c)
 	ipmove(c->raddr, IPnoaddr);
 
 	ecb = (Espcb*)c->ptcl;
-	secfree(ecb->espstate);
-	secfree(ecb->ahstate);
+	free(ecb->espstate);
+	free(ecb->ahstate);
 	memset(ecb, 0, sizeof(Espcb));
+}
+
+static int
+convipvers(Conv *c)
+{
+	if((memcmp(c->raddr, v4prefix, IPv4off) == 0 &&
+	    memcmp(c->laddr, v4prefix, IPv4off) == 0) ||
+	    ipcmp(c->raddr, IPnoaddr) == 0)
+		return V4;
+	else
+		return V6;
 }
 
 static int
@@ -423,9 +438,9 @@ espkick(void *x)
 	qunlock(c);
 	/* print("esp: pass down: %uld\n", BLEN(bp)); */
 	if (vers.version == V4)
-		ipoput4(c->p->f, bp, nil, c->ttl, c->tos, c);
+		ipoput4(c->p->f, bp, 0, c->ttl, c->tos, c);
 	else
-		ipoput6(c->p->f, bp, nil, c->ttl, c->tos, c);
+		ipoput6(c->p->f, bp, 0, c->ttl, c->tos, c);
 }
 
 /*
@@ -433,7 +448,7 @@ espkick(void *x)
  * pass the result up the spi's Conv's read queue.
  */
 void
-espiput(Proto *esp, Ipifc *ifc, Block *bp)
+espiput(Proto *esp, Ipifc*, Block *bp)
 {
 	int payload, nexthdr;
 	uchar *auth, *espspi;
@@ -462,7 +477,7 @@ espiput(Proto *esp, Ipifc *ifc, Block *bp)
 		qunlock(esp);
 		netlog(f, Logesp, "esp: no conv %I -> %I!%lud\n", vers.raddr,
 			vers.laddr, vers.spi);
-		icmpnoconv(f, ifc, bp);
+		icmpnoconv(f, bp);
 		freeblist(bp);
 		return;
 	}
@@ -472,7 +487,7 @@ espiput(Proto *esp, Ipifc *ifc, Block *bp)
 
 	ecb = c->ptcl;
 	/* too hard to do decryption/authentication on block lists */
-	if(bp->next != nil)
+	if(bp->next)
 		bp = concatblock(bp);
 
 	if(BLEN(bp) < vers.hdrlen + ecb->espivlen + Esptaillen + ecb->ahlen) {
@@ -500,7 +515,7 @@ print("esp: bad auth %I -> %I!%ld\n", vers.raddr, vers.laddr, vers.spi);
 	payload = BLEN(bp) - vers.hdrlen - ecb->ahlen;
 	if(payload <= 0 || payload % 4 != 0 || payload % ecb->espblklen != 0) {
 		qunlock(c);
-		netlog(f, Logesp, "esp: bad length %I -> %I!%lud payload=%d BLEN=%zd\n",
+		netlog(f, Logesp, "esp: bad length %I -> %I!%lud payload=%d BLEN=%lud\n",
 			vers.raddr, vers.laddr, vers.spi, payload, BLEN(bp));
 		freeb(bp);
 		return;
@@ -574,7 +589,7 @@ espctl(Conv *c, char **f, int n)
 
 /* called from icmp(v6) for unreachable hosts, time exceeded, etc. */
 void
-espadvise(Proto *esp, Block *bp, Ipifc *, char *msg)
+espadvise(Proto *esp, Block *bp, char *msg)
 {
 	Conv *c;
 	Versdep vers;
@@ -584,7 +599,7 @@ espadvise(Proto *esp, Block *bp, Ipifc *, char *msg)
 
 	qlock(esp);
 	c = convlookup(esp, vers.spi);
-	if(c != nil && !c->ignoreadvice) {
+	if(c != nil) {
 		qhangup(c->rq, msg);
 		qhangup(c->wq, msg);
 	}
@@ -683,16 +698,16 @@ setalg(Espcb *ecb, char **f, int n, Algorithm *alg)
 			return "non-hex character in key";
 	}
 	/* collapse hex digits into complete bytes in reverse order in key */
-	key = secalloc(nbyte);
+	key = smalloc(nbyte);
 	for(i = 0; i < nchar && i/2 < nbyte; i++) {
 		c = f[2][nchar-i-1];
 		if(i&1)
 			c <<= 4;
 		key[i/2] |= c;
 	}
-	memset(f[2], 0, nchar);
+
 	alg->init(ecb, alg->name, key, alg->keylen);
-	secfree(key);
+	free(key);
 	return nil;
 }
 
@@ -780,7 +795,7 @@ shaahinit(Espcb *ecb, char *name, uchar *key, unsigned klen)
 	ecb->ahblklen = 1;
 	ecb->ahlen = BITS2BYTES(96);
 	ecb->auth = shaauth;
-	ecb->ahstate = secalloc(klen);
+	ecb->ahstate = smalloc(klen);
 	memmove(ecb->ahstate, key, klen);
 }
 
@@ -788,6 +803,37 @@ shaahinit(Espcb *ecb, char *name, uchar *key, unsigned klen)
 /*
  * aes
  */
+
+/* ah_aes_xcbc_mac_96, rfc3566 */
+static int
+aesahauth(Espcb *ecb, uchar *t, int tlen, uchar *auth)
+{
+	int r;
+	uchar hash[AESdlen];
+
+	memset(hash, 0, AESdlen);
+	ecb->ds = hmac_aes(t, tlen, (uchar*)ecb->ahstate, BITS2BYTES(96), hash,
+		ecb->ds);
+	r = memcmp(auth, hash, ecb->ahlen) == 0;
+	memmove(auth, hash, ecb->ahlen);
+	return r;
+}
+
+static void
+aesahinit(Espcb *ecb, char *name, uchar *key, unsigned klen)
+{
+	if(klen != 128)
+		panic("aesahinit: keylen not 128");
+	klen /= BI2BY;
+
+	ecb->ahalg = name;
+	ecb->ahblklen = 1;
+	ecb->ahlen = BITS2BYTES(96);
+	ecb->auth = aesahauth;
+	ecb->ahstate = smalloc(klen);
+	memmove(ecb->ahstate, key, klen);
+}
+
 static int
 aescbccipher(Espcb *ecb, uchar *p, int n)	/* 128-bit blocks */
 {
@@ -829,21 +875,21 @@ static void
 aescbcespinit(Espcb *ecb, char *name, uchar *k, unsigned n)
 {
 	uchar key[Aeskeysz], ivec[Aeskeysz];
+	int i;
 
 	n = BITS2BYTES(n);
 	if(n > Aeskeysz)
 		n = Aeskeysz;
 	memset(key, 0, sizeof(key));
 	memmove(key, k, n);
-	prng(ivec, Aeskeysz);
+	for(i = 0; i < Aeskeysz; i++)
+		ivec[i] = nrand(256);
 	ecb->espalg = name;
 	ecb->espblklen = Aesblk;
 	ecb->espivlen = Aesblk;
 	ecb->cipher = aescbccipher;
-	ecb->espstate = secalloc(sizeof(AESstate));
+	ecb->espstate = smalloc(sizeof(AESstate));
 	setupAESstate(ecb->espstate, key, n /* keybytes */, ivec);
-	memset(ivec, 0, sizeof(ivec));
-	memset(key, 0, sizeof(key));
 }
 
 static int
@@ -887,21 +933,21 @@ static void
 aesctrespinit(Espcb *ecb, char *name, uchar *k, unsigned n)
 {
 	uchar key[Aesblk], ivec[Aesblk];
+	int i;
 
 	n = BITS2BYTES(n);
 	if(n > Aeskeysz)
 		n = Aeskeysz;
 	memset(key, 0, sizeof(key));
 	memmove(key, k, n);
-	prng(ivec, Aesblk);
+	for(i = 0; i < Aesblk; i++)
+		ivec[i] = nrand(256);
 	ecb->espalg = name;
 	ecb->espblklen = Aesblk;
 	ecb->espivlen = Aesblk;
 	ecb->cipher = aesctrcipher;
-	ecb->espstate = secalloc(sizeof(AESstate));
+	ecb->espstate = smalloc(sizeof(AESstate));
 	setupAESstate(ecb->espstate, key, n /* keybytes */, ivec);
-	memset(ivec, 0, sizeof(ivec));
-	memset(key, 0, sizeof(key));
 }
 
 
@@ -952,7 +998,7 @@ md5ahinit(Espcb *ecb, char *name, uchar *key, unsigned klen)
 	ecb->ahblklen = 1;
 	ecb->ahlen = BITS2BYTES(96);
 	ecb->auth = md5auth;
-	ecb->ahstate = secalloc(klen);
+	ecb->ahstate = smalloc(klen);
 	memmove(ecb->ahstate, key, klen);
 }
 
@@ -995,44 +1041,44 @@ static void
 desespinit(Espcb *ecb, char *name, uchar *k, unsigned n)
 {
 	uchar key[Desblk], ivec[Desblk];
+	int i;
 
 	n = BITS2BYTES(n);
 	if(n > Desblk)
 		n = Desblk;
 	memset(key, 0, sizeof(key));
 	memmove(key, k, n);
-	prng(ivec, Desblk);
+	for(i = 0; i < Desblk; i++)
+		ivec[i] = nrand(256);
 	ecb->espalg = name;
 	ecb->espblklen = Desblk;
 	ecb->espivlen = Desblk;
 
 	ecb->cipher = descipher;
-	ecb->espstate = secalloc(sizeof(DESstate));
+	ecb->espstate = smalloc(sizeof(DESstate));
 	setupDESstate(ecb->espstate, key, ivec);
-	memset(ivec, 0, sizeof(ivec));
-	memset(key, 0, sizeof(key));
 }
 
 static void
 des3espinit(Espcb *ecb, char *name, uchar *k, unsigned n)
 {
 	uchar key[3][Desblk], ivec[Desblk];
+	int i;
 
 	n = BITS2BYTES(n);
 	if(n > Des3keysz)
 		n = Des3keysz;
 	memset(key, 0, sizeof(key));
 	memmove(key, k, n);
-	prng(ivec, Desblk);
+	for(i = 0; i < Desblk; i++)
+		ivec[i] = nrand(256);
 	ecb->espalg = name;
 	ecb->espblklen = Desblk;
 	ecb->espivlen = Desblk;
 
 	ecb->cipher = des3cipher;
-	ecb->espstate = secalloc(sizeof(DES3state));
+	ecb->espstate = smalloc(sizeof(DES3state));
 	setupDES3state(ecb->espstate, key, ivec);
-	memset(ivec, 0, sizeof(ivec));
-	memset(key, 0, sizeof(key));
 }
 
 

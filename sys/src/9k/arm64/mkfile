@@ -1,0 +1,125 @@
+# arm64 mkfile - build arm64 kernels
+
+KTZERO=0xffffffc080000000			# default: at 2GB phys
+RBKTZERO=0xbff05000
+BANK0SIZE=GB
+PAUart0=0x31c0000
+
+# changing ARCH should change addrconf.h thus triggering recompilation.
+# this is more foolproof than requiring "mk nuke" when changing ARCH.
+## <rvarch.$ARCH
+# KTZERO here must match KTZERO in mem.h
+## <|mkconf KTZERO ${KTZERO}ull RVARCH $ARCH'' PAUart0 $PAUart0'' BANK0SIZE $BANK0SIZE'' >tmpac; cpdiffers tmpac addrconf.h; echo
+
+ARCH=hc
+CONF=${ARCH}cpu
+CONFLIST=${ARCH}cpu # ${ARCH}cpuf ${ARCH}fs
+EXTRACOPIES=fsstand
+
+p=9
+
+objtype=arm64
+</$objtype/mkfile
+
+CFLAGS=$CFLAGS $CONFDEF
+AFLAGS=$AFLAGS $CONFDEF
+
+9k:V:	$p$CONF
+
+null:VQ:
+	echo
+
+# <| ../mk/mkparts $CONF; awk -f ../mk/parse $CONF
+<|awk -f ../mk/parse $CONF
+<../mk/bootmkfile
+<../mk/portmkfile
+
+# OBJ=$MACH $CONF.root.$O $CONF.$O $DEVS $PORT
+OBJ=$MACH $PORT $DEVS $CONF.$O $CONF.root.$O
+
+$p$CONF:	$CONF.c $OBJ $LIB
+	d=`{date}
+	$CC $CFLAGS '-DKERNDATE='`{date -n} '-DDATESTR="'$"d'"' $CONF.c
+	$LD -o $target $LDFLAGS -T$KTZERO -R4096 $OBJ
+	size $target
+
+#	# .bin for temu, for tecpu
+#	$LD -a >$target.bin.list $LDFLAGS -o $target.bin -H0 -T$KTZERO -R8 $OBJ &
+#	wait
+#	gzip <$target.bin >$target.gz
+#	aux/mkubootimage -l `{echo $KTZERO | sed 's/0xf+[8ce]?/0x/'} \
+#		$target.gz $target.uim && rm -f $target.gz # for u-boot
+#	# aux/mkubootimage -l `{echo $KTZERO | sed 's/0xf+[8ce]?/0x/'} \
+#	#	$target.bin $target.uim
+
+#	# -H7 -P0x020000 sets INITTEXTP
+#	$LD -o $target.elf -S -H7 -k -T$KTZERO -P$KTZERO -E_main -R8 $OBJ &
+#	dd -ibs 32 -skip 1 -obs 8192 <$target >$target.bin
+
+$p$CONF.bin $p$CONF.uim: $p$CONF
+	;
+
+# don't strip the gzipped kernels -- too frustrating when that's all you have!
+$p%.gz:D:	$p%
+	gzip -9 <$p$stem >$p$stem.gz
+$p%.lz:D:	$p%
+	lzip -9 <$p$stem >$p$stem.lz
+
+# we don't need gzipped kernels otherwise, so don't make them
+install:V:	$p$CONF $p$CONF.bin $p$CONF.uim
+	cp -x $prereq /$objtype/ &
+	if (! ~ $#EXTRACOPIES 0)
+		echo -n 'installing on: '
+	for(i in $EXTRACOPIES)
+		{ 9fs $i && cp -x $prereq /n/$i/$objtype && echo -n $i... & }
+	wait
+	echo
+
+%.$O:	mem.h addrconf.h	# rvarch.$ARCH
+
+start.$O strap.$O mtrap.$O:	${objtype}l.h	# start.h
+mch.$O fp.$O fakemtrap.$O sbiecall.$O: ${objtype}l.h
+rebootcode.$O:	${objtype}l.h
+
+$CONF.$O:	$objtype.h
+arch%.$O:	$objtype.h
+begin.$O:	$objtype.h
+devarch.$O:	$objtype.h ../port/error.h /$objtype/include/ureg.h
+fpu.$O:		$objtype.h /$objtype/include/ureg.h
+main.$O:	$objtype.h io.h init.h reboot.h
+mmu.$O:		$objtype.h
+%sbi%.$O:	$objtype.h
+trap.$O:	../port/error.h io.h $objtype.h
+trap.$O:	/sys/include/tos.h /$objtype/include/ureg.h
+
+devether.$O:	../port/error.h ../port/netif.h etherif.h
+devrtc.$O:	../port/error.h
+ether%.$O:	../port/error.h ../port/netif.h etherif.h io.h
+kbd.$O:		../port/error.h io.h
+pci.$O:		io.h
+
+${objtype}l.h:D:	$objtype.h
+	rc ../mk/mkenum $objtype.h >$target
+
+#reboot.h reboot.out:D:	reboottramp.$O restart.$O ${objtype}l.h mem.h
+#	$LD -a >$target.list -s -T0xbff05000 -R8 -o reboot.out \
+#		reboottramp.$O restart.$O
+
+# -T argument must match sys->reboottramp in dat.h (see acid), as 32 bits.
+# currently assumes 1GB at PHYSMEM and lives at the top.
+# "mk -f ktzmkfile" if PHYSMEM or BANK0SIZE or MACHSTKSZ or Mach changes
+# to generate a new value.
+reboot.h reboot.out:D:	rebootcode.$O ${objtype}l.h mem.h
+	$LD -a >$target.list -l -s -T$RBKTZERO -R8 -o reboot.out rebootcode.$O
+	size reboot.out
+	{echo 'uchar rebootcode[]={'; exec2hex reboot.out; echo '};'} >reboot.h
+
+$CONF.rr:	../mk/mkrr $CONF hpc-root/$CONF.proto hpc-root/$O.cpu
+	../mk/mkrr $CONF hpc-root/$CONF.proto
+
+$ARCH.clean:V:
+	rm -f $ARCH^*.c [9bz]$ARCH^* [9bz]$ARCH^*.gz boot$ARCH^*.* $p$ARCH^*.list
+	rm -f prktzero.[$OS] [$OS].prktzero
+
+$ARCH.nuke:V:
+	rm -f $objtype^l.h reboot.h

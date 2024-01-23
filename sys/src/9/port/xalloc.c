@@ -16,9 +16,9 @@ typedef struct Xhdr Xhdr;
 
 struct Hole
 {
-	uintptr	addr;
-	uintptr	size;
-	uintptr	top;
+	ulong	addr;
+	ulong	size;
+	ulong	top;
 	Hole*	link;
 };
 
@@ -42,10 +42,11 @@ static Xalloc	xlists;
 void
 xinit(void)
 {
-	ulong maxpages, kpages, n;
+	int i, n, upages, kpages;
+	ulong maxpages;
+	Confmem *m;
+	Pallocmem *pm;
 	Hole *h, *eh;
-	Confmem *cm;
-	int i;
 
 	eh = &xlists.hole[Nhole-1];
 	for(h = xlists.hole; h < eh; h++)
@@ -53,45 +54,49 @@ xinit(void)
 
 	xlists.flist = xlists.hole;
 
-	kpages = conf.npage - conf.upages;
-
+	upages = conf.upages;
+	kpages = conf.npage - upages;
+	pm = palloc.mem;
 	for(i=0; i<nelem(conf.mem); i++){
-		cm = &conf.mem[i];
-		n = cm->npage;
+		m = &conf.mem[i];
+		n = m->npage;
 		if(n > kpages)
 			n = kpages;
 		/* don't try to use non-KADDR-able memory for kernel */
-		maxpages = cankaddr(cm->base)/BY2PG;
+		maxpages = cankaddr(m->base)/BY2PG;
 		if(n > maxpages)
 			n = maxpages;
-		/* give to kernel */
+		/* first give to kernel */
 		if(n > 0){
-			cm->kbase = (uintptr)KADDR(cm->base);
-			cm->klimit = (uintptr)cm->kbase+(uintptr)n*BY2PG;
-			if(cm->klimit == 0)
-				cm->klimit = (uintptr)-BY2PG;
-			xhole(cm->base, cm->klimit - cm->kbase);
+			m->kbase = (ulong)KADDR(m->base);
+			m->klimit = (ulong)KADDR(m->base+n*BY2PG);
+			xhole(m->base, n*BY2PG);
 			kpages -= n;
 		}
-		/*
-		 * anything left over: cm->npage - nkpages(cm)
-		 * will be given to user by pageinit()
-		 */
+		/* if anything left over, give to user */
+		if(n < m->npage){
+			if(pm >= palloc.mem+nelem(palloc.mem)){
+				print("xinit: losing %lud pages\n", m->npage-n);
+				continue;
+			}
+			pm->base = m->base+n*BY2PG;
+			pm->npage = m->npage - n;
+			pm++;
+		}
 	}
-	xsummary();
+//	xsummary();			/* call it from main if desired */
 }
 
 void*
 xspanalloc(ulong size, int align, ulong span)
 {
-	uintptr a, v, t;
-
-	a = (uintptr)xalloc(size+align+span);
+	ulong a, v, t;
+	a = (ulong)xalloc(size+align+span);
 	if(a == 0)
 		panic("xspanalloc: %lud %d %lux", size, align, span);
 
 	if(span > 2) {
-		v = (a + span) & ~((uintptr)span-1);
+		v = (a + span) & ~(span-1);
 		t = v - a;
 		if(t > 0)
 			xhole(PADDR(a), t);
@@ -103,7 +108,7 @@ xspanalloc(ulong size, int align, ulong span)
 		v = a;
 
 	if(align > 1)
-		v = (v + align) & ~((uintptr)align-1);
+		v = (v + align) & ~(align-1);
 
 	return (void*)v;
 }
@@ -154,7 +159,7 @@ xfree(void *p)
 {
 	Xhdr *x;
 
-	x = (Xhdr*)((uintptr)p - offsetof(Xhdr, data[0]));
+	x = (Xhdr*)((ulong)p - offsetof(Xhdr, data[0]));
 	if(x->magix != Magichole) {
 		xsummary();
 		panic("xfree(%#p) %#ux != %#lux", p, Magichole, x->magix);
@@ -167,8 +172,8 @@ xmerge(void *vp, void *vq)
 {
 	Xhdr *p, *q;
 
-	p = (Xhdr*)(((uintptr)vp - offsetof(Xhdr, data[0])));
-	q = (Xhdr*)(((uintptr)vq - offsetof(Xhdr, data[0])));
+	p = (Xhdr*)(((ulong)vp - offsetof(Xhdr, data[0])));
+	q = (Xhdr*)(((ulong)vq - offsetof(Xhdr, data[0])));
 	if(p->magix != Magichole || q->magix != Magichole) {
 		int i;
 		ulong *wd;
@@ -195,10 +200,10 @@ xmerge(void *vp, void *vq)
 }
 
 void
-xhole(uintptr addr, uintptr size)
+xhole(ulong addr, ulong size)
 {
+	ulong top;
 	Hole *h, *c, **l;
-	uintptr top;
 
 	if(size == 0)
 		return;
@@ -234,7 +239,7 @@ xhole(uintptr addr, uintptr size)
 
 	if(xlists.flist == nil) {
 		iunlock(&xlists);
-		print("xfree: no free holes, leaked %llud bytes\n", (uvlong)size);
+		print("xfree: no free holes, leaked %lud bytes\n", size);
 		return;
 	}
 
@@ -253,17 +258,24 @@ xsummary(void)
 {
 	int i;
 	Hole *h;
-	uintptr s;
 
 	i = 0;
 	for(h = xlists.flist; h; h = h->link)
 		i++;
-	print("%d holes free\n", i);
 
-	s = 0;
+	print("%d holes free", i);
+	i = 0;
 	for(h = xlists.table; h; h = h->link) {
-		print("%#8.8p %#8.8p %llud\n", h->addr, h->top, (uvlong)h->size);
-		s += h->size;
+		if (0) {
+			print("addr %#.8lux top %#.8lux size %lud\n",
+				h->addr, h->top, h->size);
+			delay(10);
+		}
+		i += h->size;
+		if (h == h->link) {
+			print("xsummary: infinite loop broken\n");
+			break;
+		}
 	}
-	print("%llud bytes free\n", (uvlong)s);
+	print(" %d bytes free\n", i);
 }

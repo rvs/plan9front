@@ -1,0 +1,7 @@
+# starfive visionfive 2
+PHYSMEM=0x40000000u
+KTZERO=0xffffffc040200000	# sv39 but skip firmware (& extended a.out hdr?)
+RBKTZERO=0x7ff05000
+PAUart0=0x10000000
+CONFDEF= -DERRATUM_CIP_1200 -DLONG_CLINT
+SFX=bin

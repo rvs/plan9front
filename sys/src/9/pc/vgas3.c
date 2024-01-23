@@ -4,7 +4,6 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 
 #define	Image	IMAGE
@@ -92,18 +91,16 @@ s3page(VGAscr* scr, int page)
 static void
 s3linear(VGAscr* scr, int, int)
 {
-	uvlong mmiobase;
-	ulong mmiosize;
 	int id, j;
+	ulong mmiobase, mmiosize;
 	Pcidev *p;
 	
+	vgalinearpciid(scr, PCIS3, 0);
 	p = scr->pci;
-	if(p == nil)
+	if(scr->paddr == 0 || p == nil)
 		return;
-	vgalinearpci(scr);
-
-	if(scr->paddr)
-		addvgaseg("s3screen", scr->paddr, scr->apsize);
+		
+	addvgaseg("s3screen", scr->paddr, scr->apsize);
 	
 	id = (vgaxi(Crtx, 0x2D)<<8)|vgaxi(Crtx, 0x2E);
 	switch(id){			/* find mmio */
@@ -122,7 +119,6 @@ s3linear(VGAscr* scr, int, int)
 		 * much space they would need in the first design.
 		 */
 		for(j=0; j<nelem(p->mem); j++){
-			if((p->mem[j].bar&1) == 0)
 			if((p->mem[j].bar&~0x0F) != scr->paddr)
 			if(p->mem[j].size==512*1024 || p->mem[j].size==16*1024*1024){
 				mmiobase = p->mem[j].bar & ~0x0F;
@@ -309,7 +305,7 @@ s3enable(VGAscr* scr)
 	 * Find a place for the cursor data in display memory.
 	 * Must be on a 1024-byte boundary.
 	 */
-	storage = (scr->pitch*scr->height+1023)/1024;
+	storage = (scr->gscreen->width*BY2WD*scr->gscreen->r.max.y+1023)/1024;
 	vgaxo(Crtx, 0x4C, storage>>8);
 	vgaxo(Crtx, 0x4D, storage & 0xFF);
 	storage *= 1024;
@@ -319,7 +315,7 @@ s3enable(VGAscr* scr)
 	 * Load, locate and enable the cursor
 	 * in Microsoft Windows format.
 	 */
-	s3load(scr, &cursor);
+	s3load(scr, &arrow);
 	s3move(scr, ZP);
 	vgaxo(Crtx, 0x55, vgaxi(Crtx, 0x55) & ~0x10);
 	s3vsyncactive();
@@ -420,12 +416,14 @@ hwscroll(VGAscr *scr, Rectangle r, Rectangle sr)
 {
 	enum { Bitbltop = 0xCC };	/* copy source */
 	ulong *mmio;
-	ulong cmd;
+	ulong cmd, stride;
 	Point dp, sp;
-	int did;
+	int did, d;
 
-	did = (scr->gscreen->depth-8)/8;
+	d = scr->gscreen->depth;
+	did = (d-8)/8;
 	cmd = 0x00000020|(Bitbltop<<17)|(did<<2);
+	stride = Dx(scr->gscreen->r)*d/8;
 
 	if(r.min.x <= sr.min.x){
 		cmd |= 1<<25;
@@ -450,7 +448,7 @@ hwscroll(VGAscr *scr, Rectangle r, Rectangle sr)
 	waitforfifo(scr, 7);
 	mmio[SrcBase] = scr->paddr;
 	mmio[DstBase] = scr->paddr;
-	mmio[Stride] = (scr->pitch<<16)|scr->pitch;
+	mmio[Stride] = (stride<<16)|stride;
 	mmio[WidthHeight] = ((Dx(r)-1)<<16)|Dy(r);
 	mmio[SrcXY] = (sp.x<<16)|sp.y;
 	mmio[DestXY] = (dp.x<<16)|dp.y;
@@ -464,18 +462,20 @@ hwfill(VGAscr *scr, Rectangle r, ulong sval)
 {
 	enum { Bitbltop = 0xCC };	/* copy source */
 	ulong *mmio;
-	ulong cmd;
-	int did;
+	ulong cmd, stride;
+	int did, d;
 
-	did = (scr->gscreen->depth-8)/8;
+	d = scr->gscreen->depth;
+	did = (d-8)/8;
 	cmd = 0x16000120|(Bitbltop<<17)|(did<<2);
+	stride = Dx(scr->gscreen->r)*d/8;
 	mmio = scr->mmio;
 	waitforlinearfifo(scr);
 	waitforfifo(scr, 8);
 	mmio[SrcBase] = scr->paddr;
 	mmio[DstBase] = scr->paddr;
 	mmio[DstBase] = scr->paddr;
-	mmio[Stride] = (scr->pitch<<16)|scr->pitch;
+	mmio[Stride] = (stride<<16)|stride;
 	mmio[FgrdData] = sval;
 	mmio[WidthHeight] = ((Dx(r)-1)<<16)|Dy(r);
 	mmio[DestXY] = (r.min.x<<16)|r.min.y;
@@ -521,6 +521,7 @@ s3drawinit(VGAscr *scr)
 	 * above.
 	 */
 	scr->blank = s3blank;
+	/* hwblank = 1;		not known to work well */
 
 	switch(id){
 	case VIRGE:

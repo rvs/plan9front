@@ -7,39 +7,31 @@
 #include <u.h>
 #include <libc.h>
 
-char cons[] = "/dev/cons";
+char cons[] = "#c/cons";
 char boot[] = "/boot/boot";
 char dev[] = "/dev";
 char c[] = "#c";
-char d[] = "#d";
 char e[] = "#e";
 char ec[] = "#ec";
-char p[] = "#p";
 char s[] = "#s";
-char σ[] = "#σ";
-char env[] = "/env";
-char fd[] = "/fd";
-char proc[] = "/proc";
 char srv[] = "/srv";
-char shr[] = "/shr";
+char env[] = "/env";
 
 void
-startboot(char*, char **argv)
+startboot(char *argv0, char **argv)
 {
 	char buf[200];	/* keep this fairly large to capture error details */
 
-	bind(c, dev, MAFTER);
-	bind(d, fd, MREPL);
-	bind(ec, env, MAFTER);
-	bind(e, env, MCREATE|MAFTER);
-	bind(p, proc, MREPL);
-	bind(s, srv, MREPL|MCREATE);
-	bind(σ, shr, MREPL);
-
+	/* in case boot is a shell script */
 	open(cons, OREAD);
 	open(cons, OWRITE);
 	open(cons, OWRITE);
+	bind(c, dev, MAFTER);
+	bind(ec, env, MAFTER);
+	bind(e, env, MCREATE|MAFTER);
+	bind(s, srv, MREPL|MCREATE);
 
+	USED(argv0);
 	exec(boot, argv);
 
 	rerrstr(buf, sizeof buf);

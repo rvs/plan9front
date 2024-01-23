@@ -95,12 +95,17 @@ i8259init(void)
 			if(inb(Elcr1) == 0x20)
 				i8259elcr = x;
 			outb(Elcr1, x & 0xFF);
-			print("ELCR: %4.4uX\n", i8259elcr);
+			if (i8259elcr)
+				print("ELCR: %4.4uX\n", i8259elcr);
 		}
 	}
 	iunlock(&i8259lock);
 }
 
+/*
+ * return in-service bit for vector vno.
+ * also dismisses highest-priority interrupt.
+ */
 int
 i8259isr(int vno)
 {
@@ -127,38 +132,11 @@ i8259isr(int vno)
 	return isr & (1<<irq);
 }
 
-static int
-irqenable(Vctl *v, int shared)
-{
-	if(shared)
-		return 0;
-	ilock(&i8259lock);
-	i8259mask &= ~(1<<v->irq);
-	if(v->irq < 8)
-		outb(Int0aux, i8259mask & 0xFF);
-	else
-		outb(Int1aux, (i8259mask>>8) & 0xFF);
-	iunlock(&i8259lock);
-	return 0;
-}
-
-static int
-irqdisable(Vctl *v, int shared)
-{
-	if(shared)
-		return 0;
-	ilock(&i8259lock);
-	i8259mask |= 1<<v->irq;
-	if(v->irq < 8)
-		outb(Int0aux, i8259mask & 0xFF);
-	else
-		outb(Int1aux, (i8259mask>>8) & 0xFF);
-	iunlock(&i8259lock);
-	return 0;
-}
-
+/*
+ * Return -1 or the chosen vector number.
+ */
 int
-i8259assign(Vctl *v)
+i8259enable(Vctl* v)
 {
 	int irq, irqbit;
 
@@ -180,40 +158,53 @@ i8259assign(Vctl *v)
 		iunlock(&i8259lock);
 		return -1;
 	}
+	i8259mask &= ~irqbit;
+	if(irq < 8)
+		outb(Int0aux, i8259mask & 0xFF);
+	else
+		outb(Int1aux, (i8259mask>>8) & 0xFF);
+
+	v->eoi = v->isr = nil;
+	if(i8259elcr & irqbit)
+		v->eoi = i8259isr;  /* dismiss level-triggered at isr end */
+	else
+		v->isr = i8259isr;  /* dismiss edge-triggered at isr start */
 	iunlock(&i8259lock);
 
-	if(i8259elcr & irqbit)
-		v->eoi = i8259isr;
-	else
-		v->isr = i8259isr;
-
-	v->enable = irqenable;
-	v->disable = irqdisable;
-
 	return VectorPIC+irq;
-}
-
-int
-i8259irqno(int irq, int tbdf)
-{
-	if(tbdf != BUSUNKNOWN && (irq == 0xff || irq == 0))
-		return -1;
-
-	/*
-	 * IRQ2 doesn't really exist, it's used to gang the interrupt
-	 * controllers together. A device set to IRQ2 will appear on
-	 * the second interrupt controller as IRQ9.
-	 */
-	if(irq == 2)
-		irq = 9;
-
-	return irq;
 }
 
 int
 i8259vecno(int irq)
 {
 	return VectorPIC+irq;
+}
+
+int
+i8259disable(int irq)
+{
+	int irqbit;
+
+	/*
+	 * Given an IRQ, disable the corresponding interrupt
+	 * in the 8259.
+	 */
+	if(irq < 0 || irq > MaxIrqPIC){
+		print("i8259disable: irq %d out of range\n", irq);
+		return -1;
+	}
+	irqbit = 1<<irq;
+
+	ilock(&i8259lock);
+	if(!(i8259mask & irqbit)){
+		i8259mask |= irqbit;
+		if(irq < 8)
+			outb(Int0aux, i8259mask & 0xFF);
+		else
+			outb(Int1aux, (i8259mask>>8) & 0xFF);
+	}
+	iunlock(&i8259lock);
+	return 0;
 }
 
 void

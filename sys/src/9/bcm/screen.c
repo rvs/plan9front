@@ -22,11 +22,26 @@ enum {
 	Depth		= 16,
 };
 
+Cursor	arrow = {
+	{ -1, -1 },
+	{ 0xFF, 0xFF, 0x80, 0x01, 0x80, 0x02, 0x80, 0x0C,
+	  0x80, 0x10, 0x80, 0x10, 0x80, 0x08, 0x80, 0x04,
+	  0x80, 0x02, 0x80, 0x01, 0x80, 0x02, 0x8C, 0x04,
+	  0x92, 0x08, 0x91, 0x10, 0xA0, 0xA0, 0xC0, 0x40,
+	},
+	{ 0x00, 0x00, 0x7F, 0xFE, 0x7F, 0xFC, 0x7F, 0xF0,
+	  0x7F, 0xE0, 0x7F, 0xE0, 0x7F, 0xF0, 0x7F, 0xF8,
+	  0x7F, 0xFC, 0x7F, 0xFE, 0x7F, 0xFC, 0x73, 0xF8,
+	  0x61, 0xF0, 0x60, 0xE0, 0x40, 0x40, 0x00, 0x00,
+	},
+};
+
 Memimage *gscreen;
+Lcd	*lcd;
 
 static Memdata xgdata;
 
-static Memimage xgscreen =
+/*static*/ Memimage xgscreen =
 {
 	{ 0, 0, Wid, Ht },	/* r */
 	{ 0, 0, Wid, Ht },	/* clipr */
@@ -55,25 +70,203 @@ static void myscreenputs(char *s, int n);
 static void screenputc(char *buf);
 static void screenwin(void);
 
+/*
+ * Software cursor. 
+ */
+static int	swvisible;	/* is the cursor visible? */
+static int	swenabled;	/* is the cursor supposed to be on the screen? */
+static Memimage *swback;	/* screen under cursor */
+static Memimage *swimg;		/* cursor image */
+static Memimage *swmask;	/* cursor mask */
+static Memimage *swimg1;
+static Memimage *swmask1;
+
+static Point	swoffset;
+static Rectangle swrect;	/* screen rectangle in swback */
+static Point	swpt;		/* desired cursor location */
+static Point	swvispt;	/* actual cursor location */
+static int	swvers;		/* incremented each time cursor image changes */
+static int	swvisvers;	/* the version on the screen */
+
+/*
+ * called with drawlock locked for us, most of the time.
+ * kernel prints at inopportune times might mean we don't
+ * hold the lock, but memimagedraw is now reentrant so
+ * that should be okay: worst case we get cursor droppings.
+ */
+static void
+swcursorhide(void)
+{
+	if(swvisible == 0)
+		return;
+	if(swback == nil)
+		return;
+	swvisible = 0;
+	memimagedraw(gscreen, swrect, swback, ZP, memopaque, ZP, S);
+	flushmemscreen(swrect);
+}
+
+static void
+swcursoravoid(Rectangle r)
+{
+	if(swvisible && rectXrect(r, swrect))
+		swcursorhide();
+}
+
+static void
+swcursordraw(void)
+{
+	int dounlock;
+
+	if(swvisible)
+		return;
+	if(swenabled == 0)
+		return;
+	if(swback == nil || swimg1 == nil || swmask1 == nil)
+		return;
+	dounlock = canqlock(&drawlock);
+	swvispt = swpt;
+	swvisvers = swvers;
+	swrect = rectaddpt(Rect(0,0,16,16), swvispt);
+	memimagedraw(swback, swback->r, gscreen, swpt, memopaque, ZP, S);
+	memimagedraw(gscreen, swrect, swimg1, ZP, swmask1, ZP, SoverD);
+	flushmemscreen(swrect);
+	swvisible = 1;
+	if(dounlock)
+		qunlock(&drawlock);
+}
+
+int
+cursoron(int dolock)
+{
+	int retry;
+
+	if (dolock)
+		lock(&cursor);
+	if (canqlock(&drawlock)) {
+		retry = 0;
+		swcursorhide();
+		swcursordraw();
+		qunlock(&drawlock);
+	} else
+		retry = 1;
+	if (dolock)
+		unlock(&cursor);
+	return retry;
+}
+
+void
+cursoroff(int dolock)
+{
+	if (dolock)
+		lock(&cursor);
+	swcursorhide();
+	if (dolock)
+		unlock(&cursor);
+}
+
+static void
+swload(Cursor *curs)
+{
+	uchar *ip, *mp;
+	int i, j, set, clr;
+
+	if(!swimg || !swmask || !swimg1 || !swmask1)
+		return;
+	/*
+	 * Build cursor image and mask.
+	 * Image is just the usual cursor image
+	 * but mask is a transparent alpha mask.
+	 * 
+	 * The 16x16x8 memimages do not have
+	 * padding at the end of their scan lines.
+	 */
+	ip = byteaddr(swimg, ZP);
+	mp = byteaddr(swmask, ZP);
+	for(i=0; i<32; i++){
+		set = curs->set[i];
+		clr = curs->clr[i];
+		for(j=0x80; j; j>>=1){
+			*ip++ = set&j ? 0x00 : 0xFF;
+			*mp++ = (clr|set)&j ? 0xFF : 0x00;
+		}
+	}
+	swoffset = curs->offset;
+	swvers++;
+	memimagedraw(swimg1,  swimg1->r,  swimg,  ZP, memopaque, ZP, S);
+	memimagedraw(swmask1, swmask1->r, swmask, ZP, memopaque, ZP, S);
+}
+
 /* called from devmouse */
-
-void
-cursoron(void)
-{
-	swcursorhide(0);
-	swcursordraw(mousexy());
-}
-
-void
-cursoroff(void)
-{
-	swcursorhide(0);
-}
-
 void
 setcursor(Cursor* curs)
 {
-	swcursorload(curs);
+	cursoroff(0);
+	swload(curs);
+	cursoron(0);
+}
+
+static int
+swmove(Point p)
+{
+	swpt = addpt(p, swoffset);
+	return 0;
+}
+
+static void
+swcursorclock(void)
+{
+	int x;
+
+	if(!swenabled)
+		return;
+	swmove(mousexy());
+	if(swvisible && eqpt(swpt, swvispt) && swvers==swvisvers)
+		return;
+
+	x = splhi();
+	if(swenabled)
+	if(!swvisible || !eqpt(swpt, swvispt) || swvers!=swvisvers)
+	if(canqlock(&drawlock)){
+		swcursorhide();
+		swcursordraw();
+		qunlock(&drawlock);
+	}
+	splx(x);
+}
+
+void
+swcursorinit(void)
+{
+	static int init;
+
+	if(!init){
+		init = 1;
+		addclock0link(swcursorclock, 10);
+		swenabled = 1;
+	}
+	if(swback){
+		freememimage(swback);
+		freememimage(swmask);
+		freememimage(swmask1);
+		freememimage(swimg);
+		freememimage(swimg1);
+	}
+
+	swback  = allocmemimage(Rect(0,0,32,32), gscreen->chan);
+	swmask  = allocmemimage(Rect(0,0,16,16), GREY8);
+	swmask1 = allocmemimage(Rect(0,0,16,16), GREY1);
+	swimg   = allocmemimage(Rect(0,0,16,16), GREY8);
+	swimg1  = allocmemimage(Rect(0,0,16,16), GREY1);
+	if(swback==nil || swmask==nil || swmask1==nil || swimg==nil || swimg1 == nil){
+		print("software cursor: allocmemimage fails\n");
+		return;
+	}
+
+	memfillcolor(swmask, DOpaque);
+	memfillcolor(swmask1, DOpaque);
+	memfillcolor(swimg, DBlack);
+	memfillcolor(swimg1, DBlack);
 }
 
 int
@@ -81,19 +274,22 @@ hwdraw(Memdrawparam *par)
 {
 	Memimage *dst, *src, *mask;
 
-	if((dst = par->dst) == nil || dst->data == nil)
+	if((dst=par->dst) == nil || dst->data == nil)
 		return 0;
-	if((src = par->src) && src->data == nil)
-		src = nil;
-	if((mask = par->mask) && mask->data == nil)
-		mask = nil;
+	if((src=par->src) == nil || src->data == nil)
+		return 0;
+	if((mask=par->mask) == nil || mask->data == nil)
+		return 0;
 
 	if(dst->data->bdata == xgdata.bdata)
 		swcursoravoid(par->r);
-	if(src && src->data->bdata == xgdata.bdata)
+	if(src->data->bdata == xgdata.bdata)
 		swcursoravoid(par->sr);
-	if(mask && mask->data->bdata == xgdata.bdata)
+	if(mask->data->bdata == xgdata.bdata)
 		swcursoravoid(par->mr);
+
+	if(lcd)
+		lcd->draw(par->r);
 
 	return 0;
 }
@@ -101,13 +297,17 @@ hwdraw(Memdrawparam *par)
 static int
 screensize(void)
 {
-	char *p;
+	char *p, buf[32];
 	char *f[3];
 	int width, height, depth;
 
 	p = getconf("vgasize");
-	if(p == nil || getfields(p, f, nelem(f), 0, "x") != nelem(f) ||
-	    (width = atoi(f[0])) < 16 || (height = atoi(f[1])) <= 0 ||
+	if(p == nil || memccpy(buf, p, '\0', sizeof buf) == nil)
+		return -1;
+
+	if(getfields(buf, f, nelem(f), 0, "x") != nelem(f) ||
+	    (width = atoi(f[0])) < 16 ||
+	    (height = atoi(f[1])) <= 0 ||
 	    (depth = atoi(f[2])) <= 0)
 		return -1;
 	xgscreen.r.max = Pt(width, height);
@@ -119,7 +319,8 @@ void
 screeninit(void)
 {
 	uchar *fb;
-	int set;
+	char *p;
+	int set, rgbswap;
 	ulong chan;
 
 	set = screensize() == 0;
@@ -129,6 +330,7 @@ screeninit(void)
 			xgscreen.r.max.x, xgscreen.r.max.y, xgscreen.depth);
 		return;
 	}
+	rgbswap = ((p = getconf("bcm2708_fb.fbswap")) != nil && *p == '1');
 	xgscreen.clipr = xgscreen.r;
 	switch(xgscreen.depth){
 	default:
@@ -139,10 +341,10 @@ screeninit(void)
 		chan = RGB16;
 		break;
 	case 24:
-		chan = RGB24;
+		chan = rgbswap? RGB24 : BGR24;
 		break;
 	case 32:
-		chan = XRGB32;
+		chan = ARGB32;
 		break;
 	}
 	memsetchan(&xgscreen, chan);
@@ -155,9 +357,7 @@ screeninit(void)
 	memimageinit();
 	memdefont = getmemdefont();
 	screenwin();
-	myscreenputs(kmesg.buf, kmesg.n);
 	screenputs = myscreenputs;
-	swcursorinit();
 }
 
 void
@@ -165,20 +365,16 @@ flushmemscreen(Rectangle)
 {
 }
 
-Memdata*
+uchar*
 attachscreen(Rectangle *r, ulong *chan, int* d, int *width, int *softscreen)
 {
-	if(gscreen == nil)
-		return nil;
-
 	*r = gscreen->r;
 	*d = gscreen->depth;
 	*chan = gscreen->chan;
 	*width = gscreen->width;
 	*softscreen = 0;
 
-	gscreen->data->ref++;
-	return gscreen->data;
+	return gscreen->data->bdata;
 }
 
 void
@@ -198,6 +394,8 @@ void
 blankscreen(int blank)
 {
 	fbblank(blank);
+	if(lcd)
+		lcd->blank(blank);
 }
 
 static void
@@ -284,9 +482,13 @@ scroll(void)
 	p = Pt(window.min.x, window.min.y+o);
 	memimagedraw(gscreen, r, gscreen, p, nil, p, S);
 	flushmemscreen(r);
+	if(lcd)
+		lcd->draw(r);
 	r = Rpt(Pt(window.min.x, window.max.y-o), window.max);
 	memimagedraw(gscreen, r, back, ZP, nil, ZP, S);
 	flushmemscreen(r);
+	if(lcd)
+		lcd->draw(r);
 
 	curpos.y -= o;
 }
@@ -301,7 +503,7 @@ screenputc(char *buf)
 	static int *xp;
 	static int xbuf[256];
 
-	if (xp < xbuf || xp >= &xbuf[nelem(xbuf)])
+	if (xp < xbuf || xp >= &xbuf[sizeof(xbuf)])
 		xp = xbuf;
 
 	switch (buf[0]) {

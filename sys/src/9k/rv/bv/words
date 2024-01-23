@@ -1,0 +1,73 @@
+beagle v
+discontinued 30 July 2021; might work on starfive visionfive v1 (jh7100)
+
+starfive jh7100 risc-v rv64gc cpu: dual-core sifive u74 @ 1GHz
+• U74 are dual-issue cores.
+39-bit virtual addresses in rv64
+8GB ram in two banks, with framebuffer memory after 1st 1GB and 6GB after
+opensbi 0.9 (sbi 0.2?)
+proprietary l2 cache controller, 2MB but not DMA coherent
+cpus are cache coherent but dma is not (to be fixed in jh7110)
+has standard clint & plic interrupt controllers
+synopsis "gmac" Gb ether
+hdmi, video accelerators - which one?
+xhci
+microsd card
+
+BeagleV # meminfo
+DRAM:  8 GiB
+BeagleV # bdinfo
+boot_params = 0x0000000080000000
+DRAM bank   = 0x0000000000000000
+-> start    = 0x0000000080000000
+-> size     = 0x0000000200000000
+flashstart  = 0x0000000000000000
+flashsize   = 0x0000000000000000
+flashoffset = 0x0000000000000000
+baudrate    = 115200 bps
+relocaddr   = 0x00000000fff56000
+reloc off   = 0x000000007ff36000
+Build       = 64-bit
+current eth = dwmac.10020000
+ethaddr     = 2c:f7:f1:1b:e3:cb
+IP addr     = 192.168.120.200
+fdt_blob    = 0x00000000fffd0d40
+new_fdt     = 0x0000000000000000
+fdt_size    = 0x0000000000000000
+lmb_dump_all:
+    memory.cnt		   = 0x1
+    memory.size		   = 0x0
+    memory.reg[0x0].base   = 0x80000000
+		   .size   = 0x200000000
+
+    reserved.cnt	   = 0x4
+    reserved.size	   = 0x0
+    reserved.reg[0x0].base = 0xc9000000
+		     .size = 0x4000000
+    reserved.reg[0x1].base = 0xd0000000
+		     .size = 0x28000000
+    reserved.reg[0x2].base = 0xf9000000
+		     .size = 0x1000000
+    reserved.reg[0x3].base = 0xfb000000
+		     .size = 0x2000000
+
+
+physical memory map for beagle v
+
+/* on-core devices */
+0x02000000	clint
+0x02010000	l2 cache controller
+0x0c000000	plic
+/* off-core i/o */
+
+/*
+ * on-core memory.
+ */
+0x80000000	protected memory; no idea why it's this high up
+0x80020000	1GB-128K cached non-dma-coherent memory; ether needs fences
+0xc9000000	framebuffer, 64MB
+0xd0000000	framebuffer, 640MB
+0xf9000000	framebuffer, 16MB
+0xfb000000	framebuffer, 32MB
+0x100000000	4GB
+0x3000000000	cached access to up to 6GB

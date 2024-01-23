@@ -1,0 +1,6 @@
+# polarfire icicle
+PAUart0=0x20100000		# actually uart 1, used by u-boot
+BANK0SIZE=(GB-4*MB)		# leave last 4MB for HSS v2022.10 and later
+RBKTZERO=0xbfb05000
+CONFDEF=-DERRATUM_CIP_1200
+SFX=uim

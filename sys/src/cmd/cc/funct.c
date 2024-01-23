@@ -217,11 +217,12 @@ dclfunct(Type *t, Sym *s)
 	Node *n;
 	Type *f1, *f2, *f3, *f4;
 	int o, i, c;
+	char str[100];
 
 	if(t->funct)
 		return;
 
-	// recognize generated tag of dorm _%d_
+	// recognize generated tag of form _%d_
 	if(t->tag == S)
 		goto bad;
 	for(i=0; c = t->tag->name[i]; i++) {
@@ -261,9 +262,9 @@ dclfunct(Type *t, Sym *s)
 		o = ftabinit[i].op;
 		if(o == OXXX)
 			break;
-		snprint(symb, NSYMB, "%s_%s_", t->tag->name, ftabinit[i].name);
+		snprint(str, sizeof str, "%s_%s_", t->tag->name, ftabinit[i].name);
 		n = new(ONAME, Z, Z);
-		n->sym = lookup();
+		n->sym = slookup(str);
 		f->sym[o] = n->sym;
 		switch(ftabinit[i].typ) {
 		default:
@@ -295,18 +296,18 @@ dclfunct(Type *t, Sym *s)
 		/*
 		 * OCAST types T1 _T2_T1_(T2)
 		 */
-		snprint(symb, NSYMB, "_%s%s_", gtabinit[i].name, t->tag->name);
+		snprint(str, sizeof str, "_%s%s_", gtabinit[i].name, t->tag->name);
 		n = new(ONAME, Z, Z);
-		n->sym = lookup();
+		n->sym = slookup(str);
 		f->castto[o] = n->sym;
 
 		f1 = typ(TFUNC, t);
 		f1->down = types[o];
 		dodecl(xdecl, CEXTERN, f1, n);
 
-		snprint(symb, NSYMB, "%s_%s_", t->tag->name, gtabinit[i].name);
+		snprint(str, sizeof str, "%s_%s_", t->tag->name, gtabinit[i].name);
 		n = new(ONAME, Z, Z);
-		n->sym = lookup();
+		n->sym = slookup(str);
 		f->castfr[o] = n->sym;
 
 		f1 = typ(TFUNC, types[o]);

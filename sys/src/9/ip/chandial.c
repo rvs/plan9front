@@ -40,7 +40,7 @@ chandial(char *dest, char *local, char *dir, Chan **ctlp)
 	ds.ctlp = ctlp;
 
 	_dial_string_parse(dest, &ds);
-	if(ds.netdir == nil)
+	if(ds.netdir == 0)
 		ds.netdir = "/net";
 
 	/* no connection server, don't translate */
@@ -66,7 +66,7 @@ call(char *clone, char *dest, DS *ds)
 	name[n] = 0;
 	for(p = name; *p == ' '; p++)
 		;
-	sprint(name, "%lud", strtoul(p, 0, 0));
+	snprint(name, sizeof name, "%lud", strtoul(p, 0, 0));
 	p = strrchr(clone, '/');
 	*p = 0;
 	if(ds->dir)
@@ -109,13 +109,11 @@ _dial_string_parse(char *str, DS *ds)
 		ds->rem = ds->buf;
 	} else {
 		if(*ds->buf != '/' && *ds->buf != '#'){
-			ds->netdir = nil;
+			ds->netdir = 0;
 			ds->proto = ds->buf;
 		} else {
-			for(p2 = p; *p2 != '/' && p2 != ds->buf; p2--)
+			for(p2 = p; *p2 != '/'; p2--)
 				;
-			if(p2 == ds->buf)
-				error(Ebadarg);
 			*p2++ = 0;
 			ds->netdir = ds->buf;
 			ds->proto = p2;

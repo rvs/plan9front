@@ -12,25 +12,107 @@
 enum {
 	Qdir,
 	Qwdctl,
+
+	Wdogms = 200,
 };
 
+/*
+ * these are exposed so that delay() and the like can disable the watchdog
+ * before busy looping for a long time.
+ */
+Watchdog*watchdog;
+int	watchdogon;		/* flag: if set, watchdog will be non-nil */
+
 static Watchdog *wd;
+static int wdautopet;
+static int wdclock0called;
+static Ref refs;
 static Dirtab wddir[] = {
-	".",		{ Qdir, 0, QTDIR },	0,		0550,
-	"wdctl",	{ Qwdctl, 0 },		0,		0660,
+	".",		{ Qdir, 0, QTDIR },	0,		0555,
+	"wdctl",	{ Qwdctl, 0 },		0,		0664,
 };
 
 
 void
-addwatchdog(Watchdog *watchdog)
+addwatchdog(Watchdog *wdog)
 {
 	if(wd){
 		print("addwatchdog: watchdog already installed\n");
 		return;
 	}
-	wd = watchdog;
+	wd = watchdog = wdog;
 	if(wd)
 		wd->disable();
+}
+
+static int
+wdallowed(void)
+{
+	return getconf("*nowatchdog") == nil;
+}
+
+static void
+wdshutdown(void)
+{
+	if (wd) {
+		wd->disable();
+		watchdogon = 0;
+	}
+}
+
+/* called from clock interrupt, so restart needs ilock internally */
+static void
+wdpet(void)
+{
+	/* watchdog could be paused; if so, don't restart */
+	if (wdautopet && watchdogon)
+		wd->restart();
+}
+
+/*
+ * reassure the watchdog from the clock interrupt
+ * until the user takes control of it.
+ */
+static void
+wdautostart(void)
+{
+	if (wdautopet || !wd || !wdallowed())
+		return;
+	if (waserror()) {
+		// print("watchdog: automatic enable failed\n");
+		return;				/* oh well */
+	}
+	wd->enable();
+	poperror();
+
+	wdautopet = watchdogon = 1;
+	if (!wdclock0called) {
+		addclock0link(wdpet, Wdogms);
+		wdclock0called = 1;
+	}
+}
+
+/*
+ * disable strokes from the clock interrupt.
+ * have to disable the watchdog to mark it `not in use'.
+ */
+static void
+wdautostop(void)
+{
+	if (!wdautopet)
+		return;
+	wdautopet = 0;
+	wdshutdown();
+}
+
+/*
+ * user processes exist and up is non-nil when the
+ * device init routines are called.
+ */
+static void
+wdinit(void)
+{
+	wdautostart();
 }
 
 static Chan*
@@ -54,12 +136,18 @@ wdstat(Chan *c, uchar *dp, int n)
 static Chan*
 wdopen(Chan* c, int omode)
 {
-	return devopen(c, omode, wddir, nelem(wddir), devgen);
+	wdautostop();
+	c = devopen(c, omode, wddir, nelem(wddir), devgen);
+	if (c->qid.path == Qwdctl)
+		incref(&refs);
+	return c;
 }
 
 static void
-wdclose(Chan*)
+wdclose(Chan *c)
 {
+	if(c->qid.path == Qwdctl && c->flag&COPEN && decref(&refs) <= 0)
+		wdshutdown();
 }
 
 static long
@@ -76,7 +164,9 @@ wdread(Chan* c, void* a, long n, vlong off)
 		if(wd == nil || wd->stat == nil)
 			return 0;
 
-		p = smalloc(READSTR);
+		p = malloc(READSTR);
+		if(p == nil)
+			error(Enomem);
 		if(waserror()){
 			free(p);
 			nexterror();
@@ -115,10 +205,16 @@ wdwrite(Chan* c, void* a, long n, vlong off)
 		if((p = strchr(a, '\n')) != nil)
 			*p = 0;
 
-		if(strncmp(a, "enable", n) == 0)
+		if(strncmp(a, "enable", n) == 0) {
+			if (waserror()) {
+				print("watchdog: enable failed\n");
+				nexterror();
+			}
 			wd->enable();
-		else if(strncmp(a, "disable", n) == 0)
-			wd->disable();
+			poperror();
+			watchdogon = 1;
+		} else if(strncmp(a, "disable", n) == 0)
+			wdshutdown();
 		else if(strncmp(a, "restart", n) == 0)
 			wd->restart();
 		else
@@ -138,8 +234,8 @@ Dev wddevtab = {
 	"watchdog",
 
 	devreset,
-	devinit,
-	devshutdown,
+	wdinit,
+	wdshutdown,
 	wdattach,
 	wdwalk,
 	wdstat,

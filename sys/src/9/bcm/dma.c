@@ -82,8 +82,6 @@ struct Ctlr {
 	Cb	*cb;
 	Rendez	r;
 	int	dmadone;
-	void	*flush;
-	int	len;
 };
 
 struct Cb {
@@ -102,15 +100,15 @@ static u32int *dmaregs = (u32int*)DMAREGS;
 uintptr
 dmaaddr(void *va)
 {
-	if(va == nil)
-		return soc.busdram;
-	return soc.busdram | (PADDR(va) - PHYSDRAM);
+	if(PTR2UINT(va)&0x40000000)
+		panic("dma address %#p (from%#p)\n", va, getcallerpc(&va));
+	return soc.busdram | (PTR2UINT(va) & ~KSEGM);
 }
 
 static uintptr
 dmaioaddr(void *va)
 {
-	return soc.busio | ((uintptr)va - soc.virtio);
+	return soc.busio | (PTR2UINT(va) & ~VIRTIO);
 }
 
 static void
@@ -166,30 +164,26 @@ dmastart(int chan, int dev, int dir, void *src, void *dst, int len)
 		ctlr->regs[Cs] = Reset;
 		while(ctlr->regs[Cs] & Reset)
 			;
-		intrenable(IRQDMA(chan), dmainterrupt, ctlr, BUSUNKNOWN, "dma");
+		intrenable(IRQDMA(chan), dmainterrupt, ctlr, 0, "dma");
 	}
-	ctlr->len = len;
 	cb = ctlr->cb;
 	ti = 0;
 	switch(dir){
 	case DmaD2M:
-		ctlr->flush = dst;
-		dmaflush(1, dst, len);
+		cachedwbinvse(dst, len);
 		ti = Srcdreq | Destinc;
 		cb->sourcead = dmaioaddr(src);
 		cb->destad = dmaaddr(dst);
 		break;
 	case DmaM2D:
-		ctlr->flush = nil;
-		dmaflush(1, src, len);
+		cachedwbse(src, len);
 		ti = Destdreq | Srcinc;
 		cb->sourcead = dmaaddr(src);
 		cb->destad = dmaioaddr(dst);
 		break;
 	case DmaM2M:
-		ctlr->flush = dst;
-		dmaflush(1, dst, len);
-		dmaflush(1, src, len);
+		cachedwbse(src, len);
+		cachedinvse(dst, len);
 		ti = Srcinc | Destinc;
 		cb->sourcead = dmaaddr(src);
 		cb->destad = dmaaddr(dst);
@@ -199,7 +193,7 @@ dmastart(int chan, int dev, int dir, void *src, void *dst, int len)
 	cb->txfrlen = len;
 	cb->stride = 0;
 	cb->nextconbk = 0;
-	dmaflush(1, cb, sizeof(Cb));
+	cachedwbse(cb, sizeof(Cb));
 	ctlr->regs[Cs] = 0;
 	microdelay(1);
 	ctlr->regs[Conblkad] = dmaaddr(cb);
@@ -209,8 +203,8 @@ dmastart(int chan, int dev, int dir, void *src, void *dst, int len)
 	DBG print("intstatus %ux\n", dmaregs[Intstatus]);
 	dmaregs[Intstatus] = 0;
 	ctlr->regs[Cs] = Int;
-	microdelay(1);
 	coherence();
+	microdelay(1);
 	DBG dumpdregs("before Active", ctlr->regs);
 	ctlr->regs[Cs] = Active;
 	DBG dumpdregs("after Active", ctlr->regs);
@@ -226,10 +220,6 @@ dmawait(int chan)
 	ctlr = &dma[chan];
 	tsleep(&ctlr->r, dmadone, ctlr, 3000);
 	ctlr->dmadone = 0;
-	if(ctlr->flush != nil){
-		dmaflush(0, ctlr->flush, ctlr->len);
-		ctlr->flush = nil;
-	}
 	r = ctlr->regs;
 	DBG dumpdregs("after sleep", r);
 	s = r[Cs];
@@ -242,32 +232,4 @@ dmawait(int chan)
 	}
 	r[Cs] = Int|End;
 	return 0;
-}
-
-void
-dmaflush(int clean, void *p, ulong len)
-{
-	uintptr s = (uintptr)p;
-	uintptr e = (uintptr)p + len;
-
-	if(clean){
-		s &= ~(BLOCKALIGN-1);
-		e += BLOCKALIGN-1;
-		e &= ~(BLOCKALIGN-1);
-		cachedwbse((void*)s, e - s);
-		return;
-	}
-	if(s & BLOCKALIGN-1){
-		s &= ~(BLOCKALIGN-1);
-		cachedwbinvse((void*)s, BLOCKALIGN);
-		s += BLOCKALIGN;
-	}
-	if(e & BLOCKALIGN-1){
-		e &= ~(BLOCKALIGN-1);
-		if(e < s)
-			return;
-		cachedwbinvse((void*)e, BLOCKALIGN);
-	}
-	if(s < e)
-		cachedinvse((void*)s, e - s);
 }

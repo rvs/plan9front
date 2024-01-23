@@ -1,0 +1,5 @@
+# tinyemu in Sv39 but using only low 38 bits
+# must match KTZERO in mem.h
+KTZERO=0x2080000000		# sv39 at 2GB
+CONFDEF= -DLOWKERN
+LDFLAGS=-c			# uncompressed is much faster on tinyemu

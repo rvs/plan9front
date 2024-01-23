@@ -11,14 +11,15 @@
 #include "io.h"
 #include "arm.h"
 
+#include "../port/netif.h"
+#include "etherif.h"
+
 #define	POWERREGS	(VIRTIO+0x100000)
 
 Soc soc = {
 	.dramsize	= 512*MiB,
-	.busdram	= 0x40000000,
-	.iosize		= 16*MiB,
-	.virtio		= VIRTIO,
 	.physio		= 0x20000000,
+	.busdram	= 0x40000000,
 	.busio		= 0x7E000000,
 	.armlocal	= 0,
 	.l1ptedramattrs = Cached | Buffered,
@@ -113,6 +114,63 @@ void
 archbcmlink(void)
 {
 	addclock0link(wdogfeed, HZ);
+}
+
+int
+archether(unsigned ctlrno, Ether *ether)
+{
+	ether->type = "usb";
+	ether->ctlrno = ctlrno;
+	ether->irq = -1;
+	ether->nopt = 0;
+	return 1;
+}
+
+int
+l2ap(int ap)
+{
+	return (AP(3, (ap))|AP(2, (ap))|AP(1, (ap))|AP(0, (ap)));
+}
+
+/*
+ * atomic ops
+ * make sure that we don't drag in the C library versions
+ */
+
+long
+adec(long *p)
+{
+	long s, v;
+
+	s = splhi();
+	v = --*p;
+	splx(s);
+	return v;
+}
+
+long
+ainc(long *p)
+{
+	long s, v;
+
+	s = splhi();
+	v = ++*p;
+	splx(s);
+	return v;
+}
+
+int
+cas32(void* addr, u32int old, u32int new)
+{
+	int r, s;
+
+	s = splhi();
+	if(r = (*(u32int*)addr == old))
+		*(u32int*)addr = new;
+	splx(s);
+	if (r)
+		coherence();
+	return r;
 }
 
 int

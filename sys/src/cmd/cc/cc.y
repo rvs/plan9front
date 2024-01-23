@@ -64,7 +64,7 @@
 %token	LIF LINT LLONG LREGISTER LRETURN LSHORT LSIZEOF LUSED
 %token	LSTATIC LSTRUCT LSWITCH LTYPEDEF LTYPESTR LUNION LUNSIGNED
 %token	LWHILE LVOID LENUM LSIGNED LCONSTNT LVOLATILE LSET LSIGNOF
-%token	LRESTRICT LINLINE LNORET
+%token	LRESTRICT LINLINE LNORETURN
 %%
 prog:
 |	prog xdecl
@@ -82,7 +82,7 @@ xdecl:
 	{
 		lastdcl = T;
 		firstarg = S;
-		thisfnnode = dodecl(xdecl, lastclass, lasttype, $2);
+		dodecl(xdecl, lastclass, lasttype, $2);
 		if(lastdcl == T || lastdcl->etype != TFUNC) {
 			diag($2, "not a function");
 			lastdcl = types[TFUNC];
@@ -95,13 +95,11 @@ xdecl:
 	pdecl
 	{
 		argmark($2, 1);
-		fndecls(0);
 	}
 	block
 	{
 		Node *n;
 
-		fndecls(1);
 		n = revertdcl();
 		if(n)
 			$6 = new(OLIST, n, $6);
@@ -858,8 +856,8 @@ lstring:
 	{
 		$$ = new(OLSTRING, Z, Z);
 		$$->type = typ(TARRAY, types[TRUNE]);
-		$$->type->width = $1.l + sizeof(Rune);
-		$$->rstring = (Rune*)$1.s;
+		$$->type->width = $1.l + sizeof(TRune);
+		$$->rstring = (TRune*)$1.s;
 		$$->sym = symstring;
 		$$->etype = TARRAY;
 		$$->class = CSTATIC;
@@ -869,16 +867,16 @@ lstring:
 		char *s;
 		int n;
 
-		n = $1->type->width - sizeof(Rune);
+		n = $1->type->width - sizeof(TRune);
 		s = alloc(n+$2.l+MAXALIGN);
 
 		memcpy(s, $1->rstring, n);
 		memcpy(s+n, $2.s, $2.l);
-		*(Rune*)(s+n+$2.l) = 0;
+		*(TRune*)(s+n+$2.l) = 0;
 
 		$$ = $1;
 		$$->type->width += $2.l;
-		$$->rstring = (Rune*)s;
+		$$->rstring = (TRune*)s;
 	}
 
 zelist:
@@ -1010,7 +1008,7 @@ complex:
 |	LSTRUCT sbody
 	{
 		taggen++;
-		sprint(symb, "_%d_", taggen);
+		snprint(symb, sizeof symb, "_%d_", taggen);
 		$$ = dotag(lookup(), TSTRUCT, autobn);
 		$$->link = $2;
 		sualign($$);
@@ -1035,7 +1033,7 @@ complex:
 |	LUNION sbody
 	{
 		taggen++;
-		sprint(symb, "_%d_", taggen);
+		snprint(symb, sizeof symb, "_%d_", taggen);
 		$$ = dotag(lookup(), TUNION, autobn);
 		$$->link = $2;
 		sualign($$);
@@ -1151,7 +1149,7 @@ gname:	/* garbage words */
 	LCONSTNT { $$ = BCONSTNT; }
 |	LVOLATILE { $$ = BVOLATILE; }
 |	LRESTRICT { $$ = 0; }
-|	LNORET { $$ = BNORET; }
+|	LNORETURN { $$ = 0; }
 
 name:
 	LNAME

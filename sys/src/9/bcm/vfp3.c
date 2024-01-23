@@ -94,8 +94,8 @@ havefp(void)
 
 	m->havefp = 0;
 	gotfp = 1 << CpFP | 1 << CpDFP;
-	cpwrsc(0, CpCONTROL, 0, CpCPaccess, MASK(28));
-	acc = cprdsc(0, CpCONTROL, 0, CpCPaccess);
+	cpwrcpaccess(MASK(28));
+	acc = cprdcpaccess();
 	if ((acc & (MASK(2) << (2*CpFP))) == 0) {
 		gotfp &= ~(1 << CpFP);
 		print("fpon: no single FP coprocessor\n");
@@ -110,7 +110,7 @@ havefp(void)
 		return 0;
 	}
 	m->fpon = 1;			/* don't panic */
-	sid = fprd(Fpsid);
+	sid = fprdsid();
 	m->fpon = 0;
 	switch((sid >> 16) & MASK(7)){
 	case 0:				/* VFPv1 */
@@ -140,7 +140,7 @@ void
 fpoff(void)
 {
 	if (m->fpon) {
-		fpwr(Fpexc, 0);
+		fpwrexc(0);
 		m->fpon = 0;
 	}
 }
@@ -150,7 +150,7 @@ fpononly(void)
 {
 	if (!m->fpon && havefp()) {
 		/* enable fp.  must be first operation on the FPUs. */
-		fpwr(Fpexc, Fpenabled);
+		fpwrexc(Fpenabled);
 		m->fpon = 1;
 	}
 }
@@ -167,12 +167,12 @@ fpcfg(void)
 	/* VFPv2 needs software support for underflows, so force them to zero */
 	if(m->havefp == VFPv2)
 		m->fpscr |= Fz;
-	fpwr(Fpscr, m->fpscr);
+	fpwrscr(m->fpscr);
 	m->fpconfiged = 1;
 
 	if (printed)
 		return;
-	sid = fprd(Fpsid);
+	sid = fprdsid();
 	impl = sid >> 24;
 	print("fp: %s arch %s; rev %ld\n", implement(impl),
 		subarch(impl, (sid >> 16) & MASK(7)), sid & MASK(4));
@@ -194,7 +194,7 @@ fpon(void)
 	if (havefp()) {
 	 	fpononly();
 		if (m->fpconfiged)
-			fpwr(Fpscr, (fprd(Fpscr) & Allcc) | m->fpscr);
+			fpwrscr((fprdscr() & Allcc) | m->fpscr);
 		else
 			fpcfg();	/* 1st time on this fpu; configure it */
 	}
@@ -206,11 +206,11 @@ fpclear(void)
 //	ulong scr;
 
 	fpon();
-//	scr = fprd(Fpscr);
+//	scr = fprdscr();
 //	m->fpscr = scr & ~Allexc;
-//	fpwr(Fpscr, m->fpscr);
+//	fpwrscr(m->fpscr);
 
-	fpwr(Fpexc, fprd(Fpexc) & ~Fpmbc);
+	fpwrexc(fprdexc() & ~Fpmbc);
 }
 
 
@@ -225,7 +225,7 @@ void
 fpunotify(Ureg*)
 {
 	if(up->fpstate == FPactive){
-		fpsave(up->fpsave);
+		fpsave(&up->fpsave);
 		up->fpstate = FPinactive;
 	}
 	up->fpstate |= FPillegal;
@@ -242,31 +242,52 @@ fpunoted(void)
 	up->fpstate &= ~FPillegal;
 }
 
+/*
+ * Called early in the non-interruptible path of
+ * sysrfork() via the machine-dependent syscall() routine.
+ * Save the state so that it can be easily copied
+ * to the child process later.
+ */
+void
+fpusysrfork(Ureg*)
+{
+	if(up->fpstate == FPactive){
+		fpsave(&up->fpsave);
+		up->fpstate = FPinactive;
+	}
+}
+
+/*
+ * Called later in sysrfork() via the machine-dependent
+ * sysrforkchild() routine.
+ * Copy the parent FPU state to the child.
+ */
+void
+fpusysrforkchild(Proc *p, Ureg *, Proc *up)
+{
+	/* don't penalize the child, it hasn't done FP in a note handler. */
+	p->fpstate = up->fpstate & ~FPillegal;
+}
+
 /* should only be called if p->fpstate == FPactive */
 void
 fpsave(FPsave *fps)
 {
-	int n;
-
 	fpon();
-	fps->control = fps->status = fprd(Fpscr);
+	fps->control = fps->status = fprdscr();
 	assert(m->fpnregs);
-	for (n = 0; n < m->fpnregs; n++)
-		fpsavereg(n, (uvlong *)fps->regs[n]);
+	fpsaveregs((uvlong*)fps->regs, m->fpnregs);
 	fpoff();
 }
 
 static void
 fprestore(Proc *p)
 {
-	int n;
-
 	fpon();
-	fpwr(Fpscr, p->fpsave->control);
-	m->fpscr = fprd(Fpscr) & ~Allcc;
+	fpwrscr(p->fpsave.control);
+	m->fpscr = fprdscr() & ~Allcc;
 	assert(m->fpnregs);
-	for (n = 0; n < m->fpnregs; n++)
-		fprestreg(n, *(uvlong *)p->fpsave->regs[n]);
+	fprestregs((uvlong*)p->fpsave.regs, m->fpnregs);
 }
 
 /*
@@ -286,11 +307,12 @@ fpuprocsave(Proc *p)
 			/*
 			 * Fpsave() stores without handling pending
 			 * unmasked exeptions. Postnote() can't be called
-			 * so the handling of pending exceptions is delayed
+			 * here as sleep() already has up->rlock, so
+			 * the handling of pending exceptions is delayed
 			 * until the process runs again and generates an
 			 * emulation fault to activate the FPU.
 			 */
-			fpsave(p->fpsave);
+			fpsave(&p->fpsave);
 		}
 		p->fpstate = FPinactive;
 	}
@@ -308,28 +330,6 @@ fpuprocrestore(Proc *)
 }
 
 /*
- * The current process has been forked,
- * save and copy neccesary state to child.
- */
-void
-fpuprocfork(Proc *p)
-{
-	int s;
-
-	s = splhi();
-	switch(up->fpstate & ~FPillegal){
-	case FPactive:
-		fpsave(up->fpsave);
-		up->fpstate = FPinactive;
-		/* no break */
-	case FPinactive:
-		memmove(p->fpsave, up->fpsave, sizeof(FPsave));
-		p->fpstate = FPinactive;
-	}
-	splx(s);
-}
-
-/*
  * Disable the FPU.
  * Called from sysexec() via sysprocsetup() to
  * set the FPU for the new process.
@@ -337,12 +337,8 @@ fpuprocfork(Proc *p)
 void
 fpusysprocsetup(Proc *p)
 {
-	int s;
-
-	s = splhi();
 	p->fpstate = FPinit;
 	fpoff();
-	splx(s);
 }
 
 static void
@@ -351,7 +347,7 @@ mathnote(void)
 	ulong status;
 	char *msg, note[ERRMAX];
 
-	status = up->fpsave->status;
+	status = up->fpsave.status;
 
 	/*
 	 * Some attention should probably be paid here to the
@@ -370,7 +366,7 @@ mathnote(void)
 	else
 		msg = "spurious";
 	snprint(note, sizeof note, "sys: fp: %s fppc=%#p status=%#lux",
-		msg, up->fpsave->pc, status);
+		msg, up->fpsave.pc, status);
 	postnote(up, 1, note, NDebug);
 }
 
@@ -392,7 +388,7 @@ mathemu(Ureg *)
 		 * More attention should probably be paid here to the
 		 * exception masks and error summary.
 		 */
-		if(up->fpsave->status & (FPAINEX|FPAUNFL|FPAOVFL|FPAZDIV|FPAINVAL)){
+		if(up->fpsave.status & (FPAINEX|FPAUNFL|FPAOVFL|FPAZDIV|FPAINVAL)){
 			mathnote();
 			break;
 		}
@@ -400,7 +396,7 @@ mathemu(Ureg *)
 		up->fpstate = FPactive;
 		break;
 	case FPactive:
-		error("illegal instruction: bad vfp fpu opcode");
+		error("sys: illegal instruction: bad vfp fpu opcode");
 		break;
 	}
 	fpclear();

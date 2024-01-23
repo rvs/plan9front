@@ -49,4 +49,4 @@
 #define	PREAD		50
 #define	PWRITE		51
 #define	TSEMACQUIRE	52
-#define _NSEC		53
+#define NSEC		53

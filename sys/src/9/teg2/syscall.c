@@ -1,5 +1,3 @@
-/* we use l1 and l2 cache ops to help stability. */
-
 #include "u.h"
 #include "../port/lib.h"
 #include "mem.h"
@@ -47,7 +45,7 @@ noted(Ureg* cur, uintptr arg0)
 	nf = up->ureg;
 
 	/* sanity clause */
-	if(!okaddr((uintptr)nf, sizeof(NFrame), 0)){
+	if(!okaddr(PTR2UINT(nf), sizeof(NFrame), 0)){
 		qunlock(&up->debug);
 		pprint("bad ureg in noted %#p\n", nf);
 		pexit("Suicide", 0);
@@ -80,20 +78,24 @@ noted(Ureg* cur, uintptr arg0)
 		qunlock(&up->debug);
 
 		splhi();
-		nf->arg1 = nf->msg;
-		nf->arg0 = &nf->ureg;
+		nf->arg1 = nf->msg;		/* arg 1 is string */
+		nf->arg0 = &nf->ureg;		/* arg 0 XX(FP) is ureg* */
 		nf->ip = 0;
-		cur->sp = (uintptr)nf;
-		cur->r0 = (uintptr)nf->arg0;
+		cur->sp = PTR2UINT(nf);
+		cur->r0 = PTR2UINT(nf->arg0);	/* arg 0 in reg is ureg* */
 		break;
 	default:
-		up->lastnote->flag = NDebug;
-		/*FALLTHROUGH*/
+		pprint("unknown noted arg %#p\n", arg0);
+		up->lastnote.flag = NDebug;
+		/* fall through */
 	case NDFLT:
-		qunlock(&up->debug);
-		if(up->lastnote->flag == NDebug)
-			pprint("suicide: %s\n", up->lastnote->msg);
-		pexit(up->lastnote->msg, up->lastnote->flag != NDebug);
+		if(up->lastnote.flag == NDebug){ 
+			qunlock(&up->debug);
+			pprint("suicide: %s\n", up->lastnote.msg);
+		}
+		else
+			qunlock(&up->debug);
+		pexit(up->lastnote.msg, up->lastnote.flag != NDebug);
 	}
 }
 
@@ -104,13 +106,14 @@ noted(Ureg* cur, uintptr arg0)
 int
 notify(Ureg* ureg)
 {
+	int l;
+	Note *n;
 	u32int s;
 	uintptr sp;
 	NFrame *nf;
-	char *msg;
 
 	if(up->procctl)
-		procctl();
+		procctl(up);
 	if(up->nnote == 0)
 		return 0;
 
@@ -118,16 +121,36 @@ notify(Ureg* ureg)
 
 	s = spllo();
 	qlock(&up->debug);
-	msg = popnote(ureg);
-	if(msg == nil){
+
+	up->notepending = 0;
+	n = &up->note[0];
+	if(strncmp(n->msg, "sys:", 4) == 0){
+		l = strlen(n->msg);
+		if(l > ERRMAX-23)	/* " pc=0x0123456789abcdef\0" */
+			l = ERRMAX-23;
+		snprint(n->msg + l, sizeof n->msg - l, " pc=%#lux", ureg->pc);
+	}
+
+	if(n->flag != NUser && (up->notified || up->notify == 0)){
+		if(n->flag == NDebug)
+			pprint("suicide: %s\n", n->msg);
+		qunlock(&up->debug);
+		pexit(n->msg, n->flag != NDebug);
+	}
+
+	if(up->notified){
 		qunlock(&up->debug);
 		splhi();
 		return 0;
 	}
-
-	if(!okaddr((uintptr)up->notify, 1, 0)){
+		
+	if(up->notify == nil){
 		qunlock(&up->debug);
+		pexit(n->msg, n->flag != NDebug);
+	}
+	if(!okaddr(PTR2UINT(up->notify), 1, 0)){
 		pprint("suicide: notify function address %#p\n", up->notify);
+		qunlock(&up->debug);
 		pexit("Suicide", 0);
 	}
 
@@ -138,23 +161,26 @@ notify(Ureg* ureg)
 		pexit("Suicide", 0);
 	}
 
-	nf = (void*)sp;
+	nf = UINT2PTR(sp);
 	memmove(&nf->ureg, ureg, sizeof(Ureg));
 	nf->old = up->ureg;
 	up->ureg = nf;
-	memmove(nf->msg, msg, ERRMAX);
-	nf->arg1 = nf->msg;
-	nf->arg0 = &nf->ureg;
+	memmove(nf->msg, up->note[0].msg, ERRMAX);
+	nf->arg1 = nf->msg;			/* arg 1 is string */
+	nf->arg0 = &nf->ureg;			/* arg 0 XX(FP) is ureg* */
+	ureg->r0 = PTR2UINT(nf->arg0);		/* arg 0 in r0 is ureg* */
 	nf->ip = 0;
 
 	ureg->sp = sp;
-	ureg->pc = (uintptr)up->notify;
-	ureg->r0 = (uintptr)nf->arg0;
+	ureg->pc = PTR2UINT(up->notify);
+
+	up->notified = 1;
+	up->nnote--;
+	memmove(&up->lastnote, &up->note[0], sizeof(Note));
+	memmove(&up->note[0], &up->note[1], up->nnote*sizeof(Note));
 
 	qunlock(&up->debug);
 	splx(s);
-
-	l1cache->wb();				/* is this needed? */
 	return 1;
 }
 
@@ -168,16 +194,22 @@ syscall(Ureg* ureg)
 	int i, scallnr;
 	vlong startns, stopns;
 
-	if(!kenter(ureg))
+	if(!userureg(ureg))
 		panic("syscall: from kernel: pc %#lux r14 %#lux psr %#lux",
 			ureg->pc, ureg->r14, ureg->psr);
+
+	cycles(&up->kentry);
+	ckstack(&ureg);
 
 	m->syscall++;
 	up->insyscall = 1;
 	up->pc = ureg->pc;
+	up->dbgreg = ureg;
 
 	scallnr = ureg->r0;
 	up->scallnr = scallnr;
+	if(scallnr == RFORK)
+		fpusysrfork(ureg);
 	spllo();
 	sp = ureg->sp;
 
@@ -185,16 +217,14 @@ syscall(Ureg* ureg)
 		/*
 		 * Redundant validaddr.  Do we care?
 		 * Tracing syscalls is not exactly a fast path...
-		 * Beware, validaddr currently does a pexit rather
-		 * than an error if there's a problem; that might
-		 * change in the future.
+		 * Beware, validaddr calls error if there's a problem.
 		 */
 		if(sp < (USTKTOP-BY2PG) || sp > (USTKTOP-sizeof(Sargs)-BY2WD))
 			validaddr(sp, sizeof(Sargs)+BY2WD, 0);
 
 		syscallfmt(scallnr, ureg->pc, (va_list)(sp+BY2WD));
 		up->procctl = Proc_stopme;
-		procctl();
+		procctl(up);
 		if (up->syscalltrace) 
 			free(up->syscalltrace);
 		up->syscalltrace = nil;
@@ -204,18 +234,23 @@ syscall(Ureg* ureg)
 	ret = -1;
 	startns = todget(nil);
 
-	l1cache->wb();			/* system is more stable with this */
 	if(!waserror()){
+		if(scallnr >= nsyscall){
+			pprint("bad sys call number %d pc %#lux\n",
+				scallnr, ureg->pc);
+			postnote(up, 1, "sys: bad sys call", NDebug);
+			error(Ebadarg);
+		}
+
 		if(sp < (USTKTOP-BY2PG) || sp > (USTKTOP-sizeof(Sargs)-BY2WD))
 			validaddr(sp, sizeof(Sargs)+BY2WD, 0);
 
 		up->s = *((Sargs*)(sp+BY2WD));
-		if(scallnr >= nsyscall || systab[scallnr] == nil){
-			postnote(up, 1, "sys: bad sys call", NDebug);
-			error(Ebadarg);
-		}
 		up->psstate = sysctab[scallnr];
-		ret = systab[scallnr]((va_list)up->s.args);
+
+	/*	iprint("%s: syscall %s\n", up->text, sysctab[scallnr]?sysctab[scallnr]:"huh?"); */
+
+		ret = systab[scallnr](up->s.args);
 		poperror();
 	}else{
 		/* failure: save the error buffer for errstr */
@@ -241,10 +276,10 @@ syscall(Ureg* ureg)
 
 	if(up->procctl == Proc_tracesyscall){
 		stopns = todget(nil);
+		up->procctl = Proc_stopme;
 		sysretfmt(scallnr, (va_list)(sp+BY2WD), ret, startns, stopns);
 		s = splhi();
-		up->procctl = Proc_stopme;
-		procctl();
+		procctl(up);
 		splx(s);
 		if(up->syscalltrace)
 			free(up->syscalltrace);
@@ -261,8 +296,6 @@ syscall(Ureg* ureg)
 	if(scallnr != RFORK && (up->procctl || up->nnote))
 		notify(ureg);
 
-	l1cache->wb();			/* system is more stable with this */
-
 	/* if we delayed sched because we held a lock, sched now */
 	if(up->delaysched){
 		sched();
@@ -271,8 +304,9 @@ syscall(Ureg* ureg)
 	kexit(ureg);
 }
 
-uintptr
-execregs(uintptr entry, ulong ssize, ulong nargs)
+/* set registers at end of exec system call */
+long
+execregs(ulong entry, ulong ssize, ulong nargs)
 {
 	ulong *sp;
 	Ureg *ureg;
@@ -284,8 +318,8 @@ execregs(uintptr entry, ulong ssize, ulong nargs)
 //	memset(ureg, 0, 15*sizeof(ulong));
 	ureg->r13 = (ulong)sp;
 	ureg->pc = entry;
-//print("%lud: EXECREGS pc %#ux sp %#ux nargs %ld\n", up->pid, ureg->pc, ureg->r13, nargs);
-	allcache->wbse(ureg, sizeof *ureg);		/* is this needed? */
+//	print("%lud: EXECREGS pc %#ux sp %#ux nargs %ld\n",
+//		up->pid, ureg->pc, ureg->r13, nargs);
 
 	/*
 	 * return the address of kernel/user shared data
@@ -310,7 +344,7 @@ forkchild(Proc *p, Ureg *ureg)
 {
 	Ureg *cureg;
 
-	p->sched.sp = (ulong)p - sizeof(Ureg);
+	p->sched.sp = (ulong)p->kstack+KSTACK-sizeof(Ureg);
 	p->sched.pc = (ulong)forkret;
 
 	cureg = (Ureg*)(p->sched.sp);
@@ -318,4 +352,10 @@ forkchild(Proc *p, Ureg *ureg)
 
 	/* syscall returns 0 for child */
 	cureg->r0 = 0;
+
+	/* Things from bottom of syscall which were never executed */
+	p->psstate = 0;
+	p->insyscall = 0;
+
+	fpusysrforkchild(p, cureg, up);
 }

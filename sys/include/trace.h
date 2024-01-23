@@ -13,6 +13,7 @@ typedef enum Tevent {
 	SInts,		/* Interrupt start */
 	SInte,		/* Interrupt end */
 	SUser,		/* user event */
+	SLock,		/* blocked on a queue or lock */
 	Nevent,
 } Tevent;
 
@@ -20,5 +21,6 @@ typedef struct Traceevent	Traceevent;
 struct Traceevent {
 	ulong	pid;	
 	ulong	etype;	/* Event type */
-	vlong	time;	/* time stamp  */
+	uvlong	time;	/* time stamp  */
+	ulong	core;	/* core number */
 };

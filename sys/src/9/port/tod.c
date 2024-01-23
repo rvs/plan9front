@@ -114,7 +114,7 @@ todset(vlong t, vlong delta, int n)
 			delta = 0;
 		} else
 			delta /= n;
-		tod.sstart = MACHP(0)->ticks;
+		tod.sstart = sys->ticks;
 		tod.send = tod.sstart + n;
 		tod.delta = delta;
 	}
@@ -145,7 +145,7 @@ todget(vlong *ticksp)
 
 	/* add in correction */
 	if(tod.sstart != tod.send){
-		t = MACHP(0)->ticks;
+		t = sys->ticks;
 		if(t >= tod.send)
 			t = tod.send;
 		tod.off = tod.off + tod.delta*(t - tod.sstart);
@@ -198,25 +198,25 @@ todfix(void)
 	uvlong x;
 
 	ticks = fastticks(nil);
-	diff = ticks - tod.last;
-	if(diff <= tod.hz)
-		return;
 
-	ilock(&tod);
 	diff = ticks - tod.last;
 	if(diff > tod.hz){
+		ilock(&tod);
+
 		/* convert to epoch */
 		mul64fract(&x, diff, tod.multiplier);
+if(x > 30000000000ULL) iprint("todfix %llud\n", x);
 		x += tod.off;
 
 		/* protect against overflows */
 		tod.last = ticks;
 		tod.off = x;
+
+		iunlock(&tod);
 	}
-	iunlock(&tod);
 }
 
-long
+ulong
 seconds(void)
 {
 	return (vlong)todget(nil) / TODFREQ;

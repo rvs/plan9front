@@ -4,7 +4,6 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 
 #define	Image	IMAGE
@@ -65,11 +64,18 @@ t2r4enable(VGAscr* scr)
 
 	if(scr->mmio)
 		return;
-	p = scr->pci;
-	if(p == nil)
+	if(p = pcimatch(nil, 0x105D, 0)){
+		switch(p->did){
+		case 0x5348:
+			break;
+		default:
+			return;
+		}
+	}
+	else
 		return;
-	if(p->mem[4].bar & 1)
-		return;
+	scr->pci = p;
+	
 	mmio = vmap(p->mem[4].bar & ~0x0F, p->mem[4].size);
 	if(mmio == nil)
 		return;
@@ -263,7 +269,7 @@ t2r4curenable(VGAscr* scr)
 	/*
 	 * Load, locate and enable the cursor, 64x64, mode 2.
 	 */
-	t2r4curload(scr, &cursor);
+	t2r4curload(scr, &arrow);
 	t2r4curmove(scr, ZP);
 	t2r4xo(scr, CursorCtl, CursorMode);
 }
@@ -459,8 +465,13 @@ t2r4blank(VGAscr *scr, int blank)
 static void
 t2r4drawinit(VGAscr *scr)
 {
+	ulong pitch;
+	int depth;
 	int fmt;
 	ulong *d;
+
+	pitch = Dx(scr->gscreen->r);
+	depth = scr->gscreen->depth;
 
 	switch(scr->gscreen->chan){
 	case RGB16:
@@ -483,8 +494,8 @@ t2r4drawinit(VGAscr *scr)
 	d[BufCtl] = fmt<<24;
 	d[DeSorg] = 0;
 	d[DeDorg] = 0;
-	d[DeSptch] = scr->pitch;
-	d[DeDptch] = scr->pitch;
+	d[DeSptch] = (pitch*depth)/8;
+	d[DeDptch] = (pitch*depth)/8;
 	d[CmdClp] = 0;	/* 2 = inside rectangle */
 	d[Mask] = ~0;
 	d[DeKey] = 0;
@@ -496,6 +507,7 @@ t2r4drawinit(VGAscr *scr)
 	scr->fill = t2r4hwfill;
 	scr->scroll = t2r4hwscroll;
 	scr->blank = t2r4blank;
+	hwblank = 1;
 }
 
 VGAdev vgat2r4dev = {

@@ -1,0 +1,45 @@
+This is a specialised pc kernel that acts as a bootstrap loader for 386 and
+amd64 kernels, and replaces the old 9pxeload, 9load and 9loadusb.  It relies
+on the pc port (in /sys/src/9/pc) for most of its non-portable source files,
+notably the disk and ethernet drivers.  Support for user mode (such as
+system calls) is almost entirely absent.  There is some duplication of code
+with the pc kernel, but we have tried to keep it to a minimum.
+
+../pcexp is derived from this code, in part, and contains the source
+for the self-decompressing headers for bootstrap and normal kernels.
+
+See 9boot(8) and /sys/doc/bootpc.ms for more details.
+
+chinese puzzle constraints:
+BIOS calls only work from bottom 1MB (640K, really).
+with paging on, we need to have created page tables for the memory we use.
+a20 has to be enabled before we try to use memory above 1MB.
+
+
+Initialisation
+
+expand.l.s must do this:
+
+* entered in 16-bit real mode.
+
+turn interrupts off
+jump over aligned code and data (_start32p & _multibootheader)
+save multiboot registers
+initialise cpu registers (set segment selectors, set up stack)
+enable a20 line
+do real-mode bios calls to
+- set cga mode
+- turn off any floppy motor
+- obtain apm & e820 maps into low memory
+
+* switch to 32-bit protected mode
+
+expand.c decompresses protected-mode payload (9boot & 9load proper),
+jumps to it.
+
+* apm & e820 are in low memory.
+
+do 32-bit initialisation:
+- enable paging, including setting up minimal page tables.
+- clear Mach, etc.
+jump to 9boot/9load's main()

@@ -5,60 +5,49 @@
 #include	"fns.h"
 #include	"../port/error.h"
 
-Palloc palloc;
+#define	pghash(daddr)	palloc.hash[(daddr>>PGSHIFT)&(PGHSIZE-1)]
 
-ulong
-nkpages(Confmem *cm)
-{
-	return ((cm->klimit - cm->kbase) + BY2PG-1) / BY2PG;
-}
+struct	Palloc palloc;
 
 void
 pageinit(void)
 {
 	int color, i, j;
-	Page *p, **t;
-	Confmem *cm;
-	vlong m, v, u;
+	Page *p;
+	Pallocmem *pm;
+	ulong m, np, k, vkb, pkb;
 
-	if(palloc.pages == nil){
-		ulong np;
-
-		np = 0;
-		for(i=0; i<nelem(conf.mem); i++){
-			cm = &conf.mem[i];
-			np += cm->npage - nkpages(cm);
-		}
-		palloc.pages = xalloc(np*sizeof(Page));
-		if(palloc.pages == nil)
-			panic("pageinit");
+	np = 0;
+	for(i=0; i<nelem(palloc.mem); i++){
+		pm = &palloc.mem[i];
+		np += pm->npage;
 	}
+	palloc.pages = xalloc(np*sizeof(Page));
+	if(palloc.pages == 0)
+		panic("pageinit");
 
 	color = 0;
-	palloc.freecount = 0;
-	palloc.head = nil;
-
-	t = &palloc.head;
-	p = palloc.pages;
-
-	for(i=0; i<nelem(conf.mem); i++){
-		cm = &conf.mem[i];
-		for(j=nkpages(cm); j<cm->npage; j++){
-			memset(p, 0, sizeof *p);
-			p->pa = cm->base+j*BY2PG;
-			if(cankaddr(p->pa) && (KADDR(p->pa) == nil || KADDR(p->pa) == (void*)-BY2PG))
-				continue;
+	palloc.head = palloc.pages;
+	p = palloc.head;
+	for(i=0; i<nelem(palloc.mem); i++){
+		pm = &palloc.mem[i];
+		for(j=0; j<pm->npage; j++){
+			p->prev = p-1;
+			p->next = p+1;
+			p->pa = pm->base+j*BY2PG;
 			p->color = color;
-			color = (color+1)%NCOLOR;
-			*t = p, t = &p->next;
 			palloc.freecount++;
+			color = (color+1)%NCOLOR;
 			p++;
 		}
 	}
+	palloc.tail = p - 1;
+	palloc.head->prev = 0;
+	palloc.tail->next = 0;
 
 	palloc.user = p - palloc.pages;
-	u = palloc.user*BY2PG;
-	v = u + conf.nswap*BY2PG;
+	pkb = palloc.user*BY2PG/1024;
+	vkb = pkb + (conf.nswap*BY2PG)/1024;
 
 	/* Paging numbers */
 	swapalloc.highwater = (palloc.user*5)/100;
@@ -68,128 +57,104 @@ pageinit(void)
 	for(i=0; i<nelem(conf.mem); i++)
 		if(conf.mem[i].npage)
 			m += conf.mem[i].npage*BY2PG;
-	m += PGROUND(end - (char*)KTZERO);
-
-	print("%lldM memory: ", (m+1024*1024-1)/(1024*1024));
-	print("%lldM kernel data, ", (m-u+1024*1024-1)/(1024*1024));
-	print("%lldM user, ", u/(1024*1024));
-	print("%lldM swap\n", v/(1024*1024));
+	k = PGROUND(end - (char*)KTZERO);
+	print("%ldM memory: ", (m+k+MB-1)/MB);
+	print("%ldM kernel data", (m+k-pkb*1024+MB-1)/MB);
+	if (pkb)
+		print(", %ldM user", pkb/1024);
+	if (vkb)
+		print(", %ldM swap", vkb/1024);
+	print("\n");
 }
 
 static void
-pagechaindone(void)
+pageunchain(Page *p)
 {
-	if(palloc.pwait[0].p != nil && wakeup(&palloc.pwait[0]) != nil)
-		return;
-	if(palloc.pwait[1].p != nil)
-		wakeup(&palloc.pwait[1]);
+	if(canlock(&palloc))
+		panic("pageunchain (palloc %p)", &palloc);
+	if(p->prev)
+		p->prev->next = p->next;
+	else
+		palloc.head = p->next;
+	if(p->next)
+		p->next->prev = p->prev;
+	else
+		palloc.tail = p->prev;
+	p->prev = p->next = nil;
+	palloc.freecount--;
 }
 
 void
-freepages(Page *head, Page *tail, ulong np)
+pagechaintail(Page *p)
 {
-	if(head == nil)
-		return;
-	if(tail == nil){
-		tail = head;
-		for(np = 1;; np++){
-			tail->ref = 0;
-			if(tail->next == nil)
-				break;
-			tail = tail->next;
-		}
+	if(canlock(&palloc))
+		panic("pagechaintail");
+	if(palloc.tail) {
+		p->prev = palloc.tail;
+		palloc.tail->next = p;
 	}
-	lock(&palloc);
-	tail->next = palloc.head;
-	palloc.head = head;
-	palloc.freecount += np;
-	pagechaindone();
-	unlock(&palloc);
+	else {
+		palloc.head = p;
+		p->prev = 0;
+	}
+	palloc.tail = p;
+	p->next = 0;
+	palloc.freecount++;
 }
 
-ulong
-pagereclaim(Image *i)
+void
+pagechainhead(Page *p)
 {
-	Page **h, **l, **x, *p;
-	Page *fh, *ft;
-	ulong np;
-
-	lock(i);
-	if(i->pgref == 0){
-		unlock(i);
-		return 0;
+	if(canlock(&palloc))
+		panic("pagechainhead");
+	if(palloc.head) {
+		p->next = palloc.head;
+		palloc.head->prev = p;
 	}
-	incref(i);
-
-	np = 0;
-	fh = ft = nil;
-	for(h = i->pghash; h < &i->pghash[PGHSIZE]; h++){
-		l = h;
-		x = nil;
-		for(p = *l; p != nil; p = p->next){
-			if(p->ref == 0)
-				x = l;
-			l = &p->next;
-		}
-		if(x == nil)
-			continue;
-
-		p = *x;
-		*x = p->next;
-		p->next = nil;
-		p->image = nil;
-		p->daddr = ~0;
-
-		if(fh == nil)
-			fh = p;
-		else
-			ft->next = p;
-		ft = p;
-		np++;
-
-		decref(i);
-		if(--i->pgref == 0)
-			break;
+	else {
+		palloc.tail = p;
+		p->next = 0;
 	}
-	putimage(i);
-
-	if(np > 0)
-		freepages(fh, ft, np);
-
-	return np;
-}
-
-static int
-ispages(void*)
-{
-	return palloc.freecount > swapalloc.highwater || up->noswap && palloc.freecount > 0;
+	palloc.head = p;
+	p->prev = 0;
+	palloc.freecount++;
 }
 
 Page*
-newpage(int clear, Segment **s, uintptr va)
+newpage(int clear, Segment **s, ulong va)
 {
-	Page *p, **l;
-	int color;
+	Page *p;
+	KMap *k;
+	uchar ct;
+	int i, hw, dontalloc, color;
 
 	lock(&palloc);
-	while(!ispages(nil)){
+	color = getpgcolor(va);
+	hw = swapalloc.highwater;
+	for(;;) {
+		if(palloc.freecount > hw)
+			break;
+		if(up->kp && palloc.freecount > 0)
+			break;
+
 		unlock(&palloc);
-		if(s != nil)
-			qunlock(*s);
-
-		if(!waserror()){
-			Rendezq *q;
-
-			q = &palloc.pwait[!up->noswap];
-			eqlock(q);	
-			if(!waserror()){
-				kickpager();
-				sleep(q, ispages, nil);
-				poperror();
-			}
-			qunlock(q);
-			poperror();
+		dontalloc = 0;
+		if(s && *s) {
+			qunlock(&((*s)->lk));
+			*s = 0;
+			dontalloc = 1;
 		}
+		qlock(&palloc.pwait);	/* Hold memory requesters here */
+
+		while(waserror())	/* Ignore interrupts */
+			;
+
+		kickpager();
+		tsleep(&palloc.r, ispages, 0, 1000);
+
+		poperror();
+
+		qunlock(&palloc.pwait);
 
 		/*
 		 * If called from fault and we lost the segment from
@@ -197,41 +162,52 @@ newpage(int clear, Segment **s, uintptr va)
 		 * a page. Fault will call newpage again when it has
 		 * reacquired the segment locks
 		 */
-		if(s != nil){
-			*s = nil;
-			return nil;
-		}
+		if(dontalloc)
+			return 0;
+
 		lock(&palloc);
 	}
 
 	/* First try for our colour */
-	color = getpgcolor(va);
-	l = &palloc.head;
-	for(p = *l; p != nil; p = p->next){
+	for(p = palloc.head; p; p = p->next)
 		if(p->color == color)
 			break;
-		l = &p->next;
+
+	ct = PG_NOFLUSH;
+	if(p == 0) {
+		p = palloc.head;
+		p->color = color;
+		ct = PG_NEWCOL;
 	}
 
-	if(p == nil) {
-		l = &palloc.head;
-		p = *l;
-	}
+	pageunchain(p);
 
-	*l = p->next;
-	p->next = nil;
-	palloc.freecount--;
-	unlock(&palloc);
+	lock(p);
+	if(p->ref != 0)
+		panic("newpage: p->ref %d != 0", p->ref);
 
-	p->ref = 1;
+	uncachepage(p);
+	p->ref++;
 	p->va = va;
 	p->modref = 0;
-	inittxtflush(p);
+	for(i = 0; i < MAXMACH; i++)
+		p->cachectl[i] = ct;
+	unlock(p);
+	unlock(&palloc);
 
-	if(clear)
-		zeropage(p);
+	if(clear) {
+		k = kmap(p);
+		memset((void*)VA(k), 0, BY2PG);
+		kunmap(k);
+	}
 
 	return p;
+}
+
+int
+ispages(void*)
+{
+	return palloc.freecount >= swapalloc.highwater;
 }
 
 void
@@ -241,12 +217,140 @@ putpage(Page *p)
 		putswap(p);
 		return;
 	}
-	if(p->image != nil) {
-		decref(p);
+
+	lock(&palloc);
+	lock(p);
+
+	if(p->ref == 0)
+		panic("putpage");
+
+	if(--p->ref > 0) {
+		unlock(p);
+		unlock(&palloc);
 		return;
 	}
-	if(decref(p) == 0)
-		freepages(p, p, 1);
+
+	if(p->image && p->image != &swapimage)
+		pagechaintail(p);
+	else 
+		pagechainhead(p);
+
+	if(palloc.r.p != 0)
+		wakeup(&palloc.r);
+
+	unlock(p);
+	unlock(&palloc);
+}
+
+Page*
+auxpage(void)
+{
+	Page *p;
+
+	lock(&palloc);
+	p = palloc.head;
+	if(palloc.freecount < swapalloc.highwater) {
+		unlock(&palloc);
+		return 0;
+	}
+	pageunchain(p);
+
+	lock(p);
+	if(p->ref != 0)
+		panic("auxpage");
+	p->ref++;
+	uncachepage(p);
+	unlock(p);
+	unlock(&palloc);
+
+	return p;
+}
+
+static int dupretries = 15000;
+
+int
+duppage(Page *p)				/* Always call with p locked */
+{
+	Page *np;
+	int color;
+	int retries;
+
+	retries = 0;
+retry:
+
+	if(retries++ > dupretries){
+		print("duppage %d, up %p\n", retries, up);
+		dupretries += 100;
+		if(dupretries > 100000)
+			panic("duppage");
+		uncachepage(p);
+		return 1;
+	}
+		
+
+	/* don't dup pages with no image */
+	if(p->ref == 0 || p->image == nil || p->image->notext)
+		return 0;
+
+	/*
+	 *  normal lock ordering is to call
+	 *  lock(&palloc) before lock(p).
+	 *  To avoid deadlock, we have to drop
+	 *  our locks and try again.
+	 */
+	if(!canlock(&palloc)){
+		unlock(p);
+		if(up)
+			sched();
+		lock(p);
+		goto retry;
+	}
+
+	/* No freelist cache when memory is very low */
+	if(palloc.freecount < swapalloc.highwater) {
+		unlock(&palloc);
+		uncachepage(p);
+		return 1;
+	}
+
+	color = getpgcolor(p->va);
+	for(np = palloc.head; np; np = np->next)
+		if(np->color == color)
+			break;
+
+	/* No page of the correct color */
+	if(np == 0) {
+		unlock(&palloc);
+		uncachepage(p);
+		return 1;
+	}
+
+	pageunchain(np);
+	pagechaintail(np);
+/*
+* XXX - here's a bug? - np is on the freelist but it's not really free.
+* when we unlock palloc someone else can come in, decide to
+* use np, and then try to lock it.  they succeed after we've 
+* run copypage and cachepage and unlock(np).  then what?
+* they call pageunchain before locking(np), so it's removed
+* from the freelist, but still in the cache because of
+* cachepage below.  if someone else looks in the cache
+* before they remove it, the page will have a nonzero ref
+* once they finally lock(np).
+*/
+	lock(np);
+	unlock(&palloc);
+
+	/* Cache the new version */
+	uncachepage(np);
+	np->va = p->va;
+	np->daddr = p->daddr;
+	copypage(p, np);
+	cachepage(np, p->image);
+	unlock(np);
+	uncachepage(p);
+
+	return 0;
 }
 
 void
@@ -262,93 +366,102 @@ copypage(Page *f, Page *t)
 }
 
 void
-zeropage(Page *p)
+uncachepage(Page *p)			/* Always called with a locked page */
 {
-	KMap *k;
+	Page **l, *f;
 
-	k = kmap(p);
-	memset((void*)VA(k), 0, BY2PG);
-	kunmap(k);
+	if(p->image == 0)
+		return;
+
+	lock(&palloc.hashlock);
+	l = &pghash(p->daddr);
+	for(f = *l; f; f = f->hash) {
+		if(f == p) {
+			*l = p->hash;
+			break;
+		}
+		l = &f->hash;
+	}
+	unlock(&palloc.hashlock);
+	putimage(p->image);
+	p->image = 0;
+	p->daddr = 0;
 }
 
 void
 cachepage(Page *p, Image *i)
 {
-	Page **h;
+	Page **l;
 
-	lock(i);
-	p->image = i;
-	h = &PGHASH(i, p->daddr);
-	p->next = *h;
-	*h = p;
+	/* If this ever happens it should be fixed by calling
+	 * uncachepage instead of panic. I think there is a race
+	 * with pio in which this can happen. Calling uncachepage is
+	 * correct - I just wanted to see if we got here.
+	 */
+	if(p->image)
+		panic("cachepage");
+
 	incref(i);
-	i->pgref++;
-	unlock(i);
+	lock(&palloc.hashlock);
+	p->image = i;
+	l = &pghash(p->daddr);
+	p->hash = *l;
+	*l = p;
+	unlock(&palloc.hashlock);
 }
 
 void
-uncachepage(Page *p)
+cachedel(Image *i, ulong daddr)
 {
-	Page **l, *x;
-	Image *i;
+	Page *f, **l;
 
-	i = p->image;
-	if(i == nil)
-		return;
-
-	lock(i);
-	if(p->image != i){
-		unlock(i);
-		return;
-	}
-	l = &PGHASH(i, p->daddr);
-	for(x = *l; x != nil; x = x->next) {
-		if(x == p){
-			*l = p->next;
-			p->next = nil;
-			p->image = nil;
-			p->daddr = ~0;
-			i->pgref--;
-			putimage(i);
-			return;
+	lock(&palloc.hashlock);
+	l = &pghash(daddr);
+	for(f = *l; f; f = f->hash) {
+		if(f->image == i && f->daddr == daddr) {
+			lock(f);
+			if(f->image == i && f->daddr == daddr){
+				*l = f->hash;
+				putimage(f->image);
+				f->image = 0;
+				f->daddr = 0;
+			}
+			unlock(f);
+			break;
 		}
-		l = &x->next;
+		l = &f->hash;
 	}
-	unlock(i);
+	unlock(&palloc.hashlock);
 }
 
-Page*
-lookpage(Image *i, uintptr daddr)
+Page *
+lookpage(Image *i, ulong daddr)
 {
-	Page *p, **h, **l;
+	Page *f;
 
-	lock(i);
-	l = h = &PGHASH(i, daddr);
-	for(p = *l; p != nil; p = p->next){
-		if(p->daddr == daddr){
-			*l = p->next;
-			p->next = *h;
-			*h = p;
-			incref(p);
-			unlock(i);
-			return p;
+	lock(&palloc.hashlock);
+	for(f = pghash(daddr); f; f = f->hash) {
+		if(f->image == i && f->daddr == daddr) {
+			unlock(&palloc.hashlock);
+
+			lock(&palloc);
+			lock(f);
+			if(f->image != i || f->daddr != daddr) {
+				unlock(f);
+				unlock(&palloc);
+				return 0;
+			}
+			if(++f->ref == 1)
+				pageunchain(f);
+			unlock(&palloc);
+			unlock(f);
+
+			return f;
 		}
-		l = &p->next;
 	}
-	unlock(i);
+	unlock(&palloc.hashlock);
 
-	return nil;
-}
-
-void
-cachedel(Image *i, uintptr daddr)
-{
-	Page *p;
-
-	while((p = lookpage(i, daddr)) != nil){
-		uncachepage(p);
-		putpage(p);
-	}
+	return 0;
 }
 
 Pte*
@@ -361,11 +474,14 @@ ptecpy(Pte *old)
 	dst = &new->pages[old->first-old->pages];
 	new->first = dst;
 	for(src = old->first; src <= old->last; src++, dst++)
-		if(*src != nil) {
+		if(*src) {
 			if(onswap(*src))
 				dupswap(*src);
-			else
-				incref(*src);
+			else {
+				lock(*src);
+				(*src)->ref++;
+				unlock(*src);
+			}
 			new->last = dst;
 			*dst = *src;
 		}
@@ -385,42 +501,155 @@ ptealloc(void)
 }
 
 void
-freepte(Segment*, Pte *p)
+freepte(Segment *s, Pte *p)
 {
-	Page **pg, **pe;
+	int ref;
+	void (*fn)(Page*);
+	Page *pt, **pg, **ptop;
 
-	pg = p->first;
-	pe = p->last;
-	while(pg <= pe){
-		if(*pg != nil)
-			putpage(*pg);
-		pg++;
+	switch(s->type&SG_TYPE) {
+	case SG_PHYSICAL:
+		fn = s->pseg->pgfree;
+		ptop = &p->pages[PTEPERTAB];
+		if(fn) {
+			for(pg = p->pages; pg < ptop; pg++) {
+				if(*pg == 0)
+					continue;
+				(*fn)(*pg);
+				*pg = 0;
+			}
+			break;
+		}
+		for(pg = p->pages; pg < ptop; pg++) {
+			pt = *pg;
+			if(pt == 0)
+				continue;
+			lock(pt);
+			ref = --pt->ref;
+			unlock(pt);
+			if(ref == 0)
+				free(pt);
+		}
+		break;
+	default:
+		for(pg = p->first; pg <= p->last; pg++)
+			if(*pg) {
+				putpage(*pg);
+				*pg = 0;
+			}
 	}
 	free(p);
 }
 
-void
-zeroprivatepages(void)
+ulong
+pagenumber(Page *p)
 {
-	Page *p, *pe;
+	return p-palloc.pages;
+}
 
-	/*
-	 * in case of a panic, we might not have a process
-	 * context to do the clearing of the private pages.
-	 */
-	if(up == nil){
-		assert(panicking);
+void
+checkpagerefs(void)
+{
+	int s;
+	ulong i, np, nwrong;
+	ulong *ref;
+	
+	np = palloc.user;
+	ref = malloc(np*sizeof ref[0]);
+	if(ref == nil){
+		print("checkpagerefs: out of memory\n");
 		return;
 	}
-
+	
+	/*
+	 * This may not be exact if there are other processes
+	 * holding refs to pages on their stacks.  The hope is
+	 * that if you run it on a quiescent system it will still
+	 * be useful.
+	 */
+	s = splhi();
 	lock(&palloc);
-	pe = palloc.pages + palloc.user;
-	for(p = palloc.pages; p != pe; p++) {
-		if(p->modref & PG_PRIV){
-			incref(p);
-			zeropage(p);
-			decref(p);
+	countpagerefs(ref, 0);
+	portcountpagerefs(ref, 0);
+	nwrong = 0;
+	for(i=0; i<np; i++){
+		if(palloc.pages[i].ref != ref[i]){
+			iprint("page %#.8lux ref %d actual %lud\n", 
+				palloc.pages[i].pa, palloc.pages[i].ref, ref[i]);
+			ref[i] = 1;
+			nwrong++;
+		}else
+			ref[i] = 0;
+	}
+	countpagerefs(ref, 1);
+	portcountpagerefs(ref, 1);
+	iprint("%lud mistakes found\n", nwrong);
+	unlock(&palloc);
+	splx(s);
+}
+
+void
+portcountpagerefs(ulong *ref, int print)
+{
+	ulong i, j, k, ns, n;
+	Page **pg, *entry;
+	Proc *p;
+	Pte *pte;
+	Segment *s;
+
+	/*
+	 * Pages in segments.  s->mark avoids double-counting.
+	 */
+	n = 0;
+	ns = 0;
+	for(i=0; i<conf.nproc; i++){
+		p = proctab(i);
+		for(j=0; j<NSEG; j++){
+			s = p->seg[j];
+			if(s)
+				s->mark = 0;
 		}
 	}
-	unlock(&palloc);
+	for(i=0; i<conf.nproc; i++){
+		p = proctab(i);
+		for(j=0; j<NSEG; j++){
+			s = p->seg[j];
+			if(s == nil || s->mark++)
+				continue;
+			ns++;
+			for(k=0; k<s->mapsize; k++){
+				pte = s->map[k];
+				if(pte == nil)
+					continue;
+				for(pg = pte->first; pg <= pte->last; pg++){
+					entry = *pg;
+					if(pagedout(entry))
+						continue;
+					if(print){
+						if(ref[pagenumber(entry)])
+							iprint("page %#.8lux in segment %#p\n", entry->pa, s);
+						continue;
+					}
+					if(ref[pagenumber(entry)]++ == 0)
+						n++;
+				}
+			}
+		}
+	}
+	if(!print){
+		iprint("%lud pages in %lud segments\n", n, ns);
+		for(i=0; i<conf.nproc; i++){
+			p = proctab(i);
+			for(j=0; j<NSEG; j++){
+				s = p->seg[j];
+				if(s == nil)
+					continue;
+				if(s->ref != s->mark){
+					iprint("segment %#p (used by proc %lud pid %lud) has bad ref count %lud actual %lud\n",
+						s, i, p->pid, s->ref, s->mark);
+				}
+			}
+		}
+	}
 }
+

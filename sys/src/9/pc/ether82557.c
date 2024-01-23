@@ -14,14 +14,18 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 #include "../port/netif.h"
-#include "../port/etherif.h"
+
+#include "etherif.h"
 
 enum {
-	Nrfd		= 64,		/* receive frame area */
-	Ncb		= 64,		/* maximum control blocks queued */
+	/*
+	 * these were both 64.  increased them to try to improve lookout's
+	 * reliability as a pxe booter.
+	 */
+	Nrfd		= 128,		/* receive frame area */
+	Ncb		= 128,		/* maximum control blocks queued */
 
 	NullPointer	= 0xFFFFFFFF,	/* 82557 NULL pointer */
 };
@@ -341,15 +345,13 @@ rfdalloc(ulong link)
 }
 
 static void
-watchdog(void* arg)
+ethwatchdog(void* arg)
 {
 	Ether *ether;
 	Ctlr *ctlr;
 	static void txstart(Ether*);
 
 	ether = arg;
-	while(waserror())
-		;
 	for(;;){
 		tsleep(&up->sleep, return0, 0, 4000);
 
@@ -359,8 +361,10 @@ watchdog(void* arg)
 		 * the future.
 		 */
 		ctlr = ether->ctlr;
-		if(ctlr == nil || ctlr->state == 0)
-			break;
+		if(ctlr == nil || ctlr->state == 0){
+			print("%s: exiting\n", up->text);
+			pexit("disabled", 0);
+		}
 
 		ilock(&ctlr->cblock);
 		if(ctlr->tick++){
@@ -369,8 +373,6 @@ watchdog(void* arg)
 		}
 		iunlock(&ctlr->cblock);
 	}
-	print("%s: exiting\n", up->text);
-	pexit("disabled", 1);
 }
 
 static void
@@ -381,26 +383,24 @@ attach(Ether* ether)
 
 	ctlr = ether->ctlr;
 	lock(&ctlr->slock);
-	if(ctlr->state){
-		unlock(&ctlr->slock);
-		return;
-	}
-	ilock(&ctlr->rlock);
-	csr8w(ctlr, Interrupt, 0);
-	iunlock(&ctlr->rlock);
-	command(ctlr, RUstart, PADDR(ctlr->rfdhead->rp));
-	ctlr->state = 1;
-	unlock(&ctlr->slock);
+	if(ctlr->state == 0){
+		ilock(&ctlr->rlock);
+		csr8w(ctlr, Interrupt, 0);
+		iunlock(&ctlr->rlock);
+		command(ctlr, RUstart, PADDR(ctlr->rfdhead->rp));
+		ctlr->state = 1;
 
-	/*
-	 * Start the watchdog timer for the receive lockup errata
-	 * unless the EEPROM compatibility word indicates it may be
-	 * omitted.
-	 */
-	if((ctlr->eeprom[0x03] & 0x0003) != 0x0003){
-		snprint(name, KNAMELEN, "#l%dwatchdog", ether->ctlrno);
-		kproc(name, watchdog, ether);
+		/*
+		 * Start the watchdog timer for the receive lockup errata
+		 * unless the EEPROM compatibility word indicates it may be
+		 * omitted.
+		 */
+		if((ctlr->eeprom[0x03] & 0x0003) != 0x0003){
+			snprint(name, KNAMELEN, "#l%dwatchdog", ether->ctlrno);
+			kproc(name, ethwatchdog, ether);
+		}
 	}
+	unlock(&ctlr->slock);
 }
 
 static long
@@ -413,10 +413,6 @@ ifstat(Ether* ether, void* a, long n, ulong offset)
 
 	ctlr = ether->ctlr;
 	lock(&ctlr->dlock);
-	if(waserror()){
-		unlock(&ctlr->dlock);
-		nexterror();
-	}
 
 	/*
 	 * Start the command then
@@ -425,26 +421,26 @@ ifstat(Ether* ether, void* a, long n, ulong offset)
 	 */
 	ctlr->dump[16] = 0;
 	command(ctlr, DumpSC, 0);
-	for(i = 0; i < 1000 && ctlr->dump[16] == 0; i++)
-		microdelay(100);
-	if(i == 1000)
-		error("command timeout");
+	while(ctlr->dump[16] == 0)
+		;
+
+	ether->oerrs = ctlr->dump[1]+ctlr->dump[2]+ctlr->dump[3];
+	ether->crcs = ctlr->dump[10];
+	ether->frames = ctlr->dump[11];
+	ether->buffs = ctlr->dump[12]+ctlr->dump[15];
+	ether->overflows = ctlr->dump[13];
+
+	if(n == 0){
+		unlock(&ctlr->dlock);
+		return 0;
+	}
 
 	memmove(dump, ctlr->dump, sizeof(dump));
-
-	ether->oerrs = dump[1]+dump[2]+dump[3];
-	ether->crcs = dump[10];
-	ether->frames = dump[11];
-	ether->buffs = dump[12]+dump[15];
-	ether->overflows = dump[13];
-
-	poperror();
 	unlock(&ctlr->dlock);
 
-	if(n == 0)
-		return 0;
-
-	p = smalloc(READSTR);
+	p = malloc(READSTR);
+	if(p == nil)
+		error(Enomem);
 	len = snprint(p, READSTR, "transmit good frames: %lud\n", dump[0]);
 	len += snprint(p+len, READSTR-len, "transmit maximum collisions errors: %lud\n", dump[1]);
 	len += snprint(p+len, READSTR-len, "transmit late collisions errors: %lud\n", dump[2]);
@@ -590,15 +586,21 @@ configure(Ether* ether, int promiscuous)
 static void
 promiscuous(void* arg, int on)
 {
-	Ether *ether = arg;
-	configure(ether, on || ether->nmaddr > 0);
+	configure(arg, on);
 }
 
 static void
-multicast(void* arg, uchar *, int)
+multicast(void* ether, uchar *addr, int add)
 {
-	Ether *ether = arg;
-	configure(ether, ether->prom || ether->nmaddr > 0);
+	USED(addr);
+	/*
+	 * if we still cared about 100Mb/s ether, we could do:
+	 * if (add) add addr to list of mcast addrs in controller
+	 * else remove addr from list of mcast addrs in controller;
+	 * enable multicast input (see CbMAS) instead of promiscuous mode.
+	 */
+	if (add)
+		configure(ether, 1);
 }
 
 static void
@@ -658,7 +660,7 @@ receive(Ether* ether)
 				bp = xbp;
 			}
 			if(pbp != nil)
-				etheriq(ether, pbp);
+				etheriq(ether, pbp, 1);
 		}
 		else{
 			rfd->count = 0;
@@ -693,18 +695,18 @@ receive(Ether* ether)
 	}
 }
 
-static void
+static int
 interrupt(Ureg*, void* arg)
 {
 	Cb* cb;
 	Ctlr *ctlr;
 	Ether *ether;
-	int status;
+	int status, loops;
 
 	ether = arg;
 	ctlr = ether->ctlr;
 
-	for(;;){
+	for(loops = 0; ; loops++){
 		ilock(&ctlr->rlock);
 		status = csr16r(ctlr, Status);
 		csr8w(ctlr, Ack, (status>>8) & 0xFF);
@@ -759,8 +761,9 @@ interrupt(Ureg*, void* arg)
 		}
 
 		if(status & (StatCX|StatFR|StatCNA|StatRNR|StatMDI|StatSWI))
-			panic("#l%d: status %#ux", ether->ctlrno, status);
+			iprint("#l%d: status %#ux\n", ether->ctlrno, status);
 	}
+	return loops > 0? Intrforme: Intrnotforme;
 }
 
 static void
@@ -782,8 +785,6 @@ ctlrinit(Ctlr* ctlr)
 	link = NullPointer;
 	for(i = 0; i < Nrfd; i++){
 		bp = rfdalloc(link);
-		if(bp == nil)
-			panic("i82557: can't allocate rfd buffer");
 		if(ctlr->rfdhead == nil)
 			ctlr->rfdtail = bp;
 		bp->next = ctlr->rfdhead;
@@ -802,8 +803,10 @@ ctlrinit(Ctlr* ctlr)
 	 */
 	ilock(&ctlr->cblock);
 	ctlr->cbr = malloc(ctlr->ncb*sizeof(Cb));
-	if(ctlr->cbr == nil)
-		panic("i82557: can't allocate cbr");
+	if(ctlr->cbr == nil) {
+		iunlock(&ctlr->cblock);
+		error(Enomem);
+	}
 	for(i = 0; i < ctlr->ncb; i++){
 		ctlr->cbr[i].status = CbC|CbOK;
 		ctlr->cbr[i].command = CbS|CbNOP;
@@ -921,7 +924,7 @@ reread:
 		ctlr->eepromsz = 8-size;
 		ctlr->eeprom = malloc((1<<ctlr->eepromsz)*sizeof(ushort));
 		if(ctlr->eeprom == nil)
-			panic("i82557: can't allocate eeprom");
+			error(Enomem);
 		goto reread;
 	}
 
@@ -933,11 +936,11 @@ i82557pci(void)
 {
 	Pcidev *p;
 	Ctlr *ctlr;
-	int nop, port;
+	int i, nop, port;
 
 	p = nil;
 	nop = 0;
-	while(p = pcimatch(p, 0x8086, 0)){
+	while(p = pcimatch(p, Vintel, 0)){
 		switch(p->did){
 		default:
 			continue;
@@ -959,23 +962,31 @@ i82557pci(void)
 			break;
 		}
 
+		if(pcigetpms(p) > 0){
+			pcisetpms(p, 0);
+	
+			for(i = 0; i < 6; i++)
+				pcicfgw32(p, PciBAR0+i*4, p->mem[i].bar);
+			pcicfgw8(p, PciINTL, p->intl);
+			pcicfgw8(p, PciLTR, p->ltr);
+			pcicfgw8(p, PciCLS, p->cls);
+			pcicfgw16(p, PciPCR, p->pcr);
+		}
+
 		/*
 		 * bar[0] is the memory-mapped register address (4KB),
 		 * bar[1] is the I/O port register address (32 bytes) and
 		 * bar[2] is for the flash ROM (1MB).
 		 */
-		port = p->mem[1].bar & ~3;
+		port = p->mem[1].bar & ~0x01;
 		if(ioalloc(port, p->mem[1].size, 0, "i82557") < 0){
 			print("i82557: port %#ux in use\n", port);
 			continue;
 		}
 
 		ctlr = malloc(sizeof(Ctlr));
-		if(ctlr == nil){
-			print("i82557: can't allocate memory\n");
-			iofree(port);
-			continue;
-		}
+		if(ctlr == nil)
+			error(Enomem);
 		ctlr->port = port;
 		ctlr->pcidev = p;
 		ctlr->nop = nop;
@@ -985,6 +996,8 @@ i82557pci(void)
 		else
 			ctlrhead = ctlr;
 		ctlrtail = ctlr;
+
+		pcisetbme(p);
 	}
 }
 
@@ -1064,9 +1077,6 @@ reset(Ether* ether)
 	}
 	if(ctlr == nil)
 		return -1;
-
-	pcienable(ctlr->pcidev);
-	pcisetbme(ctlr->pcidev);
 
 	/*
 	 * Initialise the Ctlr structure.
@@ -1201,26 +1211,26 @@ reset(Ether* ether)
 			 */
 			miir(ctlr, phyaddr, 0x01);
 			bmsr = miir(ctlr, phyaddr, 0x01);
-			if((miir(ctlr, phyaddr, 0) & 0x1000) && (bmsr & 0x0020))
-				break;
-			miiw(ctlr, phyaddr, 0x1A, 0x2010);
-			x = miir(ctlr, phyaddr, 0);
-			miiw(ctlr, phyaddr, 0, 0x1200|x);
-			for(i = 0; i < 3000; i++){
-				delay(1);
-				if(miir(ctlr, phyaddr, 0x01) & 0x0020)
-					break;
-			}
-			miiw(ctlr, phyaddr, 0x1A, 0x2000);
+			if((miir(ctlr, phyaddr, 0) & 0x1000) && !(bmsr & 0x0020)){
+				miiw(ctlr, phyaddr, 0x1A, 0x2010);
+				x = miir(ctlr, phyaddr, 0);
+				miiw(ctlr, phyaddr, 0, 0x0200|x);
+				for(i = 0; i < 3000; i++){
+					delay(1);
+					if(miir(ctlr, phyaddr, 0x01) & 0x0020)
+						break;
+				}
+				miiw(ctlr, phyaddr, 0x1A, 0x2000);
 					
-			anar = miir(ctlr, phyaddr, 0x04);
-			anlpar = miir(ctlr, phyaddr, 0x05) & 0x03E0;
-			anar &= anlpar;
-			bmcr = 0;
-			if(anar & 0x380)
-				bmcr = 0x2000;
-			if(anar & 0x0140)
-				bmcr |= 0x0100;
+				anar = miir(ctlr, phyaddr, 0x04);
+				anlpar = miir(ctlr, phyaddr, 0x05) & 0x03E0;
+				anar &= anlpar;
+				bmcr = 0;
+				if(anar & 0x380)
+					bmcr = 0x2000;
+				if(anar & 0x0140)
+					bmcr |= 0x0100;
+			}
 			break;
 		}
 
@@ -1296,7 +1306,7 @@ reset(Ether* ether)
 	 * Load the chip configuration and start it off.
 	 */
 	if(ether->oq == 0)
-		ether->oq = qopen(256*1024, Qmsg, 0, 0);
+		ether->oq = qopen(64*1024, Qmsg, 0, 0);
 	configure(ether, 0);
 	command(ctlr, CUstart, PADDR(&ctlr->cbr->status));
 
@@ -1324,14 +1334,13 @@ reset(Ether* ether)
 	 */
 	ether->attach = attach;
 	ether->transmit = transmit;
+	ether->interrupt = interrupt;
 	ether->ifstat = ifstat;
 	ether->shutdown = shutdown;
 
 	ether->promiscuous = promiscuous;
 	ether->multicast = multicast;
 	ether->arg = ether;
-
-	intrenable(ether->irq, interrupt, ether, ether->tbdf, ether->name);
 
 	return 0;
 }

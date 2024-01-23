@@ -37,10 +37,11 @@ extern char Econrefused[];	/* connection refused */
 extern char Econinuse[];	/* connection in use */
 extern char Eintr[];		/* interrupted */
 extern char Enomem[];		/* kernel allocate failed */
+extern char Enoswap[];		/* swap space full */
 extern char Esoverlap[];	/* segments overlap */
 extern char Emouseset[];	/* mouse type already set */
 extern char Eshort[];		/* i/o count too small */
-extern char Egreg[];		/* the front fell off */
+extern char Egreg[];		/* ken has left the building */
 extern char Ebadspec[];		/* bad attach specifier */
 extern char Enoreg[];		/* process has no saved registers */
 extern char Enoattach[];	/* mount/attach disallowed */
@@ -50,5 +51,7 @@ extern char Enegoff[];		/* negative i/o offset */
 extern char Ecmdargs[];		/* wrong #args in control message */
 extern char Ebadip[];		/* bad ip address syntax */
 extern char Edirseek[];		/* seek in directory */
-extern char Etoolong[];		/* name too long */
 extern char Echange[];		/* media or partition has changed */
+extern char Estalled[];		/* endpoint stalled */
+extern char Edetach[];		/* device is detached */
+extern char Enotconf[];		/* endpoint not configured */

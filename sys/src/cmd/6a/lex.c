@@ -38,7 +38,7 @@ main(int argc, char *argv[])
 		break;
 	} ARGEND
 	if(*argv == 0) {
-		print("usage: %Ca [-options] file.s\n", thechar);
+		print("usage: %ca [-options] file.s\n", thechar);
 		errorexit();
 	}
 	if(argc > 1 && systemtype(Windows)){
@@ -92,10 +92,10 @@ main(int argc, char *argv[])
 int
 assemble(char *file)
 {
-	char *ofile, *p;
+	char ofile[100], incfile[20], *p;
 	int i, of;
 
-	ofile = strdup(file);
+	strcpy(ofile, file);
 	p = utfrrune(ofile, pathchar());
 	if(p) {
 		include[0] = ofile;
@@ -103,13 +103,16 @@ assemble(char *file)
 	} else
 		p = ofile;
 	if(outfile == 0) {
-		if(p){
-			outfile = p;
+		outfile = p;
+		if(outfile){
 			p = utfrrune(outfile, '.');
 			if(p)
 				if(p[1] == 's' && p[2] == 0)
 					p[0] = 0;
-			outfile = smprint("%s.%C", outfile, thechar);
+			p = utfrune(outfile, 0);
+			p[0] = '.';
+			p[1] = thechar;
+			p[2] = 0;
 		} else
 			outfile = "/dev/null";
 	}
@@ -117,13 +120,15 @@ assemble(char *file)
 	if(p) {
 		setinclude(p);
 	} else {
-		if(systemtype(Plan9))
-			setinclude(smprint("/%s/include", thestring));
+		if(systemtype(Plan9)) {
+			sprint(incfile,"/%s/include", thestring);
+			setinclude(strdup(incfile));
+		}
 	}
 
 	of = mycreat(outfile, 0664);
 	if(of < 0) {
-		yyerror("%Ca: cannot create %s", thechar, outfile);
+		yyerror("%ca: cannot create %s", thechar, outfile);
 		errorexit();
 	}
 	Binit(&obuf, of, OWRITE);
@@ -433,7 +438,6 @@ struct
 
 	"JCXZ",		LTYPER,	AJCXZ,
 	"JMP",		LTYPEC,	AJMP,
-	"JMPF",		LTYPEC, AJMPF,
 	"LAHF",		LTYPE0,	ALAHF,
 	"LARL",		LTYPE3,	ALARL,
 	"LARW",		LTYPE3,	ALARW,
@@ -471,7 +475,6 @@ struct
 	"MOVLQZX",	LTYPE3, AMOVLQZX,
 	"MOVNTIL",	LTYPE3,	AMOVNTIL,
 	"MOVNTIQ",	LTYPE3,	AMOVNTIQ,
-	"MOVQL",	LTYPE3,	AMOVQL,
 	"MOVWLSX",	LTYPE3, AMOVWLSX,
 	"MOVWLZX",	LTYPE3, AMOVWLZX,
 	"MOVWQSX",	LTYPE3,	AMOVWQSX,
@@ -781,10 +784,6 @@ struct
 	"ADDPS",	LTYPE3,	AADDPS,
 	"ADDSD",	LTYPE3,	AADDSD,
 	"ADDSS",	LTYPE3,	AADDSS,
-	"HADDPD",	LTYPE3,	AHADDPD,
-	"HADDPS",	LTYPE3,	AHADDPS,
-	"ADDSUBPD",	LTYPE3,	AADDSUBPD,
-	"ADDSUBPS",	LTYPE3,	AADDSUBPS,
 	"ANDNPD",	LTYPE3,	AANDNPD,
 	"ANDNPS",	LTYPE3,	AANDNPS,
 	"ANDPD",	LTYPE3,	AANDPD,
@@ -965,8 +964,6 @@ struct
 	"SUBPS",	LTYPE3,	ASUBPS,
 	"SUBSD",	LTYPE3,	ASUBSD,
 	"SUBSS",	LTYPE3,	ASUBSS,
-	"HSUBPD",	LTYPE3,	AHSUBPD,
-	"HSUBPS",	LTYPE3,	AHSUBPS,
 	"UCOMISD",	LTYPE3,	AUCOMISD,
 	"UCOMISS",	LTYPE3,	AUCOMISS,
 	"UNPCKHPD",	LTYPE3,	AUNPCKHPD,
@@ -975,12 +972,6 @@ struct
 	"UNPCKLPS",	LTYPE3,	AUNPCKLPS,
 	"XORPD",	LTYPE3,	AXORPD,
 	"XORPS",	LTYPE3,	AXORPS,
-	"ROUNDSD",	LTYPEX,	AROUNDSD,
-	"ROUNDSS",	LTYPEX,	AROUNDSS,
-	"ROUNDPD",	LTYPEX,	AROUNDPD,
-	"ROUNDPS",	LTYPEX,	AROUNDPS,
-	"DPPD",		LTYPEX,	ADPPD,
-	"DPPS",		LTYPEX,	ADPPS,
 
 	0
 };
@@ -1005,6 +996,7 @@ cinit(void)
 	iostack = I;
 	iofree = I;
 	peekc = IGN;
+	nhunk = 0;
 	for(i=0; i<NHASH; i++)
 		hash[i] = S;
 	for(i=0; itab[i].name; i++) {

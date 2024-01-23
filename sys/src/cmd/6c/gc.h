@@ -144,14 +144,17 @@ EXTERN	Prog*	firstp;
 EXTERN	Prog*	lastp;
 EXTERN	long	maxargsafe;
 EXTERN	int	mnstring;
+EXTERN	Node*	nodrat;
 EXTERN	Node*	nodret;
 EXTERN	Node*	nodsafe;
+EXTERN	long	nrathole;
 EXTERN	long	nstring;
 EXTERN	Prog*	p;
 EXTERN	long	pc;
 EXTERN	Node	lregnode;
 EXTERN	Node	qregnode;
 EXTERN	char	string[NSNAME];
+EXTERN	Sym*	symrathole;
 EXTERN	Node	znode;
 EXTERN	Prog	zprog;
 EXTERN	int	reg[D_NONE];
@@ -164,7 +167,7 @@ EXTERN	uchar	typechlpv[NTYPE];
 #define	LOAD(r)		(~r->refbehind.b[z] & r->refahead.b[z])
 #define	STORE(r)	(~r->calbehind.b[z] & r->calahead.b[z])
 
-#define	bset(a,n)	((a).b[(n)/32]&(1L<<(n)%32))
+#define	bset(a,n)	((a).b[(n)/BI2LONG] & (1L << (n)%BI2LONG))
 
 #define	CLOAD	5
 #define	CREF	5
@@ -239,7 +242,7 @@ void	gclean(void);
 void	nextpc(void);
 void	gargs(Node*, Node*, Node*);
 void	garg1(Node*, Node*, Node*, int, Node**);
-Node*	nodconst(long);
+Node*	nodconst(vlong);
 Node*	nodfconst(double);
 Node*	nodgconst(vlong, Type*);
 int	nodreg(Node*, Node*, int);
@@ -275,7 +278,6 @@ void	bitload(Node*, Node*, Node*, Node*, Node*);
 void	bitstore(Node*, Node*, Node*, Node*, Node*);
 long	outstring(char*, long);
 void	nullwarn(Node*, Node*);
-void	sextern(Sym*, Node*, long, long);
 void	gextern(Sym*, Node*, long, long);
 void	outcode(void);
 void	ieeedtod(Ieee*, double);

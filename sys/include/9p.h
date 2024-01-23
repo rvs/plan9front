@@ -27,26 +27,9 @@ typedef struct Filelist	Filelist;
 typedef struct Tree		Tree;
 typedef struct Readdir	Readdir;
 typedef struct Srv Srv;
-typedef struct Reqqueue Reqqueue;
-typedef struct Queueelem Queueelem;
 
 #pragma incomplete Filelist
 #pragma incomplete Readdir
-
-struct Queueelem
-{
-	Queueelem *prev, *next;
-	void (*f)(Req *);
-};
-
-struct Reqqueue
-{
-	QLock;
-	Rendez;
-	Queueelem;
-	int pid, flush;
-	Req *cur;
-};
 
 struct Fid
 {
@@ -77,8 +60,6 @@ struct Req
 	Fid*		afid;
 	Fid*		newfid;
 	Srv*		srv;
-	
-	Queueelem qu;
 
 /* below is implementation-specific; don't use */
 	QLock	lk;
@@ -152,6 +133,7 @@ struct Tree {
 /* below is implementation-specific; don't use */
 	Lock genlock;
 	ulong qidgen;
+	ulong dirqidgen;
 };
 
 Tree*	alloctree(char*, char*, ulong, void(*destroy)(File*));
@@ -161,7 +143,7 @@ int		removefile(File*);
 void		closefile(File*);
 File*		walkfile(File*, char*);
 Readdir*	opendirfile(File*);
-long		readdirfile(Readdir*, uchar*, long, long);
+long		readdirfile(Readdir*, uchar*, long);
 void		closedirfile(Readdir*);
 
 /*
@@ -194,7 +176,6 @@ struct Srv {
 	Tree*	tree;
 	void		(*destroyfid)(Fid*);
 	void		(*destroyreq)(Req*);
-	void		(*start)(Srv*);
 	void		(*end)(Srv*);
 	void*	aux;
 
@@ -214,6 +195,9 @@ struct Srv {
 
 	int		infd;
 	int		outfd;
+	int		nopipe;
+	int		srvfd;
+	int		leavefdsopen;	/* magic for acme win */
 	char*	keyspec;
 
 /* below is implementation-specific; don't use */
@@ -227,43 +211,27 @@ struct Srv {
 	QLock	wlock;
 	
 	char*	addr;
-
-	QLock	slock;
-	Ref	sref;	/* srvwork procs */
-	Ref	rref;	/* requests in flight */
-
-	int	spid;	/* pid of srv() caller */
-
-	void	(*forker)(void (*)(void*), void*, int);
-	void	(*free)(Srv*);
 };
 
-void		srvforker(void (*)(void*), void*, int);
-void		threadsrvforker(void (*)(void*), void*, int);
-
 void		srv(Srv*);
-int		postsrv(Srv*, char*);
 void		postmountsrv(Srv*, char*, char*, int);
-void		postsharesrv(Srv*, char*, char*, char*);
+void		_postmountsrv(Srv*, char*, char*, int);
 void		listensrv(Srv*, char*);
-
-void		threadsrv(Srv*);
-int		threadpostsrv(Srv*, char*);
-void		threadpostmountsrv(Srv*, char*, char*, int);
-void		threadpostsharesrv(Srv*, char*, char*, char*);
-void		threadlistensrv(Srv *s, char *addr);
-
+void		_listensrv(Srv*, char*);
+int 		postfd(char*, int);
 int		chatty9p;
 void		respond(Req*, char*);
 void		responderror(Req*);
+void		threadpostmountsrv(Srv*, char*, char*, int);
+void		threadlistensrv(Srv *s, char *addr);
 
 /*
  * Helper.  Assumes user is same as group.
  */
 int		hasperm(File*, char*, int);
 
-void*	emalloc9p(ulong);
-void*	erealloc9p(void*, ulong);
+void*	emalloc9p(uintptr);
+void*	erealloc9p(void*, uintptr);
 char*	estrdup9p(char*);
 
 enum {
@@ -281,10 +249,5 @@ void		authwrite(Req*);
 void		authdestroy(Fid*);
 int		authattach(Req*);
 
-void		srvacquire(Srv *);
-void		srvrelease(Srv *);
+extern void (*_forker)(void (*)(void*), void*, int);
 
-Reqqueue*	reqqueuecreate(void);
-void		reqqueuepush(Reqqueue*, Req*, void (*)(Req *));
-void		reqqueueflush(Reqqueue*, Req*);
-void		reqqueuefree(Reqqueue*);

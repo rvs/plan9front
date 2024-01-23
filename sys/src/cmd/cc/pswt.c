@@ -57,7 +57,7 @@ doswit(Node *n)
 		q++;
 	}
 	qsort(iq, nc, sizeof(C1), swcmp);
-	if(debug['W'])
+	if(debug['K'])
 	for(i=0; i<nc; i++)
 		print("case %2ld: = %.8llux\n", i, (vlong)iq[i].val);
 	dup = 0;
@@ -110,14 +110,21 @@ doswit(Node *n)
 			q++;
 		}
 		qsort(iql,  q-iql, sizeof(C1), swcmp);
-if(0){for(int k=0; k<(q-iql); k++)print("nh=%ld k=%d h=%#llux l=%#llux lab=%ld\n", nh, k, (vlong)iqh[nh].val,  (vlong)iql[k].val, iql[k].label);}
+		if (0)
+			for (int k = 0; k < (q - iql); k++)
+				print("nh=%ld k=%d h=%#llux l=%#llux lab=%ld\n",
+					nh, k, (vlong)iqh[nh].val,
+					(vlong)iql[k].val, iql[k].label);
 		iqh[nh].label = pc;
 		nh++;
 		swit1(iql, q-iql, def, vr[0]);
 		i = j;
 	}
 	patch(hsb, pc);
-if(0){for(int k=0; k<nh; k++)print("k*=%d h=%#llux lab=%ld\n", k, (vlong)iqh[k].val,  iqh[k].label);}
+	if (0)
+		for (int k = 0; k < nh; k++)
+			print("k*=%d h=%#llux lab=%ld\n", k, (vlong)iqh[k].val,
+				iqh[k].label);
 	swit1(iqh, nh, def, vr[1]);
 }
 
@@ -132,28 +139,29 @@ casf(void)
 }
 
 long
-outlstring(Rune *s, long n)
+outlstring(TRune *s, long n)
 {
-	char buf[sizeof(Rune)];
-	int c, i;
+	char buf[sizeof(TRune)];
+	uint c;
+	int i;
 	long r;
 
 	if(suppress)
 		return nstring;
-	while(nstring % sizeof buf)
+	while(nstring & (sizeof(TRune)-1))
 		outstring("", 1);
 	r = nstring;
 	while(n > 0) {
 		c = *s++;
 		if(align(0, types[TCHAR], Aarg1)) {
-			for(i = sizeof buf; i > 0; c >>= 8)
-				buf[--i] = c;
+			for(i = 0; i < sizeof(TRune); i++)
+				buf[i] = c>>(8*(sizeof(TRune) - i - 1));
 		} else {
-			for(i = 0; i < sizeof buf; c >>= 8)
-				buf[i++] = c;
+			for(i = 0; i < sizeof(TRune); i++)
+				buf[i] = c>>(8*i);
 		}
-		outstring(buf, sizeof buf);
-		n -= sizeof buf;
+		outstring(buf, sizeof(TRune));
+		n -= sizeof(TRune);
 	}
 	return r;
 }

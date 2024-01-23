@@ -1,16 +1,13 @@
 /*
  * VIA VT6105M Fast Ethernet Controller (Rhine III).
  * To do:
- *	cache-line size alignments - done
- *	reduce tx interrupts - done
- *	reorganise initialisation/shutdown/reset
- *	adjust Tx FIFO threshold on underflow - untested
+ *	reorganise initialisation/shutdown/reset.
+ *	adjust Tx FIFO threshold on underflow - untested.
  *	why does the link status never cause an interrupt?
  *	use the lproc as a periodic timer for stalls, etc.
- *	checksum offload - done
- *	take non-HW stuff out of descriptor for 64-bit
- *	cleanliness
+ *	take non-HW stuff out of descriptor for 64-bit cleanliness.
  *	why does the receive buffer alloc have a +3?
+ *	perhaps to extend it to the next word out of paranoia.
  */
 #include "u.h"
 #include "../port/lib.h"
@@ -18,11 +15,11 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 #include "../port/netif.h"
-#include "../port/etherif.h"
-#include "../port/ethermii.h"
+
+#include "etherif.h"
+#include "ethermii.h"
 
 enum {
 	Par0		= 0x00,			/* Ethernet Address */
@@ -282,15 +279,14 @@ enum {						/* Tx Ds branch */
 
 enum {
 	Nrd		= 196,
-	Ntd		= 128,
+	Ntd		= 32,
 	Crcsz		= 4,
 	Bslop		= 48,
 	Rdbsz		= ETHERMAXTU+Crcsz+Bslop,
+	Maxus		= 1500000,  /* Soekris 5501s take a while to reset */
 
 	Nrxstats	= 8,
 	Ntxstats	= 9,
-
-	Txcopy		= 128,
 };
 
 typedef struct Ctlr Ctlr;
@@ -330,7 +326,7 @@ typedef struct Ctlr {
 	uint	txstats[Ntxstats];
 	ulong	totalt;
 	uint	intr;
-	uint	lintr;			
+	uint	lintr;
 	uint	lsleep;
 	uint	rintr;
 	uint	tintr;
@@ -439,8 +435,11 @@ vt6105Mifstat(Ether* edev, void* a, long n, ulong offset)
 	char *alloc, *e, *p;
 
 	ctlr = edev->ctlr;
-	
-	p = alloc = smalloc(READSTR);
+
+	alloc = malloc(READSTR);
+	p = alloc;
+	if(p == nil)
+		error(Enomem);
 	e = p + READSTR;
 	for(i = 0; i < Nrxstats; i++){
 		p = seprint(p, e, "%s: %ud\n", rxstats[i], ctlr->rxstats[i]);
@@ -547,8 +546,6 @@ vt6105Mlproc(void* arg)
 
 	edev = arg;
 	ctlr = edev->ctlr;
-	while(waserror())
-		;
 	for(;;){
 		if(ctlr->mii == nil || ctlr->mii->curphy == nil)
 			break;
@@ -597,6 +594,7 @@ vt6105Mrballoc(void)
 	if((bp = vt6105Mrbpool) != nil){
 		vt6105Mrbpool = bp->next;
 		bp->next = nil;
+		ainc(&bp->ref);	/* prevent bp from being freed */
 	}
 	iunlock(&vt6105Mrblock);
 
@@ -611,6 +609,7 @@ static void
 vt6105Mattach(Ether* edev)
 {
 	Ctlr *ctlr;
+//	MiiPhy *phy;
 	uchar *alloc;
 	Ds *ds, *prev;
 	int dsz, i, timeo;
@@ -666,7 +665,7 @@ vt6105Mattach(Ether* edev)
 
 		ds->bp = vt6105Mrballoc();
 		if(ds->bp == nil)
-			error("vt6105M: can't allocate receive ring\n");
+			error("vt6105M: can't allocate receive ring");
 		ds->bp->rp = (uchar*)ROUNDUP((ulong)ds->bp->rp, 4);
 		ds->addr = PCIWADDR(ds->bp->rp);
 
@@ -865,7 +864,7 @@ vt6105Mreceive(Ether* edev)
 			}
 			len = ((ds->status & LengthMASK)>>LengthSHIFT)-4;
 			ds->bp->wp = ds->bp->rp+len;
-			etheriq(edev, ds->bp);
+			etheriq(edev, ds->bp, 1);
 			bp->rp = (uchar*)ROUNDUP((ulong)bp->rp, 4);
 			ds->addr = PCIWADDR(bp->rp);
 			ds->bp = bp;
@@ -885,12 +884,12 @@ vt6105Mreceive(Ether* edev)
 	csr16w(ctlr, Cr, ctlr->cr);
 }
 
-static void
+static int
 vt6105Minterrupt(Ureg*, void* arg)
 {
 	Ctlr *ctlr;
 	Ether *edev;
-	int imr, isr, r, timeo;
+	int imr, isr, r, timeo, loops;
 	long t;
 
 	edev = arg;
@@ -902,12 +901,12 @@ vt6105Minterrupt(Ureg*, void* arg)
 	csr16w(ctlr, Imr, 0);
 	imr = ctlr->imr;
 	ctlr->intr++;
-	for(;;){
+	for(loops = 0; ; loops++){
 		if((isr = csr16r(ctlr, Isr)) != 0)
 			csr16w(ctlr, Isr, isr);
 		if((isr & ctlr->imr) == 0)
 			break;
-			
+
 		if(isr & Srci){
 			imr &= ~Srci;
 			ctlr->lwakeup = isr & Srci;
@@ -940,8 +939,8 @@ vt6105Minterrupt(Ureg*, void* arg)
 					csr8w(ctlr, Bcr1, r|ctlr->tft);
 				}
 			}
-			
-			
+
+
 			ctlr->totalt += lcycles() - t;
 			vt6105Mtransmit(edev);
 			t = lcycles();
@@ -953,9 +952,10 @@ vt6105Minterrupt(Ureg*, void* arg)
 	}
 	ctlr->imr = imr;
 	csr16w(ctlr, Imr, ctlr->imr);
-	
+
 	ctlr->totalt += lcycles() - t;
 	iunlock(&ctlr->clock);
+	return loops > 0? Intrforme: Intrnotforme;
 }
 
 static int
@@ -975,12 +975,12 @@ vt6105Mmiimicmd(Mii* mii, int pa, int ra, int cmd, int data)
 		csr16w(ctlr, Miidata, data);
 	csr8w(ctlr, Miicr, cmd);
 
-	for(timeo = 0; timeo < 10000; timeo++){
+	for(timeo = 0; timeo < Maxus; timeo++){
 		if(!(csr8r(ctlr, Miicr) & cmd))
 			break;
 		microdelay(1);
 	}
-	if(timeo >= 10000)
+	if(timeo >= Maxus)
 		return -1;
 
 	if(cmd == Wcmd)
@@ -1026,16 +1026,23 @@ vt6105Mdetach(Ctlr* ctlr)
 	 */
 	csr16w(ctlr, Cr, Stop);
 	csr16w(ctlr, Cr, Stop|Sfrst);
-	/* limit used to be 10000, but that wasn't enough for our Soekris 5501s */
-	for(timeo = 0; timeo < 100000; timeo++){
+	for(timeo = 0; timeo < Maxus; timeo++){
 		if(!(csr16r(ctlr, Cr) & Sfrst))
 			break;
 		microdelay(1);
 	}
-	if(timeo >= 100000)
+	if(timeo >= Maxus)
 		return -1;
 
 	return 0;
+}
+
+static void
+vt6105Mshutdown(Ether *ether)
+{
+	Ctlr *ctlr = ether->ctlr;
+
+	vt6105Mdetach(ctlr);
 }
 
 static int
@@ -1053,13 +1060,12 @@ vt6105Mreset(Ctlr* ctlr)
 	 */
 	r = csr8r(ctlr, Eecsr);
 	csr8w(ctlr, Eecsr, Autold|r);
-	/* limit used to be 100, but that wasn't enough for our Soekris 5501s */
-	for(timeo = 0; timeo < 100000; timeo++){
+	for(timeo = 0; timeo < Maxus; timeo++){
 		if(!(csr8r(ctlr, Cr) & Autold))
 			break;
 		microdelay(1);
 	}
-	if(timeo >= 100000)
+	if(timeo >= Maxus)
 		return -1;
 
 	for(i = 0; i < Eaddrlen; i++)
@@ -1113,7 +1119,7 @@ vt6105Mpci(void)
 {
 	Pcidev *p;
 	Ctlr *ctlr;
-	int port;
+	int cls, port;
 
 	p = nil;
 	while(p = pcimatch(p, 0, 0)){
@@ -1127,22 +1133,28 @@ vt6105Mpci(void)
 			break;
 		}
 
-		port = p->mem[0].bar & ~3;
+		port = p->mem[0].bar & ~0x01;
 		if(ioalloc(port, p->mem[0].size, 0, "vt6105M") < 0){
 			print("vt6105M: port 0x%uX in use\n", port);
 			continue;
 		}
 		ctlr = malloc(sizeof(Ctlr));
-		if(ctlr == nil){
-			print("vt6105M: can't allocate memory\n");
+		if(ctlr == nil) {
 			iofree(port);
-			continue;
+			error(Enomem);
 		}
 		ctlr->port = port;
 		ctlr->pcidev = p;
-		pcienable(p);
 		ctlr->id = (p->did<<16)|p->vid;
-		ctlr->cls = p->cls*4;
+		if((cls = pcicfgr8(p, PciCLS)) == 0 || cls == 0xFF)
+			cls = conf.cachelinesz / BY2WD;
+		ctlr->cls = cls*BY2WD;
+		if(ctlr->cls < sizeof(Ds)){
+			print("vt6105M: cls %d < sizeof(Ds)\n", ctlr->cls);
+			iofree(port);
+			free(ctlr);
+			continue;
+		}
 		ctlr->tft = CtftSAF;
 
 		if(vt6105Mreset(ctlr)){
@@ -1188,7 +1200,7 @@ vt6105Mpnp(Ether* edev)
 	edev->irq = ctlr->pcidev->intl;
 	edev->tbdf = ctlr->pcidev->tbdf;
 	/*
-	 * Set to 1000Mb/s to fool the bsz calculation.  We need 
+	 * Set to 1000Mb/s to fool the bsz calculation.  We need
 	 * something better, though.
 	 */
 	edev->mbps = 1000;
@@ -1199,7 +1211,9 @@ vt6105Mpnp(Ether* edev)
 	 */
 	edev->attach = vt6105Mattach;
 	edev->transmit = vt6105Mtransmit;
+	edev->interrupt = vt6105Minterrupt;
 	edev->ifstat = vt6105Mifstat;
+	edev->shutdown = vt6105Mshutdown;
 	edev->ctl = nil;
 
 	edev->arg = edev;
@@ -1207,8 +1221,6 @@ vt6105Mpnp(Ether* edev)
 	edev->multicast = vt6105Mmulticast;
 
 	edev->maxmtu = ETHERMAXTU+Bslop;
-
-	intrenable(edev->irq, vt6105Minterrupt, edev, edev->tbdf, edev->name);
 
 	return 0;
 }

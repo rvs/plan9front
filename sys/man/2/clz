@@ -1,0 +1,23 @@
+.TH CLZ 2
+.SH NAME
+clz \- count leading zero bits of an integer
+.SH SYNOPSIS
+.B
+#include <u.h>
+.br
+.B
+#include <libc.h>
+.PP
+.B
+int clz(uvlong n)
+.SH DESCRIPTION
+.I Clz
+returns the number of contiguous leading zero bits
+including the most-significant bit, in
+.IR n .
+This number can be used to approximate
+.IR log2(n) .
+.SH SOURCE
+.B /sys/src/libc/*/*clz*.[cs]
+.SH SEE ALSO
+.IR exp (2)

@@ -171,7 +171,7 @@ enum
 	NHUNK		= 100000,
 	MINSIZ		= 64,
 	NENT		= 100,
-	MAXIO		= 8192,
+	MAXIO		= (16*1024),
 	MAXHIST		= 20,				/* limit of path elements for history symbols */
 };
 
@@ -229,7 +229,7 @@ EXTERN	char*	library[50];
 EXTERN	char*	libraryobj[50];
 EXTERN	int	libraryp;
 EXTERN	int	xrefresolv;
-EXTERN	char*	hunk;
+EXTERN	char*	hunk;		/* compat.c's malloc */
 EXTERN	char	inuxi1[1];
 EXTERN	char	inuxi2[2];
 EXTERN	char	inuxi4[4];
@@ -238,7 +238,7 @@ EXTERN	Prog*	lastp;
 EXTERN	long	lcsize;
 EXTERN	char	literal[32];
 EXTERN	int	nerrors;
-EXTERN	long	nhunk;
+EXTERN	long	nhunk;		/* compat.c's malloc */
 EXTERN	Prog	nopalign;
 EXTERN	long	instoffset;
 EXTERN	vlong	instoffx;
@@ -251,7 +251,7 @@ EXTERN	uchar	repop[ALAST];
 EXTERN	long	symsize;
 EXTERN	Prog*	textp;
 EXTERN	long	textsize;
-EXTERN	long	thunk;
+EXTERN	long	thunk;		/* compat.c's malloc */
 EXTERN	int	version;
 EXTERN	char	xcmp[32][32];
 EXTERN	Prog	zprg;
@@ -327,7 +327,7 @@ void	lput(long);
 void	lputl(long);
 void	bput(long);
 void	mkfwd(void);
-void*	mysbrk(ulong);
+#define	mysbrk sbrk
 void	names(void);
 void	nocache(Prog*);
 void	noops(void);

@@ -3,6 +3,10 @@
  *
  * HZ should divide 1000 evenly, ideally.
  * 100, 125, 200, 250 and 333 are okay.
+ *
+ * 100 is typical, but we want to pop out of WFI more often
+ * since we don't yet implement lockwake; 200 achieves that,
+ * but also results in occasional duplicated usb keystrokes.
  */
 #define	HZ		100			/* clock frequency */
 #define	MS2HZ		(1000/HZ)		/* millisec per clock tick */
@@ -15,13 +19,14 @@ enum {
 typedef struct Conf	Conf;
 typedef struct Confmem	Confmem;
 typedef struct FPsave	FPsave;
-typedef struct PFPU	PFPU;
+typedef struct I2Cdev	I2Cdev;
 typedef struct ISAConf	ISAConf;
 typedef struct Label	Label;
 typedef struct Lock	Lock;
 typedef struct Memcache	Memcache;
 typedef struct MMMU	MMMU;
 typedef struct Mach	Mach;
+typedef struct Notsave	Notsave;
 typedef struct Page	Page;
 typedef struct PhysUart	PhysUart;
 typedef struct PMMU	PMMU;
@@ -57,14 +62,14 @@ struct Label
 	uintptr	pc;
 };
 
-/*
- * emulated or vfp3 floating point
- */
 enum {
 	Maxfpregs	= 32,	/* could be 16 or 32, see Mach.fpnregs */
 	Nfpctlregs	= 16,
 };
 
+/*
+ * emulated or vfp3 floating point
+ */
 struct FPsave
 {
 	ulong	status;
@@ -79,12 +84,9 @@ struct FPsave
 	uintptr	pc;		/* of failed fp instr. */
 };
 
-struct PFPU
-{
-	int	fpstate;
-	FPsave	fpsave[1];
-};
-
+/*
+ * FPsave.fpstate
+ */
 enum
 {
 	FPinit,
@@ -99,7 +101,7 @@ enum
 struct Confmem
 {
 	uintptr	base;
-	ulong	npage;
+	usize	npage;
 	uintptr	limit;
 	uintptr	kbase;
 	uintptr	klimit;
@@ -109,9 +111,9 @@ struct Conf
 {
 	ulong	nmach;		/* processors */
 	ulong	nproc;		/* processes */
-	Confmem	mem[1];		/* physical memory */
+	Confmem	mem[2];		/* physical memory */
 	ulong	npage;		/* total physical pages of memory */
-	ulong	upages;		/* user page pool */
+	usize	upages;		/* user page pool */
 	ulong	copymode;	/* 0 is copy on write, 1 is copy on reference */
 	ulong	ialloc;		/* max interrupt time allocation in bytes */
 	ulong	pipeqsize;	/* size in bytes of pipe queues */
@@ -123,6 +125,35 @@ struct Conf
 	int	monitor;	/* flag */
 };
 
+struct I2Cdev {
+	int	salen;
+	int	addr;
+	int	tenbit;
+};
+
+/*
+ * GPIO
+ */
+enum {
+	Input	= 0x0,
+	Output	= 0x1,
+	Alt0	= 0x4,
+	Alt1	= 0x5,
+	Alt2	= 0x6,
+	Alt3	= 0x7,
+	Alt4	= 0x3,
+	Alt5	= 0x2,
+};
+
+
+
+/*
+ *  things saved in the Proc structure during a notify
+ */
+struct Notsave {
+	int	emptiness;
+};
+
 /*
  *  MMU stuff in Mach.
  */
@@ -132,16 +163,20 @@ struct MMMU
 	int	mmul1lo;
 	int	mmul1hi;
 	int	mmupid;
+	PTE*	kmapl2;		/* l2 for section containing kmap area and vectors */
 };
 
 /*
  *  MMU stuff in proc
  */
 #define NCOLOR	1		/* 1 level cache, don't worry about VCE's */
+#define NKMAPS	4
 struct PMMU
 {
 	Page*	mmul2;
 	Page*	mmul2cache;	/* free mmu pages */
+	int	nkmap;
+	PTE	kmaptab[NKMAPS];
 };
 
 #include "../port/portdat.h"
@@ -150,17 +185,41 @@ struct Mach
 {
 	int	machno;			/* physical id of processor */
 	uintptr	splpc;			/* pc of last caller to splhi */
-	Proc*	proc;			/* current process on this processor */
+
+	Proc*	proc;			/* current process */
 
 	MMMU;
-	/* end of offsets known to asm */
+	int	flushmmu;		/* flush current proc mmu state */
 
-	PMach;
+	ulong	ticks;			/* of the clock since boot time */
+	Label	sched;			/* scheduler wakeup */
+	Lock	alarmlock;		/* access to alarm list */
+	void*	alarm;			/* alarms bound to this clock */
+
+	Proc*	readied;		/* for runproc */
+	ulong	schedticks;		/* next forced context switch */
 
 	int	cputype;
 	ulong	delayloop;
+
+	/* stats */
+	int	tlbfault;
+	int	tlbpurge;
+	int	pfault;
+	int	cs;
+	int	syscall;
+	int	load;
+	int	intr;
+	uvlong	fastclock;		/* last sampled value */
+	ulong	spuriousintr;
+	int	lastintr;
+	int	ilockdepth;
+	Perf	perf;			/* performance counters */
+
+
 	int	cpumhz;
 	uvlong	cpuhz;			/* speed of cpu */
+	uvlong	cyclefreq;		/* Frequency of user readable cycle counter */
 
 	/* vfp2 or vfp3 fpu */
 	int	havefp;
@@ -181,7 +240,7 @@ struct Mach
 	u32int	smon[5];		/* probably not needed */
 	u32int	ssys[5];
 
-	uintptr	stack[1];
+	int	stack[1];
 };
 
 /*
@@ -189,19 +248,29 @@ struct Mach
  */
 typedef void		KMap;
 #define	VA(k)		((uintptr)(k))
-#define	kmap(p)		(KMap*)((p)->pa|kseg0)
+//#define	kmap(p)		(KMap*)((p)->pa|kseg0)
+extern KMap* kmap(Page*);
 extern void kunmap(KMap*);
 
 struct
 {
-	char	machs[MAXMACH];		/* active CPUs */
+	Lock;
+	union {
+		ulong	machs;
+		ulong	machsmap[(MAXMACH+BI2WD-1)/BI2WD];  /* bitmap of active CPUs */
+	};
+	int	nmachs;			/* number of bits set in machs(map) */
 	int	exiting;		/* shutdown */
+	int	ispanic;		/* shutdown in response to a panic */
+	int	thunderbirdsarego; /* let added processors continue to schedinit */
+	int	rebooting;		/* just idle cpus > 0 */
 }active;
 
 extern register Mach* m;			/* R10 */
 extern register Proc* up;			/* R9 */
 extern uintptr kseg0;
 extern Mach* machaddr[MAXMACH];
+extern ulong memsize;
 extern int normalprint;
 
 /*
@@ -256,27 +325,12 @@ struct DevConf
 
 struct Soc {			/* SoC dependent configuration */
 	ulong	dramsize;
-	ulong	iosize;
+	uintptr	physio;
 	uintptr	busdram;
 	uintptr	busio;
-	uintptr	physio;
-	uintptr	virtio;
 	uintptr	armlocal;
+	uint	oscfreq;
 	u32int	l1ptedramattrs;
 	u32int	l2ptedramattrs;
 };
 extern Soc soc;
-
-/*
- * GPIO
- */
-enum {
-	Input	= 0x0,
-	Output	= 0x1,
-	Alt0	= 0x4,
-	Alt1	= 0x5,
-	Alt2	= 0x6,
-	Alt3	= 0x7,
-	Alt4	= 0x3,
-	Alt5	= 0x2,
-};

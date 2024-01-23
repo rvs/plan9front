@@ -1,0 +1,8 @@
+# tinyemu in Sv48
+KTZERO=0xffff800080000000	# sv48 at 2GB
+# KTZERO=0xffffffc080000000	# sv39 at 2GB
+CONFDEF= -DSV48			# -DFILL_PT # -DDUMP_PTES # -DTRAPDEBUG
+LDFLAGS= # -c			# uncompressed runs faster on tinyemu
+BANK0SIZE='(512*MB)'
+RBKTZERO=0x9ff05000
+SFX=bin

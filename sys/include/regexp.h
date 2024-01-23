@@ -1,29 +1,15 @@
-#pragma src "/sys/src/libregexp"
-#pragma lib "libregexp.a"
-enum
-{
-	OANY = 0,
-	OBOL,
-	OCLASS,
-	OEOL,
-	OJMP,
-	ONOTNL,
-	ORUNE,
-	OSAVE,
-	OSPLIT,
-	OUNSAVE,
-};
+#pragma	src	"/sys/src/libregexp"
+#pragma	lib	"libregexp.a"
 
-typedef struct Resub Resub;
-typedef struct Reinst Reinst;
-typedef struct Reprog Reprog;
-typedef struct Rethread Rethread;
+typedef struct Resub		Resub;
+typedef struct Reclass		Reclass;
+typedef struct Reinst		Reinst;
+typedef struct Reprog		Reprog;
 
-#pragma incomplete Reinst
-#pragma incomplete Rethread
-
-struct Resub
-{
+/*
+ *	Sub expression matches
+ */
+struct Resub{
 	union
 	{
 		char *sp;
@@ -35,21 +21,48 @@ struct Resub
 		Rune *rep;
 	};
 };
-struct Reprog
-{
-	Reinst *startinst;
-	Rethread *threads;
-	char *regstr;
-	int len;
-	int nthr;
+
+/*
+ *	character class, each pair of runes defines a range
+ */
+struct Reclass{
+	Rune	*end;			/* points into spans */
+	Rune	*spans;			/* dynamically allocated */
 };
 
-Reprog*	regcomp(char*);
-Reprog*	regcomplit(char*);
-Reprog*	regcompnl(char*);
-void	regerror(char*);
-int	regexec(Reprog*, char*, Resub*, int);
-void	regsub(char*, char*, int, Resub*, int);
-int	rregexec(Reprog*, Rune*, Resub*, int);
-void	rregsub(Rune*, Rune*, int, Resub*, int);
-int	reprogfmt(Fmt *);
+/*
+ *	Machine instructions
+ */
+struct Reinst{
+	int	type;
+	union	{
+		Reclass	*cp;		/* class pointer */
+		Rune	r;		/* character */
+		int	subid;		/* sub-expression id for RBRA and LBRA */
+		Reinst	*right;		/* right child of OR */
+	};
+	union {	/* regexp relies on these two being in the same union */
+		Reinst *left;		/* left child of OR */
+		Reinst *next;		/* next instruction for CAT & LBRA */
+	};
+};
+
+/*
+ *	Reprogram definition
+ */
+/* max character classes per program is nelem(reprog->class) */
+struct Reprog{
+	Reinst	*startinst;	/* start pc */
+	Reclass	class[16];	/* .data */
+	Reinst	firstinst[5];	/* .text */
+};
+
+extern Reprog	*regcomp(char*);
+extern Reprog	*regcomplit(char*);
+extern Reprog	*regcompnl(char*);
+extern void	regerror(char*);
+extern void	regfree(Reprog*);
+extern int	regexec(Reprog*, char*, Resub*, int);
+extern void	regsub(char*, char*, int, Resub*, int);
+extern int	rregexec(Reprog*, Rune*, Resub*, int);
+extern void	rregsub(Rune*, Rune*, int, Resub*, int);

@@ -1,0 +1,31 @@
+#!/bin/rc
+# configure a bridge for tinyemu
+fn go {
+	mk install && temu
+}
+
+if (! test -d '#B') {
+	echo $0: no bridge device configured in kernel >[1=2]
+	exit 'no bridge device'
+}
+if (test -e /srv/bridgepipe)
+	exit ''
+
+rfork e
+br=0			# bridge number
+
+rm -f /srv/emupipe /srv/bridgepipe
+bridgeio &
+test -d /net/bridge$br || bind -a '#B'$br /net || exit 'no bridge'
+while (test ! -f /srv/bridgepipe -o ! -f /srv/emupipe) {
+	echo -n .
+	sleep 0.1
+}
+
+@ {
+cd /net/bridge$br
+ownhash=0
+echo bind tunnel ethert $ownhash /srv/bridgepipe /srv/bridgepipe >ctl || exit bind-1
+echo bind  ether ether0 $ownhash /net/ether0 >ctl || exit bind-2
+echo bridge$br configured.
+}

@@ -71,7 +71,8 @@ flash2gen(Chan *c, ulong p, Dir *dp)
 		return 1;
 	case Qctl:
 		snprint(up->genbuf, sizeof(up->genbuf), "%sctl", fp->name);
-		devdir(c, q, up->genbuf, 0, eve, 0660, dp);
+		/* no harm in letting everybody read the ctl files */
+		devdir(c, q, up->genbuf, 0, eve, 0664, dp);
 		return 1;
 	default:
 		return -1;
@@ -88,7 +89,7 @@ flashgen(Chan *c, char*, Dirtab*, int, int s, Dir *dp)
 		mkqid(&q, QID(0, Qtopdir), 0, QTDIR);
 		n = "#F";
 		if(c->dev != 0){
-			sprint(up->genbuf, "#F%ld", c->dev);
+			snprint(up->genbuf, sizeof up->genbuf, "#F%ld", c->dev);
 			n = up->genbuf;
 		}
 		devdir(c, q, n, 0, eve, 0555, dp);
@@ -101,7 +102,8 @@ flashgen(Chan *c, char*, Dirtab*, int, int s, Dir *dp)
 		mkqid(&q, QID(0, Qflashdir), 0, QTDIR);
 		n = "flash";
 		if(c->dev != 0){
-			sprint(up->genbuf, "flash%ld", c->dev);
+			snprint(up->genbuf, sizeof up->genbuf, "flash%ld",
+				c->dev);
 			n = up->genbuf;
 		}
 		devdir(c, q, n, 0, eve, 0555, dp);
@@ -167,11 +169,11 @@ static Chan*
 flashattach(char *spec)
 {
 	Flash *f;
+	int bank;
 	Chan *c;
-	ulong bank;
 
-	bank = strtoul(spec, nil, 10);
-	if(bank >= Nbanks ||
+	bank = strtol(spec, nil, 0);
+	if(bank < 0 || bank >= Nbanks ||
 	   (f = flash.card[bank]) == nil ||
 	   f->attach != nil && f->attach(f) < 0)
 		error(Enodev);
@@ -240,7 +242,9 @@ flashread(Chan *c, void *buf, long n, vlong offset)
 			error(Eio);
 		return n;
 	case Qctl:
-		s = smalloc(READSTR);
+		s = malloc(READSTR);
+		if(s == nil)
+			error(Enomem);
 		if(waserror()){
 			free(s);
 			nexterror();
@@ -403,8 +407,7 @@ flashnewpart(Flash *f, char *name, ulong start, ulong end)
 	}
 	if((fp = empty) == nil)
 		return "partition table full";
-	if(strlen(name)+3 >= sizeof(up->genbuf))
-		return Etoolong;
+//	fp->name = nil;
 	kstrdup(&fp->name, name);
 	if(fp->name == nil)
 		return Enomem;
@@ -476,11 +479,9 @@ addflashcard(char *name, int (*reset)(Flash*))
 {
 	Flashtype *f, **l;
 
-	f = malloc(sizeof(*f));
-	if(f == nil){
-		print("addflashcard: no memory for Flashtype\n");
-		return;
-	}
+	f = (Flashtype*)malloc(sizeof(*f));
+	if(f == nil)
+		error(Enomem);
 	f->name = name;
 	f->reset = reset;
 	f->next = nil;

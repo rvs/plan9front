@@ -31,63 +31,6 @@ devno(int c, int user)
 }
 
 void
-devmask(Pgrp *pgrp, int invert, char *devs)
-{
-	int i, t, w;
-	char *p;
-	Rune r;
-	u64int mask[nelem(pgrp->notallowed)];
-
-	if(invert)
-		memset(mask, 0xFF, sizeof mask);
-	else		
-		memset(mask, 0, sizeof mask);		
-
-	w = sizeof mask[0] * 8;
-	for(p = devs; *p != '\0';){
-		p += chartorune(&r, p);
-		t = devno(r, 1);
-		if(t == -1)
-			continue;
-		if(invert)
-			mask[t/w] &= ~(1<<t%w);
-		else
-			mask[t/w] |= 1<<t%w;
-	}
-
-	wlock(&pgrp->ns);
-	for(i=0; i < nelem(pgrp->notallowed); i++)
-		pgrp->notallowed[i] |= mask[i];
-	wunlock(&pgrp->ns);
-}
-
-int
-devallowed(Pgrp *pgrp, int r)
-{
-	int t, w, b;
-
-	t = devno(r, 1);
-	if(t == -1)
-		return 0;
-
-	w = sizeof(u64int) * 8;
-	rlock(&pgrp->ns);
-	b = !(pgrp->notallowed[t/w] & 1<<t%w);
-	runlock(&pgrp->ns);
-	return b;
-}
-
-int
-canmount(Pgrp *pgrp)
-{
-	/*
-	 * Devmnt is not usable directly from user procs, so
-	 * having it removed is interpreted to block any mounts.
-	 */
-	return devallowed(pgrp, 'M');
-}
-
-void
 devdir(Chan *c, Qid qid, char *n, vlong length, char *user, long perm, Dir *db)
 {
 	db->name = n;
@@ -233,17 +176,18 @@ devwalk(Chan *c, Chan *nc, char **name, int nname, Dirtab *tab, int ntab, Devgen
 	if(nname > 0)
 		isdir(c);
 
-	alloc = (nc == nil);
+	alloc = 0;
 	wq = smalloc(sizeof(Walkqid)+(nname-1)*sizeof(Qid));
 	if(waserror()){
-		if(alloc && wq->clone != nil)
+		if(alloc && wq->clone!=nil)
 			cclose(wq->clone);
 		free(wq);
 		return nil;
 	}
-	if(alloc){
+	if(nc == nil){
 		nc = devclone(c);
 		nc->type = 0;	/* device doesn't know about this channel yet */
+		alloc = 1;
 	}
 	wq->clone = nc;
 
@@ -262,7 +206,7 @@ devwalk(Chan *c, Chan *nc, char **name, int nname, Dirtab *tab, int ntab, Devgen
 		if(strcmp(n, "..") == 0){
 			if((*gen)(nc, nil, tab, ntab, DEVDOTDOT, &dir) != 1){
 				print("devgen walk .. in dev%s %llux broken\n",
-					devtab[c->type]->name, c->qid.path);
+					devtab[nc->type]->name, nc->qid.path);
 				error("broken devgen");
 			}
 			nc->qid = dir.qid;
@@ -308,7 +252,7 @@ Done:
 		if(alloc)
 			cclose(wq->clone);
 		wq->clone = nil;
-	}else if(wq->clone != nil){
+	}else if(wq->clone){
 		/* attach cloned channel to same device */
 		wq->clone->type = c->type;
 	}
@@ -334,7 +278,7 @@ devstat(Chan *c, uchar *db, int n, Dirtab *tab, int ntab, Devgen *gen)
 					for(elem=p=c->path->s; *p; p++)
 						if(*p == '/')
 							elem = p+1;
-				devdir(c, c->qid, elem, 0, eve, 0555, &dir);
+				devdir(c, c->qid, elem, 0, eve, DMDIR|0555, &dir);
 				n = convD2M(&dir, db, n);
 				if(n == 0)
 					error(Ebadarg);
@@ -439,11 +383,10 @@ Return:
 	return c;
 }
 
-Chan*
+void
 devcreate(Chan*, char*, int, ulong)
 {
 	error(Eperm);
-	return 0;
 }
 
 Block*

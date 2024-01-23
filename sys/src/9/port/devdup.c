@@ -17,7 +17,7 @@ dupgen(Chan *c, char *, Dirtab*, int, int s, Dir *dp)
 	Qid q;
 
 	if(s == DEVDOTDOT){
-		devdir(c, c->qid, ".", 0, eve, 0555, dp);
+		devdir(c, c->qid, ".", 0, eve, DMDIR|0555, dp);
 		return 1;
 	}
 	if(s == 0)
@@ -29,10 +29,10 @@ dupgen(Chan *c, char *, Dirtab*, int, int s, Dir *dp)
 		return 0;
 	if(s & 1){
 		p = 0400;
-		sprint(up->genbuf, "%dctl", s/2);
+		snprint(up->genbuf, sizeof up->genbuf, "%dctl", s/2);
 	}else{
 		p = perm[f->mode&3];
-		sprint(up->genbuf, "%d", s/2);
+		snprint(up->genbuf, sizeof up->genbuf, "%d", s/2);
 	}
 	mkqid(&q, s+1, 0, QTFILE);
 	devdir(c, q, up->genbuf, 0, eve, p, dp);
@@ -63,8 +63,6 @@ dupopen(Chan *c, int omode)
 	Chan *f;
 	int fd, twicefd;
 
-	if(omode & ORCLOSE)
-		error(Eperm);
 	if(c->qid.type & QTDIR){
 		if(omode != 0)
 			error(Eisdir);
@@ -88,6 +86,8 @@ dupopen(Chan *c, int omode)
 		f = fdtochan(fd, openmode(omode), 0, 1);
 		cclose(c);
 	}
+	if(omode & OCEXEC)
+		f->flag |= CCEXEC;
 	return f;
 }
 
@@ -109,7 +109,7 @@ dupread(Chan *c, void *va, long n, vlong offset)
 	fd = twicefd/2;
 	if(twicefd & 1){
 		c = fdtochan(fd, -1, 0, 1);
-		procfdprint(c, fd, buf, sizeof buf);
+		procfdprint(c, fd, 0, buf, sizeof buf);
 		cclose(c);
 		return readstr((ulong)offset, va, n, buf);
 	}

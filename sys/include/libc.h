@@ -2,18 +2,18 @@
 #pragma	src	"/sys/src/libc"
 
 #define	nelem(x)	(sizeof(x)/sizeof((x)[0]))
-#define	offsetof(s, m)	(ulong)(&(((s*)0)->m))
+#define	offsetof(s, m)	(uintptr)(&(((s *)0)->m))
 #define	assert(x)	if(x){}else _assert("x")
 
 /*
  * mem routines
  */
-extern	void*	memccpy(void*, void*, int, usize);
-extern	void*	memset(void*, int, usize);
-extern	int	memcmp(void*, void*, usize);
-extern	void*	memcpy(void*, void*, usize);
-extern	void*	memmove(void*, void*, usize);
-extern	void*	memchr(void*, int, usize);
+extern	void*	memccpy(void*, void*, int, ulong);
+extern	void*	memset(void*, int, uintptr);
+extern	int	memcmp(void*, void*, ulong);
+extern	void*	memcpy(void*, void*, ulong);
+extern	void*	memmove(void*, void*, ulong);
+extern	void*	memchr(void*, int, ulong);
 
 /*
  * string routines
@@ -45,7 +45,7 @@ enum
 	Runesync	= 0x80,		/* cannot represent part of a UTF sequence (<) */
 	Runeself	= 0x80,		/* rune and UTF sequences are the same (<) */
 	Runeerror	= 0xFFFD,	/* decoding error in UTF */
-	Runemax		= 0x10FFFF,	/* 21 bit rune */
+	Runemax		= 0x10FFFF,	/* 21-bit rune */
 	Runemask	= 0x1FFFFF,	/* bits used by runes (see grep) */
 };
 
@@ -77,38 +77,28 @@ extern	Rune*	runestrrchr(Rune*, Rune);
 extern	long	runestrlen(Rune*);
 extern	Rune*	runestrstr(Rune*, Rune*);
 
-extern	int	runecomp(Rune*, Rune*, int);
-extern	int	runedecomp(Rune*, Rune*, int);
-extern	int	utfcomp(char*, char*, int);
-extern	int	utfdecomp(char*, char*, int);
-extern	char*	fullutfnorm(char*,int);
-extern	Rune*	fullrunenorm(Rune*,int);
-
-extern	Rune*	runewbreak(Rune*);
-extern	char*	utfwbreak(char*);
-extern	Rune*	runegbreak(Rune*);
-extern	char*	utfgbreak(char*);
-
 extern	Rune	tolowerrune(Rune);
 extern	Rune	totitlerune(Rune);
 extern	Rune	toupperrune(Rune);
+extern	Rune	tobaserune(Rune);
 extern	int	isalpharune(Rune);
+extern	int	isbaserune(Rune);
+extern	int	isdigitrune(Rune);
 extern	int	islowerrune(Rune);
 extern	int	isspacerune(Rune);
 extern	int	istitlerune(Rune);
 extern	int	isupperrune(Rune);
-extern	int	isdigitrune(Rune);
 
 /*
  * malloc
  */
-extern	void*	malloc(ulong);
-extern	void*	mallocz(ulong, int);
+extern	void*	malloc(uintptr);
+extern	void*	mallocz(uintptr, int);
 extern	void	free(void*);
-extern	ulong	msize(void*);
-extern	void*	mallocalign(ulong, ulong, long, ulong);
-extern	void*	calloc(ulong, ulong);
-extern	void*	realloc(void*, ulong);
+extern	uintptr	msize(void*);
+extern	void*	mallocalign(uintptr, uintptr, vlong, uintptr);
+extern	void*	calloc(uintptr, uintptr);
+extern	void*	realloc(void*, uintptr);
 extern	void	setmalloctag(void*, uintptr);
 extern	void	setrealloctag(void*, uintptr);
 extern	uintptr	getmalloctag(void*);
@@ -117,16 +107,17 @@ extern	void*	malloctopoolblock(void*);
 
 /*
  * print routines
+ * if you change Fmt, change the kernel declaration too (in port/lib.h).
  */
 typedef struct Fmt	Fmt;
 struct Fmt{
 	uchar	runes;			/* output buffer is runes or chars? */
+	int	nfmt;			/* num chars formatted so far */
 	void	*start;			/* of buffer */
 	void	*to;			/* current place in the buffer */
 	void	*stop;			/* end of the buffer; overwritten if flush fails */
 	int	(*flush)(Fmt *);	/* called when to == stop */
 	void	*farg;			/* to make flush a closure */
-	int	nfmt;			/* num chars formatted so far */
 	va_list	args;			/* args passed to dofmt */
 	int	r;			/* % format Rune */
 	int	width;
@@ -206,14 +197,6 @@ extern	Rune*	runefmtstrflush(Fmt*);
 #pragma	varargck	type	"lo"	ulong
 #pragma	varargck	type	"lx"	ulong
 #pragma	varargck	type	"lb"	ulong
-#pragma varargck	type	"zd"	intptr
-#pragma varargck	type	"zo"	intptr
-#pragma varargck	type	"zx"	intptr
-#pragma varargck	type	"zb"	intptr
-#pragma varargck	type	"zd"	uintptr
-#pragma varargck	type	"zo"	uintptr
-#pragma varargck	type	"zx"	uintptr
-#pragma varargck	type	"zb"	uintptr
 #pragma	varargck	type	"d"	int
 #pragma	varargck	type	"o"	int
 #pragma	varargck	type	"x"	int
@@ -292,6 +275,7 @@ extern	void	setfsr(ulong);
 extern	ulong	getfsr(void);
 extern	void	setfcr(ulong);
 extern	double	NaN(void);
+extern	double	qNaN(void);
 extern	double	Inf(int);
 extern	int	isNaN(double);
 extern	int	isInf(double, int);
@@ -326,43 +310,21 @@ extern	double	fmod(double, double);
 /*
  * Time-of-day
  */
-typedef struct Tzone Tzone;
-#pragma incomplete Tzone
-
 
 typedef
 struct Tm
 {
-	int	nsec;		/* nseconds (range 0...1e9) */
-	int	sec;		/* seconds (range 0..60) */
-	int	min;		/* minutes (0..59) */
-	int	hour;		/* hours (0..23) */
-	int	mday;		/* day of the month (1..31) */
-	int	mon;		/* month of the year (0..11) */
-	int	year;		/* year A.D. */
-	int	wday;		/* day of week (0..6, Sunday = 0) */
-	int	yday;		/* day of year (0..365) */
-	char	zone[16];	/* time zone name */
-	int	tzoff;		/* time zone delta from GMT */
-	Tzone	*tz;		/* time zone associated with this date */
+	int	sec;
+	int	min;
+	int	hour;
+	int	mday;
+	int	mon;
+	int	year;
+	int	wday;
+	int	yday;
+	char	zone[4];
+	int	tzoff;
 } Tm;
-
-typedef
-struct Tmfmt {
-	char	*fmt;
-	Tm	*tm;
-} Tmfmt;
-
-#pragma varargck	type	"τ"	Tmfmt
-
-extern	Tzone*	tzload(char *name);
-extern	Tm*	tmnow(Tm*, Tzone*);
-extern	Tm*	tmtime(Tm*, vlong, Tzone*);
-extern	Tm*	tmtimens(Tm*, vlong, int, Tzone*);
-extern	Tm*	tmparse(Tm*, char*, char*, Tzone*, char **ep);
-extern	vlong	tmnorm(Tm*);
-extern	Tmfmt	tmfmt(Tm*, char*);
-extern	void	tmfmtinstall(void);
 
 extern	Tm*	gmtime(long);
 extern	Tm*	localtime(long);
@@ -372,6 +334,16 @@ extern	double	cputime(void);
 extern	long	times(long*);
 extern	long	tm2sec(Tm*);
 extern	vlong	nsec(void);
+
+#define	_TZSIZE	((136*2)+10)		/* 1970-2106 */
+
+typedef struct _Timezone {
+	char	stname[4];
+	char	dlname[4];
+	long	stdiff;
+	long	dldiff;
+	ulong	dlpairs[_TZSIZE];
+} _Timezone;
 
 extern	void	cycles(uvlong*);	/* 64-bit value of the cycle counter if there is one, 0 if there isn't */
 
@@ -395,26 +367,15 @@ extern	long	atol(char*);
 extern	vlong	atoll(char*);
 extern	double	charstod(int(*)(void*), void*);
 extern	char*	cleanname(char*);
+extern	int	clz(uvlong);
 extern	int	decrypt(void*, void*, int);
 extern	int	encrypt(void*, void*, int);
-
 extern	int	dec64(uchar*, int, char*, int);
 extern	int	enc64(char*, int, uchar*, int);
-extern	int	dec64x(uchar*, int, char*, int, int (*)(int));
-extern	int	enc64x(char*, int, uchar*, int, int (*)(int));
 extern	int	dec32(uchar*, int, char*, int);
 extern	int	enc32(char*, int, uchar*, int);
-extern	int	dec32x(uchar*, int, char*, int, int (*)(int));
-extern	int	enc32x(char*, int, uchar*, int, int (*)(int));
 extern	int	dec16(uchar*, int, char*, int);
 extern	int	enc16(char*, int, uchar*, int);
-extern	int	dec64chr(int);
-extern	int	enc64chr(int);
-extern	int	dec32chr(int);
-extern	int	enc32chr(int);
-extern	int	dec16chr(int);
-extern	int	enc16chr(int);
-
 extern	int	encodefmt(Fmt*);
 extern	void	exits(char*);
 extern	double	frexp(double, int*);
@@ -436,7 +397,7 @@ extern	void	perror(char*);
 extern	int	postnote(int, int, char *);
 extern	double	pow10(int);
 extern	int	putenv(char*, char*);
-extern	void	qsort(void*, usize, usize, int (*)(void*, void*));
+extern	void	qsort(void*, long, long, int (*)(void*, void*));
 extern	int	setjmp(jmp_buf);
 extern	double	strtod(char*, char**);
 extern	long	strtol(char*, char**, int);
@@ -447,7 +408,7 @@ extern	void	sysfatal(char*, ...);
 #pragma	varargck	argpos	sysfatal	1
 extern	void	syslog(int, char*, char*, ...);
 #pragma	varargck	argpos	syslog	3
-extern	long	time(long*);
+extern	ulong	time(long*);
 extern	int	tolower(int);
 extern	int	toupper(int);
 
@@ -464,11 +425,23 @@ enum {
 extern	void	prof(void (*fn)(void*), void *arg, int entries, int what);
 
 /*
+ * atomic
+ */
+
+long	ainc(long*);
+long	adec(long*);
+int	cas(uint*, int, int);
+int	casv(uvlong*, uvlong, uvlong);
+int	casp(void**, void*, void*);
+
+/*
  *  synchronization
  */
 typedef
 struct Lock {
-	int	val;
+	long	key;	/* 0 is unlocked, 1 is locked; >1 is procs waiting */
+			/* on semaphore + 1 */
+	long	sem;	/* used when there is contention on key (key > 1) */
 } Lock;
 
 extern int	_tas(int*);
@@ -478,10 +451,10 @@ extern	void	unlock(Lock*);
 extern	int	canlock(Lock*);
 
 typedef struct QLp QLp;
-struct QLp
+struct QLp		/* rearranged for compactness on 64-bit systems */
 {
 	int	inuse;
-	int	state;
+	char	state;
 	QLp	*next;
 };
 
@@ -528,9 +501,7 @@ extern	void	rsleep(Rendez*);	/* unlocks r->l, sleeps, locks r->l again */
 extern	int	rwakeup(Rendez*);
 extern	int	rwakeupall(Rendez*);
 extern	void**	privalloc(void);
-
-extern void	procsetname(char*, ...);
-#pragma varargck argpos procsetname 1
+extern	void	privfree(void**);
 
 /*
  *  network dialing
@@ -548,6 +519,7 @@ extern	int	reject(int, char*, char*);
 /*
  *  encryption
  */
+extern	int	pushssl(int, char*, char*, char*, int*);
 extern	int	pushtls(int, char*, char*, int, char*, char*);
 
 /*
@@ -569,14 +541,10 @@ struct NetConnInfo
 extern	NetConnInfo*	getnetconninfo(char*, int);
 extern	void		freenetconninfo(NetConnInfo*);
 
-extern	int	idn2utf(char*, char*, int);
-extern	int	utf2idn(char*, char*, int);
-
 /*
  * system calls
  *
  */
-#define IOUNIT	32768U	/* default buffer size for 9p io */
 #define	STATMAX	65535U	/* max length of machine-independent stat structure */
 #define	DIRMAX	(sizeof(Dir)+STATMAX)	/* max length of Dir structure */
 #define	ERRMAX	128	/* max length of error string */
@@ -597,6 +565,7 @@ extern	int	utf2idn(char*, char*, int);
 #define	OCEXEC	32	/* or'ed in, close on exec */
 #define	ORCLOSE	64	/* or'ed in, remove on close */
 #define	OEXCL	0x1000	/* or'ed in, exclusive use (create only) */
+// #define	OBEHIND	0x2000	/* use write behind for writes [for 9n] */
 
 #define	AEXIST	0	/* accessible: exists */
 #define	AEXEC	1	/* execute access */
@@ -609,8 +578,8 @@ extern	int	utf2idn(char*, char*, int);
 
 #define	NCONT	0	/* continue after note */
 #define	NDFLT	1	/* terminate after note */
-#define	NSAVE	2	/* clear note but hold state */
-#define	NRSTR	3	/* restore saved state */
+#define	NSAVE	2	/* clear note but hold state (APE) */
+#define	NRSTR	3	/* restore saved state (APE) */
 
 /* bits in Qid.type */
 #define QTDIR		0x80		/* type bit for directories */
@@ -703,6 +672,8 @@ extern	int	close(int);
 extern	int	create(char*, int, ulong);
 extern	int	dup(int, int);
 extern	int	errstr(char*, uint);
+/* some experimental kernels contain exportfs */
+// extern	int	exportfs(int fd, char *dir, int flags);
 extern	int	exec(char*, char*[]);
 extern	int	execl(char*, ...);
 extern	int	fork(void);
@@ -717,6 +688,7 @@ extern	int	noted(int);
 extern	int	notify(void(*)(void*, char*));
 extern	int	open(char*, int);
 extern	int	fd2path(int, char*, int);
+// extern	int	fdflush(int);
 extern	int	pipe(int*);
 extern	long	pread(int, void*, long, vlong);
 extern	long	preadv(int, IOchunk*, int, vlong);
@@ -726,7 +698,7 @@ extern	long	read(int, void*, long);
 extern	long	readn(int, void*, long);
 extern	long	readv(int, IOchunk*, int);
 extern	int	remove(char*);
-extern	void*	sbrk(usize);
+extern	void*	sbrk(ulong);
 extern	long	oseek(int, long, int);
 extern	vlong	seek(int, vlong, int);
 extern	void*	segattach(int, char*, void*, ulong);
@@ -759,9 +731,6 @@ extern	void	rerrstr(char*, uint);
 extern	char*	sysname(void);
 extern	void	werrstr(char*, ...);
 #pragma	varargck	argpos	werrstr	1
-
-extern	long	ainc(long*);
-extern	long	adec(long*);
 
 extern char *argv0;
 #define	ARGBEGIN	for((argv0||(argv0=*argv)),argv++,argc--;\

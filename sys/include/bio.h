@@ -6,8 +6,8 @@ typedef	struct	Biobufhdr	Biobufhdr;
 
 enum
 {
-	Bsize		= IOUNIT,
-	Bungetsize	= UTFmax+1,	/* space for ungetc */
+	Bsize		= 16*1024,
+	Bungetsize	= UTFmax+1,		/* space for ungetc */
 	Bmagic		= 0x314159,
 	Beof		= -1,
 	Bbad		= -2,
@@ -32,9 +32,6 @@ struct	Biobufhdr
 	uchar*	bbuf;		/* pointer to beginning of buffer */
 	uchar*	ebuf;		/* pointer to end of buffer */
 	uchar*	gbuf;		/* pointer to good data in buf */
-	void	(*errorf)(char *);	/* called on error if not nil */
-	int	(*iof)(Biobufhdr*, void *, long);	/* called to do i/o */
-	void	*aux;		/* user data */
 };
 
 struct	Biobuf
@@ -61,7 +58,6 @@ int	Binits(Biobufhdr*, int, int, uchar*, int);
 int	Blinelen(Biobufhdr*);
 vlong	Boffset(Biobufhdr*);
 Biobuf*	Bopen(char*, int);
-Biobuf*	Bfdopen(int, int);
 int	Bprint(Biobufhdr*, char*, ...);
 int	Bvprint(Biobufhdr*, char*, va_list);
 int	Bputc(Biobufhdr*, int);
@@ -74,9 +70,5 @@ int	Bterm(Biobufhdr*);
 int	Bungetc(Biobufhdr*);
 int	Bungetrune(Biobufhdr*);
 long	Bwrite(Biobufhdr*, void*, long);
-void	Blethal(Biobufhdr*, void(*)(char*));
-void	Berror(Biobufhdr*, char*, ...);
-void	Biofn(Biobufhdr*, int(*)(Biobufhdr*, void*, long));
 
 #pragma	varargck	argpos	Bprint	2
-#pragma	varargck	argpos	Berror	2

@@ -9,7 +9,7 @@
 
 static void	netdevbind(Ipifc *ifc, int argc, char **argv);
 static void	netdevunbind(Ipifc *ifc);
-static void	netdevbwrite(Ipifc *ifc, Block *bp, int version, uchar *ip, Routehint*);
+static void	netdevbwrite(Ipifc *ifc, Block *bp, int version, uchar *ip);
 static void	netdevread(void *a);
 
 typedef struct	Netdevrock Netdevrock;
@@ -35,6 +35,7 @@ Medium netdevmedium =
 
 /*
  *  called to bind an IP ifc to a generic network device
+ *  called with ifc qlock'd
  */
 static void
 netdevbind(Ipifc *ifc, int argc, char **argv)
@@ -48,7 +49,6 @@ netdevbind(Ipifc *ifc, int argc, char **argv)
 	mchan = namec(argv[2], Aopen, ORDWR, 0);
 
 	er = smalloc(sizeof(*er));
-	er->readp = (void*)-1;
 	er->mchan = mchan;
 	er->f = ifc->conv->p->f;
 
@@ -57,27 +57,20 @@ netdevbind(Ipifc *ifc, int argc, char **argv)
 	kproc("netdevread", netdevread, ifc);
 }
 
+/*
+ *  called with ifc wlock'd
+ */
 static void
 netdevunbind(Ipifc *ifc)
 {
 	Netdevrock *er = ifc->arg;
 
-	while(waserror())
-		;
-	/* wait for reader to start */
-	while(er->readp == (void*)-1)
-		tsleep(&up->sleep, return0, 0, 300);
-
-	if(er->readp != nil && er->readp != up)
+	if(er->readp != nil)
 		postnote(er->readp, 1, "unbind", 0);
-	poperror();
 
-	while(waserror())
-		;
-	/* wait for reader to die */
-	while(er->readp != nil && er->readp != up)
+	/* wait for readers to die */
+	while(er->readp != nil)
 		tsleep(&up->sleep, return0, 0, 300);
-	poperror();
 
 	if(er->mchan != nil)
 		cclose(er->mchan);
@@ -89,9 +82,14 @@ netdevunbind(Ipifc *ifc)
  *  called by ipoput with a single block to write
  */
 static void
-netdevbwrite(Ipifc *ifc, Block *bp, int, uchar*, Routehint*)
+netdevbwrite(Ipifc *ifc, Block *bp, int, uchar*)
 {
 	Netdevrock *er = ifc->arg;
+
+	if(bp->next)
+		bp = concatblock(bp);
+	if(BLEN(bp) < ifc->mintu)
+		bp = adjustblock(bp, ifc->mintu);
 
 	devtab[er->mchan->type]->bwrite(er->mchan, bp, 0);
 	ifc->out++;
@@ -106,18 +104,34 @@ netdevread(void *a)
 	Ipifc *ifc;
 	Block *bp;
 	Netdevrock *er;
+	char *argv[1];
 
 	ifc = a;
 	er = ifc->arg;
 	er->readp = up;	/* hide identity under a rock for unbind */
-	if(!waserror())
+	if(waserror()){
+		er->readp = nil;
+		pexit("hangup", 1);
+	}
 	for(;;){
 		bp = devtab[er->mchan->type]->bread(er->mchan, ifc->maxtu, 0);
 		if(bp == nil){
+			/*
+			 * get here if mchan is a pipe and other side hangs up
+			 * clean up this interface & get out
+ZZZ is this a good idea?
+			 */
 			poperror();
-			break;
+			er->readp = nil;
+			argv[0] = "unbind";
+			if(!waserror())
+				ifc->conv->p->ctl(ifc->conv, argv, 1);
+			pexit("hangup", 1);
 		}
-		rlock(ifc);
+		if(!canrlock(ifc)){
+			freeb(bp);
+			continue;
+		}
 		if(waserror()){
 			runlock(ifc);
 			nexterror();
@@ -130,9 +144,6 @@ netdevread(void *a)
 		runlock(ifc);
 		poperror();
 	}
-	if(mediumunbindifc(ifc) != nil)
-		er->readp = nil;	/* someone else is doing the unbind */
-	pexit("hangup", 1);
 }
 
 void

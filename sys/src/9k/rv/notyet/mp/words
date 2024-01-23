@@ -1,0 +1,34 @@
+mango pi mq-pro (untested)
+allwinner d1 soc with dsp
+
+xuantie c906 risc-v rv64gc 1-core 1GHz cpu
+39-bit virtual addresses in rv64
+.5 or 1 GB ram
+dma not cache-coherent?
+	can map pages uncached
+	has alibaba cache maint. instructions
+standard clint & plic interrupt controllers at weird addrs
+multiple uarts, 16450 compatible
+Gbe via rtl8211f phy?
+
+physical memory map
+/* on-core devices */
+0x02001000	ccu clocks
+0x02010000	iommu		irq 80
+0x02050000	timer
+0x02500000	6 uarts, 1KB each irq 18
+0x04000000	clint
+0x04100000	usb 0 ehci	irqs 45-47
+0x04200000	usb 1 ehci	irqs 49-50
+0x04500000	emac (ether)	irq 62
+0x06010000	riscv cfg, 4k
+0x06011000	watchdog, 4k
+0x07090000	rtc
+0x08100000	cpu sys cfg, 1k
+0x10000000	plic
+/* off-core i/o */
+
+/*
+ * on-core memory.
+ */
+0x40000000	1GB of RAM

@@ -19,7 +19,6 @@ OFILES=\
 HFILES=\
 	gc.h\
 	6.out.h\
-	../cc/compat.h\
 	../cc/cc.h\
 
 LIB=../cc/cc.a$O
@@ -27,14 +26,13 @@ LIB=../cc/cc.a$O
 BIN=/$objtype/bin
 </sys/src/cmd/mkone
 
-$LIB:	../cc/cc.h
+$LIB:
 	cd ../cc
 	mk install
+	mk clean
 
 %.$O: ../cc/%.c
 	$CC $CFLAGS ../cc/$stem.c
 
 bound.$O:	bound.h
 
-enam.c:	6.out.h
-	rc mkenam

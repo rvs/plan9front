@@ -183,7 +183,6 @@ regopt(Prog *p)
 		case AMOVWLZX:
 		case AMOVWQSX:
 		case AMOVWQZX:
-		case AMOVQL:
 
 		case AMOVSS:
 		case AMOVSD:
@@ -535,7 +534,7 @@ loop2:
 			if(debug['R'] && debug['v'])
 				print("\n");
 			paint1(r, i);
-			bit.b[i/32] &= ~(1L<<(i%32));
+			bit.b[i/BI2LONG] &= ~(1L<<(i%BI2LONG));
 			if(change <= 0) {
 				if(debug['R'])
 					print("%L$%d: %B\n",
@@ -752,7 +751,7 @@ mkvar(Reg *r, Adr *a)
 	s = a->sym;
 	if(s == S)
 		goto none;
-	if(s->name[0] == '.' && strcmp(s->name, ".ret") != 0)
+	if(s->name[0] == '.')
 		goto none;
 	et = a->etype;
 	o = a->offset;
@@ -1352,7 +1351,7 @@ int
 BtoF(long b)
 {
 
-	b &= 0x70000L;
+	b &= 0x70000L;		/* bits 16-18 */
 	if(b == 0)
 		return 0;
 	return bitno(b) - 16 + FREGMIN;

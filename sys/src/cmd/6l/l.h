@@ -2,7 +2,11 @@
 #include	<libc.h>
 #include	<bio.h>
 #include	"../6c/6.out.h"
-#include	"../cc/compat.h"
+#include	"../8l/elf.h"
+
+#ifndef	EXTERN
+#define	EXTERN	extern
+#endif
 
 #define	P		((Prog*)0)
 #define	S		((Sym*)0)
@@ -11,6 +15,8 @@
 	{ *cbp++ = c;\
 	if(--cbc <= 0)\
 		cflush(); }
+
+#define	LIBNAMELEN	300
 
 typedef	struct	Adr	Adr;
 typedef	struct	Prog	Prog;
@@ -66,7 +72,7 @@ struct	Auto
 {
 	Sym*	asym;
 	Auto*	link;
-	long	aoffset;
+	vlong	aoffset;
 	short	type;
 };
 struct	Sym
@@ -76,7 +82,6 @@ struct	Sym
 	short	version;
 	short	become;
 	short	frame;
-	char	dupok;
 	uchar	subtype;
 	ushort	file;
 	vlong	value;
@@ -104,7 +109,7 @@ enum
 	STEXT		= 1,
 	SDATA,
 	SBSS,
-	SDATA1,
+	SDATA1,		/* small datum, now allocated to data seg */
 	SXREF,
 	SFILE,
 	SCONST,
@@ -115,11 +120,12 @@ enum
 
 	NHASH		= 10007,
 	NHUNK		= 100000,
+	/* any data up to this size is allocated at start of data seg */
 	MINSIZ		= 8,
 	STRINGSZ	= 200,
 	MINLC		= 1,
-	MAXIO		= IOUNIT,
-	MAXHIST		= 20,				/* limit of path elements for history symbols */
+	MAXIO		= (16*1024),
+	MAXHIST		= 20,	/* limit of path elements for history symbols */
 
 	Yxxx		= 0,
 	Ynone,
@@ -170,7 +176,6 @@ enum
 	Zilo_m,
 	Ziqo_m,
 	Zjmp,
-	Zjmpf,
 	Zloop,
 	Zo_iw,
 	Zm_o,
@@ -249,6 +254,7 @@ EXTERN	long	HEADTYPE;
 EXTERN	vlong	INITDAT;
 EXTERN	long	INITRND;
 EXTERN	vlong	INITTEXT;
+EXTERN	vlong	INITTEXTP;
 EXTERN	char*	INITENTRY;		/* entry point */
 EXTERN	Biobuf	bso;
 EXTERN	long	bsssize;
@@ -277,6 +283,7 @@ EXTERN	char*	library[50];
 EXTERN	char*	libraryobj[50];
 EXTERN	int	libraryp;
 EXTERN	int	xrefresolv;
+EXTERN	char*	hunk;
 EXTERN	uchar	inuxi1[1];
 EXTERN	uchar	inuxi2[2];
 EXTERN	uchar	inuxi4[4];
@@ -290,6 +297,7 @@ EXTERN	int	regrex[D_NONE+1];
 EXTERN	Prog*	lastp;
 EXTERN	long	lcsize;
 EXTERN	int	nerrors;
+EXTERN	long	nhunk;
 EXTERN	long	nsymbol;
 EXTERN	char*	noname;
 EXTERN	char*	outfile;
@@ -299,6 +307,7 @@ EXTERN	Sym*	symlist;
 EXTERN	long	symsize;
 EXTERN	Prog*	textp;
 EXTERN	vlong	textsize;
+EXTERN	long	thunk;
 EXTERN	int	version;
 EXTERN	Prog	zprg;
 EXTERN	int	dtype;
@@ -323,6 +332,7 @@ int	Pconv(Fmt*);
 int	Rconv(Fmt*);
 int	Sconv(Fmt*);
 void	addhist(long, int);
+void	addlibpath(char*);
 Prog*	appendp(Prog*);
 void	asmb(void);
 void	asmdyn(void);
@@ -349,10 +359,12 @@ void	dynreloc(Sym*, ulong, int);
 vlong	entryvalue(void);
 void	errorexit(void);
 void	export(void);
+int	fileexists(char*);
 int	find1(long, int);
-int	find1v(vlong, int);
 int	find2(long, int);
+char*	findlib(char*);
 void	follow(void);
+void	gethunk(void);
 void	histtoauto(void);
 double	ieeedtod(Ieee*);
 long	ieeedtof(Ieee*);
@@ -361,10 +373,13 @@ void	ldobj(int, long, char*);
 void	loadlib(void);
 void	listinit(void);
 Sym*	lookup(char*, int);
+void	llput(vlong v);
+void	llputl(vlong v);
 void	lput(long);
 void	lputl(long);
 void	main(int, char*[]);
 void	mkfwd(void);
+void*	mysbrk(ulong);
 void	nuxiinit(void);
 void	objfile(char*);
 int	opsize(Prog*);
@@ -375,10 +390,12 @@ int	relinv(int);
 long	reuse(Prog*, Sym*);
 vlong	rnd(vlong, vlong);
 void	span(void);
+void	strnput(char*, int);
 void	undef(void);
 void	undefsym(Sym*);
 vlong	vaddr(Adr*);
-void	wput(ushort);
+void	wput(long);
+void	wputl(long);
 void	xdefine(char*, int, vlong);
 void	xfol(Prog*);
 int	zaddr(uchar*, Adr*, Sym*[]);

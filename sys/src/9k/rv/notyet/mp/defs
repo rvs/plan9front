@@ -1,0 +1,7 @@
+# mango pi mq-pro
+PHYSMEM=0x40000000u
+KTZERO=0xffffffc040200000	# sv39 but skip firmware (& extended a.out hdr?)
+PAUart0=0x02500000
+PAClint=0x04000000
+CONFDEF= -DLONG_CLINT # -DERRATUM_CIP_1200
+SFX=bin

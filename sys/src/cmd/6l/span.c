@@ -100,8 +100,10 @@ loop:
 	if(debug['v'])
 		Bprint(&bso, "etext = %llux\n", c);
 	Bflush(&bso);
-	for(p = textp; p != P; p = p->pcond)
+	for(p = textp; p != P; p = p->pcond) {
+		assert(p->from.sym != nil);
 		p->from.sym->value = p->pc;
+	}
 	textsize = c - INITTEXT;
 }
 
@@ -127,9 +129,17 @@ putsymb(char *s, int t, vlong v, int ver)
 	if(t == 'f')
 		s++;
 	l = 4;
-	if(!debug['8']){
+	switch(HEADTYPE){
+	default:
+		break;
+	case 5:
+		if(debug['8'])
+			break;
+	case 2:
+	case 6:
 		lput(v>>32);
 		l = 8;
+		break;
 	}
 	lput(v);
 	if(ver)
@@ -245,12 +255,12 @@ asmlc(void)
 		if(p->line == oldlc || p->as == ATEXT || p->as == ANOP) {
 			if(p->as == ATEXT)
 				curtext = p;
-			if(debug['L'])
+			if(debug['V'])
 				Bprint(&bso, "%6llux %P\n",
 					p->pc, p);
 			continue;
 		}
-		if(debug['L'])
+		if(debug['V'])
 			Bprint(&bso, "\t\t%6ld", lcsize);
 		v = (p->pc - oldpc) / MINLC;
 		while(v) {
@@ -258,7 +268,7 @@ asmlc(void)
 			if(v < 127)
 				s = v;
 			cput(s+128);	/* 129-255 +pc */
-			if(debug['L'])
+			if(debug['V'])
 				Bprint(&bso, " pc+%ld*%d(%ld)", s, MINLC, s+128);
 			v -= s;
 			lcsize++;
@@ -272,7 +282,7 @@ asmlc(void)
 			cput(s>>16);
 			cput(s>>8);
 			cput(s);
-			if(debug['L']) {
+			if(debug['V']) {
 				if(s > 0)
 					Bprint(&bso, " lc+%ld(%d,%ld)\n",
 						s, 0, s);
@@ -287,14 +297,14 @@ asmlc(void)
 		}
 		if(s > 0) {
 			cput(0+s);	/* 1-64 +lc */
-			if(debug['L']) {
+			if(debug['V']) {
 				Bprint(&bso, " lc+%ld(%ld)\n", s, 0+s);
 				Bprint(&bso, "%6llux %P\n",
 					p->pc, p);
 			}
 		} else {
 			cput(64-s);	/* 65-128 -lc */
-			if(debug['L']) {
+			if(debug['V']) {
 				Bprint(&bso, " lc%ld(%ld)\n", s, 64-s);
 				Bprint(&bso, "%6llux %P\n",
 					p->pc, p);
@@ -307,7 +317,7 @@ asmlc(void)
 		cput(s);
 		lcsize++;
 	}
-	if(debug['v'] || debug['L'])
+	if(debug['v'] || debug['V'])
 		Bprint(&bso, "lcsize = %ld\n", lcsize);
 	Bflush(&bso);
 }
@@ -885,28 +895,16 @@ Movtab	ymovtab[] =
 
 /* mov dr */
 	{AMOVL,	Ydr0,	Yml,	3,	0x0f,0x21,0,0},
-	{AMOVL,	Ydr1,	Yml,	3,	0x0f,0x21,1,0},
-	{AMOVL,	Ydr2,	Yml,	3,	0x0f,0x21,2,0},
-	{AMOVL,	Ydr3,	Yml,	3,	0x0f,0x21,3,0},
 	{AMOVL,	Ydr6,	Yml,	3,	0x0f,0x21,6,0},
 	{AMOVL,	Ydr7,	Yml,	3,	0x0f,0x21,7,0},
 	{AMOVQ,	Ydr0,	Yml,	3,	0x0f,0x21,0,0},
-	{AMOVQ,	Ydr1,	Yml,	3,	0x0f,0x21,1,0},
-	{AMOVQ,	Ydr2,	Yml,	3,	0x0f,0x21,2,0},
-	{AMOVQ,	Ydr3,	Yml,	3,	0x0f,0x21,3,0},
 	{AMOVQ,	Ydr6,	Yml,	3,	0x0f,0x21,6,0},
 	{AMOVQ,	Ydr7,	Yml,	3,	0x0f,0x21,7,0},
 
 	{AMOVL,	Yml,	Ydr0,	4,	0x0f,0x23,0,0},
-	{AMOVL,	Yml,	Ydr1,	4,	0x0f,0x23,1,0},
-	{AMOVL,	Yml,	Ydr2,	4,	0x0f,0x23,2,0},
-	{AMOVL,	Yml,	Ydr3,	4,	0x0f,0x23,3,0},
 	{AMOVL,	Yml,	Ydr6,	4,	0x0f,0x23,6,0},
 	{AMOVL,	Yml,	Ydr7,	4,	0x0f,0x23,7,0},
 	{AMOVQ,	Yml,	Ydr0,	4,	0x0f,0x23,0,0},
-	{AMOVQ,	Yml,	Ydr1,	4,	0x0f,0x23,1,0},
-	{AMOVQ,	Yml,	Ydr2,	4,	0x0f,0x23,2,0},
-	{AMOVQ,	Yml,	Ydr3,	4,	0x0f,0x23,3,0},
 	{AMOVQ,	Yml,	Ydr6,	4,	0x0f,0x23,6,0},
 	{AMOVQ,	Yml,	Ydr7,	4,	0x0f,0x23,7,0},
 
@@ -1014,10 +1012,6 @@ mediaop(Optab *o, int op, int osize, int z)
 	default:
 		if(andptr == and || andptr[-1] != Pm)
 			*andptr++ = Pm;
-		if(op == 0x38 || op == 0x3a){ /* 3-byte opcode escapes */
-			*andptr++ = op;
-			op = o->op[++z];
-		}
 		break;
 	}
 	*andptr++ = op;
@@ -1360,7 +1354,6 @@ found:
 		}
 		break;
 
-	case Zjmpf:
 	case Zcall:
 		q = p->pcond;
 		if(q) {

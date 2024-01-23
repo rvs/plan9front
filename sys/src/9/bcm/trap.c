@@ -12,8 +12,21 @@
 
 #include "arm.h"
 
+#define INTREGS		(VIRTIO+0xB200)
+#define	LOCALREGS	(VIRTIO+IOSIZE)
+
+typedef struct Intregs Intregs;
+typedef struct Vctl Vctl;
+
 enum {
+	Debug = 0,
+
 	Nvec = 8,		/* # of vectors at start of lexception.s */
+	Fiqenable = 1<<7,
+
+	Localtimerint	= 0x40,
+	Localmboxint	= 0x50,
+	Localintpending	= 0x60,
 };
 
 /*
@@ -23,6 +36,32 @@ typedef struct Vpage0 {
 	void	(*vectors[Nvec])(void);
 	u32int	vtable[Nvec];
 } Vpage0;
+
+/*
+ * interrupt control registers
+ */
+struct Intregs {
+	u32int	ARMpending;
+	u32int	GPUpending[2];
+	u32int	FIQctl;
+	u32int	GPUenable[2];
+	u32int	ARMenable;
+	u32int	GPUdisable[2];
+	u32int	ARMdisable;
+};
+
+struct Vctl {
+	Vctl	*next;
+	int	irq;
+	int	cpu;
+	u32int	*reg;
+	u32int	mask;
+	void	(*f)(Ureg*, void*);
+	void	*a;
+};
+
+static Lock vctllock;
+static Vctl *vctl, *vfiq;
 
 static char *trapnames[PsrMask+1] = {
 	[ PsrMusr ] "user mode",
@@ -35,7 +74,6 @@ static char *trapnames[PsrMask+1] = {
 	[ PsrMsys ] "sys trap",
 };
 
-extern int irq(Ureg*);
 extern int notify(Ureg*);
 
 /*
@@ -46,7 +84,6 @@ trapinit(void)
 {
 	Vpage0 *vpage0;
 
-	intrcpushutdown();
 	if (m->machno == 0) {
 		/* disable everything */
 		intrsoff();
@@ -68,6 +105,167 @@ trapinit(void)
 	coherence();
 }
 
+void
+intrcpushutdown(void)
+{
+	u32int *enable;
+
+	if(soc.armlocal == 0)
+		return;
+	enable = (u32int*)(LOCALREGS + Localtimerint) + m->machno;
+	*enable = 0;
+	if(m->machno){
+		enable = (u32int*)(LOCALREGS + Localmboxint) + m->machno;
+		*enable = 1;
+	}
+}
+
+void
+intrsoff(void)
+{
+	Intregs *ip;
+	int disable;
+
+	ip = (Intregs*)INTREGS;
+	disable = ~0;
+	ip->GPUdisable[0] = disable;
+	ip->GPUdisable[1] = disable;
+	ip->ARMdisable = disable;
+	ip->FIQctl = 0;
+}
+
+/* called from cpu0 after other cpus are shutdown */
+void
+intrshutdown(void)
+{
+	intrsoff();
+	intrcpushutdown();
+}
+
+static void
+intrtime(void)
+{
+	ulong diff;
+	ulong x;
+
+	x = perfticks();
+	diff = x - m->perf.intrts;
+	m->perf.intrts = 0;
+
+	m->perf.inintr += diff;
+	if(up == nil && m->perf.inidle > diff)
+		m->perf.inidle -= diff;
+}
+
+
+/*
+ *  called by trap to handle irq interrupts.
+ *  returns true iff a clock interrupt, thus maybe reschedule.
+ */
+static int
+irq(Ureg* ureg)
+{
+	Vctl *v;
+	int clockintr;
+	int found;
+
+	m->perf.intrts = perfticks();
+	clockintr = 0;
+	found = 0;
+	for(v = vctl; v; v = v->next)
+		if(v->cpu == m->machno && (*v->reg & v->mask) != 0){
+			found = 1;
+			coherence();
+			v->f(ureg, v->a);
+			coherence();
+			if(v->irq == IRQclock || v->irq == IRQcntps || v->irq == IRQcntpns)
+				clockintr = 1;
+		}
+	if(!found)
+		m->spuriousintr++;
+	intrtime();
+	return clockintr;
+}
+
+/*
+ * called direct from lexception.s to handle fiq interrupt.
+ */
+void
+fiq(Ureg *ureg)
+{
+	Vctl *v;
+	int inintr;
+
+	if(m->perf.intrts)
+		inintr = 1;
+	else{
+		inintr = 0;
+		m->perf.intrts = perfticks();
+	}
+	v = vfiq;
+	if(v == nil)
+		panic("cpu%d: unexpected item in bagging area", m->machno);
+	m->intr++;
+	ureg->pc -= 4;
+	coherence();
+	v->f(ureg, v->a);
+	coherence();
+	if(!inintr)
+		intrtime();
+}
+
+void
+irqenable(int irq, void (*f)(Ureg*, void*), void* a)
+{
+	Vctl *v;
+	Intregs *ip;
+	u32int *enable;
+
+	ip = (Intregs*)INTREGS;
+	v = (Vctl*)malloc(sizeof(Vctl));
+	if(v == nil)
+		panic("irqenable: no mem");
+	v->irq = irq;
+	v->cpu = 0;
+	if(irq >= IRQlocal){
+		v->reg = (u32int*)(LOCALREGS + Localintpending) + m->machno;
+		if(irq >= IRQmbox0)
+			enable = (u32int*)(LOCALREGS + Localmboxint) + m->machno;
+		else
+			enable = (u32int*)(LOCALREGS + Localtimerint) + m->machno;
+		v->mask = 1 << (irq - IRQlocal);
+		v->cpu = m->machno;
+	}else if(irq >= IRQbasic){
+		enable = &ip->ARMenable;
+		v->reg = &ip->ARMpending;
+		v->mask = 1 << (irq - IRQbasic);
+	}else{
+		enable = &ip->GPUenable[irq/32];
+		v->reg = &ip->GPUpending[irq/32];
+		v->mask = 1 << (irq % 32);
+	}
+	v->f = f;
+	v->a = a;
+	lock(&vctllock);
+	if(irq == IRQfiq){
+		assert((ip->FIQctl & Fiqenable) == 0);
+		assert((*enable & v->mask) == 0);
+		vfiq = v;
+		ip->FIQctl = Fiqenable | irq;
+	}else{
+		v->next = vctl;
+		vctl = v;
+		if(irq >= IRQmbox0){
+			if(irq <= IRQmbox3)
+				*enable |= 1 << (irq - IRQmbox0);
+		}else if(irq >= IRQlocal)
+			*enable |= 1 << (irq - IRQlocal);
+		else
+			*enable = v->mask;
+	}
+	unlock(&vctllock);
+}
+
 static char *
 trapname(int psr)
 {
@@ -77,6 +275,26 @@ trapname(int psr)
 	if(s == nil)
 		s = "unknown trap number in psr";
 	return s;
+}
+
+/* this is quite helpful during mmu and cache debugging */
+static void
+ckfaultstuck(uintptr va)
+{
+	static int cnt, lastpid;
+	static uintptr lastva;
+
+	if (va == lastva && up->pid == lastpid) {
+		++cnt;
+		if (cnt >= 2)
+			/* fault() isn't fixing the underlying cause */
+			panic("fault: %d consecutive faults for va %#p",
+				cnt+1, va);
+	} else {
+		cnt = 0;
+		lastva = va;
+		lastpid = up->pid;
+	}
 }
 
 /*
@@ -89,12 +307,15 @@ faultarm(Ureg *ureg, uintptr va, int user, int read)
 	char buf[ERRMAX];
 
 	if(up == nil) {
-		dumpregs(ureg);
-		panic("fault: nil up in faultarm, accessing %#p", va);
+		//dumpregs(ureg);
+		panic("fault: nil up in faultarm, pc %#p accessing %#p", ureg->pc, va);
 	}
 	insyscall = up->insyscall;
 	up->insyscall = 1;
-	n = fault(va, ureg->pc, read);
+	if (Debug)
+		ckfaultstuck(va);
+
+	n = fault(va, read);
 	if(n < 0){
 		if(!user){
 			dumpregs(ureg);
@@ -126,17 +347,46 @@ writetomem(ulong inst)
 }
 
 /*
+ * ureg is the current stack pointer.  verify that it's within
+ * a plausible range.
+ */
+void
+ckstack(Ureg **uregp)
+{
+	USED(uregp);
+}
+
+/*
  *  here on all exceptions other than syscall (SWI) and fiq
  */
 void
 trap(Ureg *ureg)
 {
-	int user, x, rv;
+	int clockintr, user, x, rv, rem;
 	ulong inst, fsr;
 	uintptr va;
 	char buf[ERRMAX];
 
-	user = kenter(ureg);
+	assert(!islo());
+	if(up != nil)
+		rem = ((char*)ureg)-up->kstack;
+	else
+		rem = ((char*)ureg)-((char*)m+sizeof(Mach));
+	if(rem < 256) {
+		iprint("trap: %d stack bytes left, up %#p ureg %#p at pc %#lux\n",
+			rem, up, ureg, ureg->pc);
+		delay(1000);
+		dumpstack();
+		panic("trap: %d stack bytes left, up %#p ureg %#p at pc %#lux",
+			rem, up, ureg, ureg->pc);
+	}
+
+	user = (ureg->psr & PsrMask) == PsrMusr;
+	if(user){
+		up->dbgreg = ureg;
+		cycles(&up->kentry);
+	}
+
 	/*
 	 * All interrupts/exceptions should be resumed at ureg->pc-4,
 	 * except for Data Abort which resumes at ureg->pc-8.
@@ -146,23 +396,24 @@ trap(Ureg *ureg)
 	else
 		ureg->pc -= 4;
 
+	clockintr = 0;		/* if set, may call sched() before return */
 	switch(ureg->type){
 	default:
-		panic("unknown trap; type %#lux, psr mode %#lux", ureg->type,
-			ureg->psr & PsrMask);
+		panic("unknown trap; type %#lux, psr mode %#lux pc %lux", ureg->type,
+			ureg->psr & PsrMask, ureg->pc);
 		break;
 	case PsrMirq:
-		preempted(irq(ureg));
+		clockintr = irq(ureg);
+		m->intr++;
 		break;
 	case PsrMabt:			/* prefetch fault */
 		x = ifsrget();
 		fsr = (x>>7) & 0x8 | x & 0x7;
 		switch(fsr){
 		case 0x02:		/* instruction debug event (BKPT) */
-			if(user){
-				snprint(buf, sizeof buf, "sys: breakpoint");
-				postnote(up, 1, buf, NDebug);
-			}else{
+			if(user)
+				postnote(up, 1, "sys: breakpoint", NDebug);
+			else{
 				iprint("kernel bkpt: pc %#lux inst %#ux\n",
 					ureg->pc, *(u32int*)ureg->pc);
 				panic("kernel bkpt");
@@ -191,8 +442,7 @@ trap(Ureg *ureg)
 		case 0x3:		/* access flag fault (section) */
 			if(user){
 				snprint(buf, sizeof buf,
-					"sys: alignment: pc %#lux va %#p\n",
-					ureg->pc, va);
+					"sys: alignment: va %#p", va);
 				postnote(up, 1, buf, NDebug);
 			} else
 				panic("kernel alignment: pc %#lux va %#p", ureg->pc, va);
@@ -228,8 +478,7 @@ trap(Ureg *ureg)
 			/* domain fault, accessing something we shouldn't */
 			if(user){
 				snprint(buf, sizeof buf,
-					"sys: access violation: pc %#lux va %#p\n",
-					ureg->pc, va);
+					"sys: access violation: va %#p", va);
 				postnote(up, 1, buf, NDebug);
 			} else
 				panic("kernel access violation: pc %#lux va %#p",
@@ -250,12 +499,8 @@ trap(Ureg *ureg)
 			else{
 				/* look for floating point instructions to interpret */
 				rv = fpuemu(ureg);
-				if(rv == 0){
-					snprint(buf, sizeof buf,
-						"undefined instruction: pc %#lux\n",
-						ureg->pc);
-					postnote(up, 1, buf, NDebug);
-				}
+				if(rv == 0)
+					postnote(up, 1, "sys: undefined instruction", NDebug);
 			}
 		}else{
 			if (ureg->pc & 3) {
@@ -270,6 +515,12 @@ trap(Ureg *ureg)
 		break;
 	}
 	splhi();
+
+	/* delaysched set because we held a lock or because our quantum ended */
+	if(up && up->delaysched && clockintr){
+		sched();		/* can cause more traps */
+		splhi();
+	}
 
 	if(user){
 		if(up->procctl || up->nnote)
@@ -322,14 +573,14 @@ dumpstackwithureg(Ureg *ureg)
 		ureg->pc, ureg->sp, ureg->r14);
 	delay(2000);
 	i = 0;
-	if(up != nil && (uintptr)&l <= (uintptr)up)
-		estack = (uintptr)up;
+	if(up != nil && (uintptr)&l <= (uintptr)up->kstack+KSTACK)
+		estack = (uintptr)up->kstack+KSTACK;
 	else if((uintptr)&l >= (uintptr)m->stack
 	     && (uintptr)&l <= (uintptr)m+MACHSIZE)
 		estack = (uintptr)m+MACHSIZE;
 	else{
 		if(up != nil)
-			iprint("&up %#p &l %#p\n", up, &l);
+			iprint("&up->kstack %#p &l %#p\n", up->kstack, &l);
 		else
 			iprint("&m %#p &l %#p\n", m, &l);
 		return;
@@ -357,13 +608,21 @@ dumpstackwithureg(Ureg *ureg)
  * Fill in enough of Ureg to get a stack trace, and call a function.
  * Used by debugging interface rdb.
  */
+
+static void
+getpcsp(ulong *pc, ulong *sp)
+{
+	*pc = getcallerpc(&pc);
+	*sp = (ulong)&pc-4;
+}
+
 void
 callwithureg(void (*fn)(Ureg*))
 {
 	Ureg ureg;
 
-	ureg.pc = getcallerpc(&fn);
-	ureg.sp = (uintptr)&fn;
+	getpcsp((ulong*)&ureg.pc, (ulong*)&ureg.sp);
+	ureg.r14 = getcallerpc(&fn);
 	fn(&ureg);
 }
 
@@ -399,9 +658,10 @@ dumpregs(Ureg* ureg)
 	iprint("pc %#lux link %#lux\n", ureg->pc, ureg->link);
 
 	if(up)
-		iprint("user stack: %#p-%#p\n", (char*)up - KSTACK, up);
+		iprint("user stack: %#p-%#p\n", up->kstack, up->kstack+KSTACK-4);
 	else
-		iprint("kernel stack: %8.8lux-%8.8lux\n", (ulong)(m+1), (ulong)m+BY2PG);
+		iprint("kernel stack: %8.8lux-%8.8lux\n",
+			(ulong)(m+1), (ulong)m+BY2PG-4);
 	dumplongs("stack", (ulong *)(ureg + 1), 16);
 	delay(2000);
 	dumpstack();

@@ -1,3 +1,4 @@
+#include "_apetypes.h"
 typedef
 struct Waitmsg
 {
@@ -32,7 +33,7 @@ struct Waitmsg
 #define	AWRITE	2	/* write access */
 #define	AREAD	4	/* read access */
 
-/* Segattch */
+/* Segattach */
 #define	SG_RONLY	0040	/* read only */
 #define	SG_CEXEC	0100	/* detach on exec */
 
@@ -92,13 +93,14 @@ extern	int	_FWSTAT(int, unsigned char*, int);
 extern	int	_MOUNT(int, int, const char*, int, const char*);
 extern	int	_NOTED(int);
 extern	int	_NOTIFY(int(*)(void*, char*));
+extern	long long	_NSEC(void);
 extern	int	_OPEN(const char*, int);
 extern	int	_PIPE(int*);
 extern	long	_PREAD(int, void*, long, long long);
 extern	long	_PWRITE(int, void*, long, long long);
 extern	long	_READ(int, void*, long);
 extern	int	_REMOVE(const char*);
-extern	void*	_RENDEZVOUS(void*, void*);
+extern	void*	_RENDEZVOUS(void *, void *);
 extern	int	_RFORK(int);
 extern	void*	_SEGATTACH(int, char*, void*, unsigned long);
 extern	void*	_SEGBRK(void*, void*);
@@ -106,9 +108,12 @@ extern	int	_SEGDETACH(void*);
 extern	int	_SEGFLUSH(void*, unsigned long);
 extern	int	_SEGFREE(void*, unsigned long);
 extern	long long	_SEEK(int, long long, int);
+extern	int	_SEMACQUIRE(long*, int);
+extern	long	_SEMRELEASE(long*, long);
 extern	int	_SLEEP(long);
 extern	int	_STAT(const char*, unsigned char*, int);
 extern	Waitmsg*	_WAIT(void);
+extern	int	_TSEMACQUIRE(long*, unsigned long);
 extern	long	_WRITE(int, const void*, long);
 extern	int	_WSTAT(const char*, unsigned char*, int);
 
@@ -119,3 +124,12 @@ extern	int	__creat(char *, int);
 extern	int	__link(char *, int);
 extern	int	__stat(char *, struct stat *);
 extern	int	__unlink(char *);
+
+/*
+ * atomic
+ */
+long	ainc(long*);
+long	adec(long*);
+int	cas32(unsigned long*, unsigned long, unsigned long);
+int	casp(void**, void*, void*);
+int	casl(unsigned long*, unsigned long, unsigned long);

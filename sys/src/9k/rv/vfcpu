@@ -1,0 +1,217 @@
+# 9k risc-v cpu server for visionfive 2 with rv32 e24 core + 4 × rv64 u74 cores
+dev +dev
+	root
+	cons
+	arch
+	env
+	pipe
+	proc
+	mnt
+	srv
+	dup
+#	rtc
+	ssl
+	tls
+	cap
+#	pnp		pci
+	kprof
+	segment
+	ether		netif
+	ip		arp chandial ip ipv6 ipaux iproute netlog nullmedium pktmedium
+	uart
+	bridge		log
+	sd
+# needed for usb kbd input via scan codes
+#	kbin
+#	usb
+
+sd +dev
+# gets "error cmd 8/55/1 intr 104 stat 1e6", 25 apr 2023
+#	sdmmc		sddwc
+#	sdahci		pci sdscsi
+#	sdnvme		pci sdscsi
+
+uart +dev
+	uarti8250
+
+ip +dev
+	tcp
+	udp
+	ipifc
+	icmp
+	icmp6
+#	ipmux
+
+link +dev
+	etherdwmac4
+	ethermedium
+	loopbackmedium
+	netdevmedium
+#	usbehci		usbehcipc
+
+misc +dev
+	cache
+
+#
+#boot cpu
+#	int cpuflag = 1;
+#boot cpu boot $3
+#	int cpuflag = 1;
+#	char* bootdisk = "$3";
+#boot rootdir $3
+#	char* rootdir = "$3";
+#boot (bboot|romboot|dosboot)
+#	int cpuflag = 1;
+#	char* bootprog = $2;
+#boot boot $3
+#	char* bootdisk = "$3";
+#
+boot cpu
+	tcp
+
+rootdir
+	boot$CONF.out		boot
+	/riscv64/bin/auth/factotum
+	/riscv64/bin/ip/ipconfig
+	/cfg/example/nvram.coll	nvram
+
+conf
+	#include "riscv64.h"
+
+	int cpuserver = 1;
+	uvlong cpuhz = 1250*1000*1000;	/* cycle tick freq */
+	uvlong timebase = 4*1000*1000;	/* clint tick freq; from u-boot */
+	Membank membanks[] = {		/* (address, size) pairs */
+		PHYSMEM+2*MB, GB-2*MB,	/* don't move Sys */
+		PHYSMEM+GB, 3ULL*GB,
+		PHYSMEM+4ULL*GB, 4ULL*GB,
+		0,
+	};
+	// char defnvram[] = "#S/sdM0/nvram";
+	char defnvram[] = "/boot/nvram";
+
+	uintptr uartregs[] = { PAUart0 };
+	int nuart = nelem(uartregs);
+	vlong uartfreq = 24000000;	/* from dev tree */
+	int prmsdelay = 40;
+
+	/* default; copied the mac address that u-boot uses */
+	uchar ether0mac[] = { 0x6c, 0xcf, 0x39, 0x00, 0x30, 0x25, };
+
+	Soc soc = {
+		.clint	 = (char *)PAClint,
+		.ether	 = { (char *)0x16030000, }, // (char *)0x16040000, },
+		.l2cache = (char *)0x02010000,
+		// .pci	 = (char *)0x2b000000,	/* ecam for cfg space */
+		// .pcictl = (char *)0x100d0000,	/* bridge, ctrl regs */
+		// .pciess = (char *)0x02050000,	/* soft reset, etc. */
+		.plic    = (char *)0x0c000000,	/* common */
+		.uart	 = (char *)PAUart0,
+		.wdog0   = (char *)0x13070000,	/* watchdog reset */
+		.sdmmc   = (char *)0x16010000,	/* 2 sdio actually */
+		.hobbled = 1,
+		.dwuart	 = 1,			/* 8250 workaround */
+		.idlewake = 1,		/* flag: send IPIs to wake wfi cpus */
+	};
+	/*
+	 * irqs from the giant TRM table of global interrupts
+	 * disagree with the supplied device tree (off by 3 or 5).
+	 */
+	Ioconf ioconfs[] = {	/* devices whose drivers vmap their regs */
+		{ "ether", 64*KB, &soc.ether[0],  7, 0, },	// dt 7 6 5
+		{ "ether", 64*KB, &soc.ether[1], 78, 1, },	// dt 78 77 76
+		0
+	};
+	Ioconf socconf[] = { /* devices without drivers that vmap their regs */
+		{ "clint", 64*KB, &soc.clint, },
+		{ "l2cache", PGSZ, &soc.l2cache, },
+		//{ "pci",   32*MB, &soc.pci, },	/* pcie [01] ecam cfg */
+		//{ "pcictl", 4*8*KB, &soc.pcictl, },	/* pcie [01] br & ctl */
+		//{ "pciess", PGSZ, &soc.pciess, },
+		{ "plic",  64*MB, &soc.plic, },		/* common */
+		{ "uart",  PGSZ, &soc.uart, 32, },	// gt 27 dt 32
+		{ "wdog",  PGSZ, &soc.wdog0, 68, },	// gt 63 dt 68
+		{ "sdmmc", 64*KB, &soc.sdmmc, 74, 0, }, // gt 69 dt 74
+		// { "sdmmc", 64*KB, &soc.sdmmc, 75, 1, }, // gt 70 dt 75
+		0
+	};
+
+dbgflg
+#	sysproc		'E'
+#	mp		'M'
+#	pci		'P'
+#	arch		'V'
+#	archrv		'V'
+#	asm		'a'
+#	chan		'c'
+#	mmu		'm'
+#	main		'x'
+riscv64
+	start
+	low
+	fakemtrap
+	strap
+	mch
+	main
+	arch
+	archjh7110
+	archrv
+	csr
+	fakepci
+	fp
+	fpu
+	ioconf
+#	kbd
+	map
+	memory
+	mmu
+	sane
+	sbi
+	sbicall
+	sbiecall
+	trap
+port
+	alarm
+	allocb
+	awaitbit
+	byteserial
+	chan
+	ctype
+	dev
+	devtab
+	edf
+	fault
+	image
+#	latin1
+	logpow
+	page
+	parse
+	pgrp
+	portclock
+	prf
+	print
+	proc
+	ps
+	qio
+	qlock
+	qmalloc
+	random
+	rebootcmd
+	segment
+	sysauth
+	syscall
+	syscallfmt
+	sysfile
+	sysproc
+	sysseg
+	systab
+	taslock
+	tod
+	watermarks
+
+#
+# controls which directories to look in for source files; must be relative to ..
+#
+dir
+	ip
+	port

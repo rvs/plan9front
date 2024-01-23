@@ -1,33 +1,65 @@
+/*
+ * things specific to 386 and later cpus not covered by other headers.
+ */
+#ifdef DREGS				/* BIOS32 */
 typedef struct BIOS32si	BIOS32si;
 typedef struct BIOS32ci	BIOS32ci;
+#pragma incomplete BIOS32si
+
+typedef struct BIOS32ci {		/* BIOS32 Calling Interface */
+	uint	eax;
+	uint	ebx;
+	uint	ecx;
+	uint	edx;
+	uint	esi;
+	uint	edi;
+} BIOS32ci;
+#endif
+
 typedef struct Conf	Conf;
 typedef struct Confmem	Confmem;
 typedef union FPsave	FPsave;
-typedef struct FPx87state FPx87state;
 typedef struct FPssestate FPssestate;
-typedef struct PFPU	PFPU;
+typedef struct FPstate	FPstate;
 typedef struct ISAConf	ISAConf;
 typedef struct Label	Label;
 typedef struct Lock	Lock;
 typedef struct MMU	MMU;
 typedef struct Mach	Mach;
+typedef struct Msi	Msi;
 typedef struct PCArch	PCArch;
 typedef struct Pcidev	Pcidev;
-typedef struct PCMmap	PCMmap;
-typedef struct PCMslot	PCMslot;
 typedef struct Page	Page;
 typedef struct PMMU	PMMU;
 typedef struct Proc	Proc;
 typedef struct Segdesc	Segdesc;
+typedef struct SFPssestate SFPssestate;
 typedef vlong		Tval;
 typedef struct Ureg	Ureg;
 typedef struct Vctl	Vctl;
 
-#pragma incomplete BIOS32si
 #pragma incomplete Pcidev
 #pragma incomplete Ureg
 
 #define MAXSYSARG	5	/* for mount(fd, afd, mpt, flag, arg) */
+
+char *confname[MAXCONF];
+char *confval[MAXCONF];
+int nconf;
+
+#ifndef KMESGSIZE
+#define KMESGSIZE (32*1024)
+#endif
+#ifndef STAGESIZE
+#define STAGESIZE 2048
+#endif
+#ifndef Intrsvcret
+#define Intrsvcret int
+#endif
+
+enum {
+	Cpuidlen = 12,
+};
 
 /*
  *  parameters for sysproc.c
@@ -36,9 +68,9 @@ typedef struct Vctl	Vctl;
 
 struct Lock
 {
-	ulong	key;
+	ulong	key;		/* offset known to assembly */
 	ulong	sr;
-	uintptr	pc;
+	ulong	pc;
 	Proc	*p;
 	Mach	*m;
 	ushort	isilock;
@@ -51,51 +83,10 @@ struct Label
 	ulong	pc;
 };
 
-struct	FPx87state		/* x87 fp state */
-{
-	ushort	control;
-	ushort	r1;
-	ushort	status;
-	ushort	r2;
-	ushort	tag;
-	ushort	r3;
-	ulong	pc;
-	ushort	selector;
-	ushort	opcode;
-	ulong	operand;
-	ushort	oselector;
-	ushort	r4;
-	uchar	regs[80];	/* floating point registers */
-};
 
-struct	FPssestate		/* SSE fp state */
-{
-	ushort	fcw;		/* control */
-	ushort	fsw;		/* status */
-	ushort	ftw;		/* tag */
-	ushort	fop;		/* opcode */
-	ulong	fpuip;		/* pc */
-	ushort	cs;		/* pc segment */
-	ushort	rsrvd1;		/* reserved */
-	ulong	fpudp;		/* data pointer */
-	ushort	ds;		/* data pointer segment */
-	ushort	rsrvd2;
-	ulong	mxcsr;		/* MXCSR register state */
-	ulong	mxcsr_mask;	/* MXCSR mask register */
-	uchar	xregs[480];	/* extended registers */
-};
-
-union FPsave {
-	FPx87state;
-	FPssestate;
-};
-
-struct PFPU
-{
-	int	fpstate;
-	FPsave	*fpsave;
-};
-
+/*
+ * FPsave.status
+ */
 enum
 {
 	/* this is a state */
@@ -107,35 +98,109 @@ enum
 	FPillegal=	0x100,
 };
 
+struct	FPstate			/* x87 fpu state */
+{
+	ushort	control;
+	ushort	r1;
+	ushort	status;
+	ushort	r2;
+	ushort	tag;
+	ushort	r3;
+	ulong	pc;
+	ushort	selector;
+	ushort	r4;
+	ulong	operand;
+	ushort	oselector;
+	ushort	r5;
+	uchar	regs[80];	/* floating point registers */
+};
+
+struct	FPssestate		/* SSE fp state (32-bit layout) */
+{
+	ushort	fcw;		/* control */
+	ushort	fsw;		/* status */
+	ushort	ftw;		/* tag */
+	ushort	fop;		/* opcode */
+	ulong	fpuip;		/* pc */
+	ushort	cs;		/* pc segment */
+	ushort	r1;		/* reserved */
+	ulong	fpudp;		/* data pointer */
+	ushort	ds;		/* data pointer segment */
+	ushort	r2;
+	ulong	mxcsr;		/* MXCSR register state */
+	ulong	mxcsr_mask;	/* MXCSR mask register */
+	uchar	xregs[480];	/* extended regs: MM[0-7], XMM[0-7], rsv'd */
+};
+
+struct	SFPssestate		/* SSE fp state with alignment slop */
+{
+	FPssestate;
+	uchar	alignpad[FPalign]; /* slop to allow copying to aligned addr */
+	ulong	magic;		/* debugging: check for overrun by FXSAVE */
+};
+
+/*
+ * the FP regs must be stored here, not somewhere pointed to from here.
+ * port code assumes this.
+ */
+union FPsave {
+	FPstate;
+	SFPssestate;
+};
+
 struct Confmem
 {
 	ulong	base;
 	ulong	npage;
-	ulong	kbase;
+	ulong	kbase;		/* set by xalloc, used by devproc */
 	ulong	klimit;
 };
 
+/* system configuration: what hardware exists and how are we using it */
 struct Conf
 {
 	ulong	nmach;		/* processors */
-	ulong	nproc;		/* processes */
-	ulong	monitor;	/* has monitor? */
+	ulong	cachelinesz;
+	int	x86type;	/* manufacturer, usually */
+	ushort	monmin;		/* smallest monitor line */
+	ushort	monmax;		/* largest monitor line */
+	uchar	havetsc;
+	uchar	monitor;	/* has monitor? */
+	int	vm;		/* bits for vm types we could be in */
+
+	Confmem	mem[4];		/* physical memory */
+	uintptr	base0;		/* base of bank 0 */
+	uintptr	base1;		/* base of bank 1 */
+	/* npage may exclude kernel pages */
 	ulong	npage;		/* total physical pages of memory */
 	ulong	upages;		/* user page pool */
+
+	ulong	nproc;		/* processes */
 	ulong	nimage;		/* number of page cache image headers */
 	ulong	nswap;		/* number of swap pages */
 	int	nswppo;		/* max # of pageouts per segment pass */
 	ulong	copymode;	/* 0 is copy on write, 1 is copy on reference */
+
 	ulong	ialloc;		/* max interrupt time allocation in bytes */
 	ulong	pipeqsize;	/* size in bytes of pipe queues */
 	int	nuart;		/* number of uart devices */
-	Confmem	mem[64];	/* physical memory */
+
+	/* most cpuid results are the same across all cpus */
+	int	cpuidax;	/* of Procsig */
+	int	cpuidbx;	/* " */
+	int	cpuidcx;	/* " */
+	int	cpuid5cx;	/* of Procmon */
+	int	cpuid7bx;	/* of Procid7 */
+	char*	cpuidtype;	/* specific model */
+	char	cpuidid[Cpuidlen+BY2WD]; /* " */
+	char	brand[3*4*BY2WD + 1];	/* 3 sets of 4 registers */
 };
 
-struct Segdesc
-{
-	ulong	d0;
-	ulong	d1;
+enum Vms {
+	Othervm		= 1<<0,
+	Parallels	= 1<<1,
+	Vmwarehyp	= 1<<2,
+	Virtualbox	= 1<<3,
 };
 
 /*
@@ -150,17 +215,7 @@ struct PMMU
 	Page*	kmaptable;		/* page table used by kmap */
 	uint	lastkmap;		/* last entry used by kmap */
 	int	nkmap;			/* number of current kmaps */
-
-	Segdesc	gdt[NPROCSEG];	/* per process descriptors */
-	Segdesc	*ldt;	/* local descriptor table */
-	int	nldt;	/* number of ldt descriptors allocated */
-	
-	u32int	dr[8];			/* debug registers */
-	void	*vmx;
 };
-
-#define	inittxtflush(p)
-#define	settxtflush(p,c)
 
 #include "../port/portdat.h"
 
@@ -193,53 +248,87 @@ typedef struct {
 	ulong	iomap;			/* I/O map base address + T-bit */
 } Tss;
 
+struct Segdesc
+{
+	ulong	d0;
+	ulong	d1;
+};
 
+enum X86types {
+	Intel,
+	Amd,
+	Sis,
+	Centaur,
+};
+
+/* per-cpu state & stack; system-wide state should be in conf or active. */
 struct Mach
 {
-	int	machno;			/* physical id of processor */
-	uintptr	splpc;			/* pc of last caller to splhi */
-	Proc*	proc;			/* current process on this processor */
+	/* start of KNOWN TO ASSEMBLY */
+	int	machno;			/* physical id of processor*/
+	ulong	splpc;			/* pc of last caller to splhi */
+	/* end of KNOWN TO ASSEMBLY */
+
 	Proc*	externup;		/* extern register Proc *up */
+	Proc*	proc;			/* current process on this processor */
 
-	PMach;
-
-	uvlong	tscticks;
-	ulong	spuriousintr;
-	int	lastintr;
-
-	int	loopconst;
-	int	aalcycles;
-	int	cpumhz;
-	uvlong	cpuhz;
-
-	int	cpuidax;
-	int	cpuidcx;
-	int	cpuiddx;
-	char	cpuidid[16];
-	char*	cpuidtype;
-	uchar	cpuidfamily;
-	uchar	cpuidmodel;
-	uchar	cpuidstepping;
-
-	char	havetsc;
-	char	havepge;
-	char	havewatchpt8;
-	char	havenx;
+	Tss*	tss;			/* tss for this processor */
+	Segdesc	*gdt;			/* gdt for this processor */
 
 	ulong*	pdb;			/* page directory base for this processor (va) */
-	Tss*	tss;			/* tss for this processor */
-	Segdesc*gdt;			/* gdt for this processor */
-	
-	u32int	dr7;			/* shadow copy of dr7 */
-	u32int	xcr0;
-	void*	vmx;
-
 	Page*	pdbpool;
 	int	pdbcnt;
 	int	pdballoc;
 	int	pdbfree;
 
-	uintptr	stack[1];
+	ulong	ticks;			/* of the clock since boot time */
+	Label	sched;			/* scheduler wakeup */
+	Proc*	readied;		/* for runproc */
+	Lock	alarmlock;		/* access to alarm list */
+	void*	alarm;			/* alarms bound to this clock */
+	ulong	schedticks;		/* next forced context switch */
+	uint	loopconst;
+	int	inclockintr;
+	ulong	spuriousintr;		/* non-sysstat statistics */
+	int	lastintr;
+	uvlong	tscticks;
+	uvlong	mwaitcycles;
+
+	int	ilockdepth;
+	int	flushmmu;		/* make current proc flush it's mmu state */
+	FPsave	*fpsavalign;
+	Lock	apictimerlock;
+	ulong	mword;			/* old contents for mwait */
+
+	int	tlbfault;		/* counters for sysstat */
+	int	tlbpurge;
+	int	pfault;
+	int	cs;
+	int	syscall;
+	int	load;
+	int	intr;
+
+	Perf	perf;			/* performance counters */
+
+	/* these don't vary enough to matter between cpus */
+	int	cpumhz;
+	uvlong	cyclefreq;		/* Frequency of user readable cycle counter */
+	uvlong	cpuhz;
+	uchar	havepge;
+
+	/* only cpuid leaf 0xb (topology) on intel & Procsig's DX vary by cpu */
+	int	cpuiddx;		/* of Procsig */
+
+	vlong	mtrrcap;
+	vlong	mtrrdef;
+	vlong	mtrrfix[11];
+	vlong	mtrrvar[32];		/* 256 max. */
+
+	/*
+	 * grows down from (char *)m+MACHSIZE toward here.
+	 * max. seen used is 1472 bytes.
+	 */
+	int	stack[1];
 };
 
 /*
@@ -250,12 +339,16 @@ typedef struct KMap		KMap;
 KMap*	kmap(Page*);
 void	kunmap(KMap*);
 
-extern u32int MemMin;
-
+/* current state of the system and its cpus, mostly software state */
 struct
 {
-	char	machs[MAXMACH];		/* active CPUs */
+	Lock;
+	ulong	machsmap[(MAXMACH+BI2WD-1)/BI2WD];  /* bitmap of active CPUs */
+	int	nmachs;			/* number of bits set in machs(map) */
 	int	exiting;		/* shutdown */
+	int	ispanic;		/* shutdown in response to a panic */
+	int	thunderbirdsarego; /* let added processors continue to schedinit */
+	int	rebooting;		/* just idle cpus > 0 */
 }active;
 
 /*
@@ -268,25 +361,22 @@ struct PCArch
 	void	(*reset)(void);		/* this should be in the model */
 
 	void	(*intrinit)(void);
-	int	(*intrassign)(Vctl*);
-	int	(*intrirqno)(int, int);
-	int	(*intrspurious)(int);
+	int	(*intrenable)(Vctl*);
 	int	(*intrvecno)(int);
+	int	(*intrdisable)(int);
 	void	(*introff)(void);
 	void	(*intron)(void);
 
-	void	(*clockinit)(void);
 	void	(*clockenable)(void);
 	uvlong	(*fastclock)(uvlong*);
 	void	(*timerset)(uvlong);
+
+	void	(*resetothers)(void);	/* put other cpus into reset */
 };
 
 /* cpuid instruction result register bits */
 enum {
-	/* cx */
-	Monitor	= 1<<3,
-
-	/* dx */
+	/* m->cpuiddx from Procsig */
 	Fpuonchip = 1<<0,
 	Vmex	= 1<<1,		/* virtual-mode extensions */
 	Pse	= 1<<3,		/* page size extensions */
@@ -295,32 +385,41 @@ enum {
 	Pae	= 1<<6,		/* physical-addr extensions */
 	Mce	= 1<<7,		/* machine-check exception */
 	Cmpxchg8b = 1<<8,
-	Cpuapic	= 1<<9,
+	Cpuapic	= 1<<9,		/* have local apic */
 	Mtrr	= 1<<12,	/* memory-type range regs.  */
-	Pge	= 1<<13,	/* page global extension */
-	Mca	= 1<<14,	/* machine-check architecture */
-	Pat	= 1<<16,	/* page attribute table */
+	Pge	= 1<<13,	/* page global extension (PPro, 1995) */
 	Pse2	= 1<<17,	/* more page size extensions */
 	Clflush = 1<<19,
-	Acpif	= 1<<22,	/* therm control msr */
 	Mmx	= 1<<23,
 	Fxsr	= 1<<24,	/* have SSE FXSAVE/FXRSTOR */
 	Sse	= 1<<25,	/* thus sfence instr. */
-	Sse2	= 1<<26,	/* thus mfence & lfence instr.s */
-	Rdrnd	= 1<<30,	/* RDRAND support bit */
+	Sse2	= 1<<26,	/* thus mfence & lfence instr.s (2000-) */
+	Htt	= 1<<28,	/* multi-threading capable */
+};
+enum {
+	/* conf.cpuidcx from Procsig */
+	Monitor	= 1<<3,		/* have monitor/mwait instr.s */
+	Hypervisor= 1<<31,	/* running on a hypervisor */
+};
+enum {
+	/* conf.cpuid5cx from Procmon */
+	Mwaitext= 1<<0,		/* MWAIT extensions supported */
+	Mwaitintrhi= 1<<1,	/* interrupts break MWAIT, even at splhi */
 };
 
-/* model-specific registers, for compatibility with pc64 code */
-enum {
-	Efer		= 0xc0000080,		/* Extended Feature Enable */
-	Star		= 0xc0000081,		/* Legacy Target IP and [CS]S */
-	Lstar		= 0xc0000082,		/* Long Mode Target IP */
-	Cstar		= 0xc0000083,		/* Compatibility Target IP */
-	Sfmask		= 0xc0000084,		/* SYSCALL Flags Mask */
-	FSbase		= 0xc0000100,		/* 64-bit FS Base Address */
-	GSbase		= 0xc0000101,		/* 64-bit GS Base Address */
-	KernelGSbase	= 0xc0000102,		/* SWAPGS instruction */
+enum {				/* mwait extensions */
+	Mwaitintrbreakshi = 1<<0,
 };
+
+enum {
+	CR4tsd =	1 << 2,		/* disable RDTSC in user mode */
+	CR4pse =	1 << 4,		/* page size extensions */
+	CR4mce =	1 << 6,		/* machine check exception */
+	CR4pge =	1 << 7,		/* page global enabled */
+	CR4Osfxsr =	1 << 9,		/* fxsave/fxrstor instrs. */
+	CR4smep =	1 << 20, /* disable execution by kernel of user pages */
+};
+
 
 /*
  *  a parsed plan9.ini line
@@ -329,11 +428,11 @@ enum {
 
 struct ISAConf {
 	char	*type;
-	uvlong	port;
+	uintptr	port;
 	int	irq;
 	ulong	dma;
-	ulong	mem;
-	ulong	size;
+	uintptr	mem;
+	usize	size;
 	ulong	freq;
 
 	int	nopt;
@@ -371,11 +470,66 @@ struct DevConf
 	Devport	*ports;			/* The ports themselves */
 };
 
-typedef struct BIOS32ci {		/* BIOS32 Calling Interface */
-	u32int	eax;
-	u32int	ebx;
-	u32int	ecx;
-	u32int	edx;
-	u32int	esi;
-	u32int	edi;
-} BIOS32ci;
+/*
+ * MSRs (model-specific registers).
+ * these are architectural (i.e. not actually model-specific once defined)
+ * except as noted.
+ */
+enum {
+	Msrmcaddr,		/* machine-check address (pentium) */
+	Msrmctype,		/* machine-check type (pentium) */
+	Msrmonsize =	6,	/* monitor/mwait size */
+	Msrtr12	=	0xe,	/* test register 12 (some pentium steppings) */
+	Msrtsc =	0x10,	/* time-stamp counter */
+	Msrapicbase =	0x1b,
+	Msri64feat =	0x3a,
+	Msrpmc0 =	0xc1,	/* intel only */
+	Msrpmc1,
+	Msrpmc2,
+	/* etc. through pmc7 */
+	MTRRCap =	0xfe,
+	Msrpevsel0 =	0x186,	/* perf. event select 0; intel only */
+	Msrpevsel1,
+	/* etc. through evsel3 */
+	Msrmiscen =	0x1a0,	/* enable misc. cpu features */
+	/*
+	 * MTRR Physical base/mask are pairs, indexed by
+	 *	MTRRPhys{Base|Mask}N = MTRRPhys{Base|Mask}0 + 2*N
+	 */
+	MTRRPhysBase0 =	0x200,
+	MTRRPhysMask0 =	0x201,
+	/* ... */
+	Msrmtrrfix0 =	0x250,
+	Msrmtrrfix1 =	0x258,
+	Msrmtrrfix2,
+	Msrmtrrfix3 =	0x268,
+	/* ... */
+	MTRRDefaultType=0x2ff,
+	Msrpebsen =	0x3f1,
+
+	/* AMD-specific */
+	AMsrpevsel0 =	0xc0010000,	/* and 3 more */
+	AMsrpmc0 =	0xc0010004,	/* and 3 more */
+};
+
+enum {				/* mtrr fields */
+	Capvcnt = 0xff,		/* mask: # of variable-range MTRRs we have */
+	Capfix	= 1<<8,		/* have fixed MTRRs? */
+	Capwc	= 1<<10,	/* have write combining? */
+
+	Deftype = 0xff,		/* default MTRR type */
+	Deffixena = 1<<10,	/* fixed-range MTRR enable */
+	Defena	= 1<<11,	/* MTRR enable */
+
+	Mtrrvalid = 1<<11,
+};
+
+enum {					/* bios cmos (nvram) registers */
+	Cmosreset = 0xf,
+};
+
+enum {					/* Cmosreset values */
+	Rstpwron = 0,			/* perform power-on reset */
+	Rstnetboot= 4,			/* INT 19h reboot */
+	Rstwarm	 = 0xa,	/* perform warm start: JMP via 32-bit ptr. at 0x467 */
+};

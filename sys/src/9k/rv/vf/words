@@ -1,0 +1,90 @@
+starfive visionfive 2 v1.3B
+
+data version: 0x2
+PCB revision: 0xb2
+BOM revision: A
+Ethernet MAC0 address: 6c:cf:39:00:30:25
+opensbi v1; sbi 0.3
+
+starfive jh7110 risc-v rv64gc cpu: quad-core sifive u74 @ 1-1.5GHz +
+	s7 mgmt hart + e24 real-time hart (hart0)
+• U74 are dual-issue cores.
+39-bit virtual addresses in rv64
+timebase frequency 4M
+8GB ram
+ram and dma are cache coherent
+standard clint & plic interrupt controllers
+synopsys "gmac" Gb ether: dwmac-5.20
+hdmi, video accelerators - which one?
+xhci
+microsd card
+
+physical memory map for visionfive 2
+
+/* on-core devices */
+0x0130c000	more gpu
+0x02000000	clint; first 64K made unusable by pmp
+0x02010000	l2 cache controller per fu740, 16KB
+0x08000000	l2 cache controller per fu740, 32MB LIM
+0x0c000000	plic
+0x10000000	3 uarts (0-2), 64K stride
+0x10030000	3 i2c, 64K stride
+0x10100000	usb xhci, 1MB
+0x10200000	usb ehci, 64KB
+0x10230000	stg crg, 64KB
+0x10240000	stg syscon, 64KB
+0x12000000	3 uarts (3-5), 64K stride
+0x12030000	4 i2c, 64K stride
+0x13020000	system crg, 64KB
+0x13030000	system syscon, 64KB
+0x13050000	5 timers, frequency 24M
+0x13070000	watchdog, 15 s. timeout
+0x13080000	intc(?)
+0x1600c000	rng
+0x16010000	2 sdios, 64K stride
+0x16030000	dwmac ethernet 0
+0x16040000	dwmac ethernet 1
+0x17000000	aon (always-on) crg, 64KB
+0x17010000	aon (always-on) syscon, 64KB
+0x17040000	rtc, frequency 1M
+0x18000000	gpu
+0x2b000000	2 pci-e controllers, 16M stride
+0x30000000	pci-e 0 memory for 32-bit devices, 128MB
+0x38000000	pci-e 1 memory for 32-bit devices, 128MB
+/* off-core i/o */
+
+/*
+ * on-core memory.
+ */
+0x40000000	4GB of RAM (more in some versions)
+0x40000000	protected memory for firmware (360K = 0x5a000)
+0x40200000	cached dma-coherent memory (or 0x40080000)
+0xc0110000	e24 memory, 960KB
+
+0x900000000	pci-e 0 memory, 1GB
+0x940000000	pci-e 0 config, 256MB
+0x980000000	pci-e 1 memory, 1GB
+0x9c0000000	pci-e 1 config, 257MB
+
+jh7110 irqs (global interrupts)
+
+dw gmac5 0	0	lpi
+		1	pmt
+		2	sbd
+		3	sbd_tx
+		4	sbd_rx
+rtc		5	ms
+		6	one_sec
+		7	rtc
+dw uart		27-29,40-42	uarts 0-5
+dw i2c		30-32,43-46	i2c 0-6
+u6_ssp_spi	50	?
+wdog		63
+timers		64-67	timers 0-3
+dw sdio		69-70	units 0-1
+dw gmac5 1	71	lpi
+		72	pmt
+		73	sbd
+		74	sbd_tx
+		75	sbd_rx
+usb		95-105

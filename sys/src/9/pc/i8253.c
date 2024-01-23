@@ -55,6 +55,8 @@ enum
 	Tickshift=8,		/* extra accuracy */
 	MaxPeriod=Freq/HZ,
 	MinPeriod=Freq/(100*HZ),
+
+	Wdogms	= 200,		/* ms between strokes */
 };
 
 typedef struct I8253 I8253;
@@ -62,6 +64,8 @@ struct I8253
 {
 	Lock;
 	ulong	period;		/* current clock period */
+	int	enabled;
+	uvlong	hz;
 
 	ushort	last;		/* last value of clock 1 */
 	uvlong	ticks;		/* cumulative ticks of counter 1 */
@@ -71,13 +75,13 @@ struct I8253
 static I8253 i8253;
 
 void
-i8253reset(void)
+i8253init(void)
 {
 	int loops, x;
 
-	ilock(&i8253);
+	ioalloc(T0cntr, 4, 0, "i8253");
+	ioalloc(T2ctl, 1, 0, "i8253.cntr2ctl");
 
-	i8253.last = 0;
 	i8253.period = Freq/HZ;
 
 	/*
@@ -96,7 +100,7 @@ i8253reset(void)
 	x = inb(T2ctl);
 	x |= T2gate;
 	outb(T2ctl, x);
-	
+
 	/*
 	 * Introduce a little delay to make sure the count is
 	 * latched and the timer is counting down; with a fast
@@ -111,18 +115,49 @@ i8253reset(void)
 		x = inb(T0cntr);
 		x |= inb(T0cntr)<<8;
 	}
-
-	iunlock(&i8253);
 }
 
-static uvlong
-i8253cpufreq(void)
+/*
+ * if the watchdog is running and we're on cpu 0 and ignoring (clock)
+ * interrupts, disable the watchdog temporarily so that the (presumed)
+ * long-running loop to follow will not trigger an NMI.
+ * wdogresume restarts the watchdog if wdogpause stopped it.
+ */
+static int
+wdogpause(void)
 {
-	int loops, x, y;
-	uvlong a, b;
+	int turndogoff;
 
-	ilock(&i8253);
-	for(loops = 1000;;loops += 1000) {
+	turndogoff = watchdogon && m->machno == 0 && !islo();
+	if (turndogoff) {
+		watchdog->disable();
+		watchdogon = 0;
+	}
+	return turndogoff;
+}
+
+static void
+wdogresume(int resume)
+{
+	if (resume) {
+		watchdog->enable();
+		watchdogon = 1;
+	}
+}
+
+void
+guesscpuhz(int aalcycles)
+{
+	int loops, incr, x, y, dogwason;
+	uvlong a, b, cpufreq;
+
+	dogwason = wdogpause();		/* don't get NMI while busy looping */
+
+	/* find biggest loop that doesn't wrap */
+	incr = 16000000/(aalcycles*HZ*2);
+	x = 2000;
+	for(loops = incr; loops < 64*1024; loops += incr) {
+
 		/*
 		 *  measure time for the loop
 		 *
@@ -135,69 +170,58 @@ i8253cpufreq(void)
 		 *  prefetch buffer.
 		 *
 		 */
-		outb(Tmode, Latch2);
+		outb(Tmode, Latch0);
 		cycles(&a);
-		x = inb(T2cntr);
-		x |= inb(T2cntr)<<8;
+		x = inb(T0cntr);
+		x |= inb(T0cntr)<<8;
 		aamloop(loops);
-		outb(Tmode, Latch2);
+		outb(Tmode, Latch0);
 		cycles(&b);
-		y = inb(T2cntr);
-		y |= inb(T2cntr)<<8;
-
+		y = inb(T0cntr);
+		y |= inb(T0cntr)<<8;
 		x -= y;
-		if(x < 0)
-			x += 0x10000;
 
-		if(x >= MaxPeriod || loops >= 1000000)
+		if(x < 0)
+			x += Freq/HZ;
+
+		if(x > Freq/(3*HZ))
 			break;
 	}
-	iunlock(&i8253);
-
-	/* avoid division by zero on vmware 7 */
-	if(x == 0)
-		x = 1;
-
-	if(m->havetsc && b > a){
-		b -= a;
-		m->cyclefreq = b * 2*Freq / x;
-		m->aalcycles = (b + loops-1) / loops;
-
-		return m->cyclefreq;
-	}
-
-	return (vlong)loops*m->aalcycles * 2*Freq / x;
-}
-
-void
-i8253init(void)
-{
-	uvlong cpufreq;
-
-	if(m->machno != 0){
-		m->cpuhz = MACHP(0)->cpuhz;
-		m->cpumhz = MACHP(0)->cpumhz;
-		m->cyclefreq = MACHP(0)->cyclefreq;
-		m->loopconst = MACHP(0)->loopconst;
-		return;
-	}
-
-	ioalloc(T0cntr, 4, 0, "i8253");
-	ioalloc(T2ctl, 1, 0, "i8253.cntr2ctl");
-
-	i8253reset();
-
-	cpufreq = i8253cpufreq();
-
-	m->loopconst = (cpufreq/1000)/m->aalcycles;	/* AAM+LOOP's for 1 ms */
-	m->cpuhz = cpufreq;
+	wdogresume(dogwason);
 
 	/*
-	 *  round to the nearest megahz
+ 	 *  figure out clock frequency and a loop multiplier for delay().
+	 *  n.b. counter goes up by 2*Freq
 	 */
-	m->cpumhz = (cpufreq+500000)/1000000L;
-	if(m->cpumhz == 0)
-		m->cpumhz = 1;
+	if(x == 0)
+		x = 1;			/* avoid division by zero on vmware 7 */
+	cpufreq = (vlong)loops*((aalcycles*2*Freq)/x);
+	m->loopconst = (cpufreq/1000)/aalcycles;	/* AAM+LOOP's for 1 ms */
+
+	if(conf.havetsc && a != b){  /* a == b means virtualbox has confused us */
+		/* counter goes up by 2*Freq */
+		b = (b-a)<<1;
+		b *= Freq;
+		b /= x;
+
+		/*
+		 *  round to the nearest megahz
+		 */
+		m->cpumhz = (b+500000)/1000000L;
+		m->cpuhz = b;
+		m->cyclefreq = b;
+	} else {
+		/*
+		 *  add in possible 0.5% error and convert to MHz
+		 */
+		m->cpumhz = (cpufreq + cpufreq/200)/1000000;
+		m->cpuhz = cpufreq;
+	}
+
+	/* don't divide by zero in trap.c */
+	if (m->cpumhz == 0)
+		panic("guesscpuhz: zero m->cpumhz");
+	i8253.hz = Freq<<Tickshift;
 }
 
 void
@@ -207,14 +231,17 @@ i8253timerset(uvlong next)
 	ulong want;
 	ulong now;
 
-	want = next>>Tickshift;
-	now = i8253.ticks;	/* assuming whomever called us just did fastticks() */
+	period = MaxPeriod;
+	if(next != 0){
+		want = next>>Tickshift;
+		now = i8253.ticks; /* assuming whomever called us just did fastticks() */
 
-	period = want - now;
-	if(period < MinPeriod)
-		period = MinPeriod;
-	else if(period > MaxPeriod)
-		period = MaxPeriod;
+		period = want - now;
+		if(period < MinPeriod)
+			period = MinPeriod;
+		else if(period > MaxPeriod)
+			period = MaxPeriod;
+	}
 
 	/* hysteresis */
 	if(i8253.period != period){
@@ -222,7 +249,7 @@ i8253timerset(uvlong next)
 		/* load new value */
 		outb(Tmode, Load0|Square);
 		outb(T0cntr, period);		/* low byte */
-		outb(T0cntr, period >> 8);	/* high byte */
+		outb(T0cntr, period >> 8);		/* high byte */
 
 		/* remember period */
 		i8253.period = period;
@@ -231,16 +258,24 @@ i8253timerset(uvlong next)
 	}
 }
 
-static void
+static int
 i8253clock(Ureg* ureg, void*)
 {
 	timerintr(ureg, 0);
+	return Intrforme;
 }
 
 void
 i8253enable(void)
 {
+	i8253.enabled = 1;
+	i8253.period = Freq/HZ;
 	intrenable(IrqCLOCK, i8253clock, 0, BUSUNKNOWN, "clock");
+}
+
+void
+i8253link(void)
+{
 }
 
 /*
@@ -255,7 +290,7 @@ i8253read(uvlong *hz)
 	uvlong ticks;
 
 	if(hz)
-		*hz = Freq<<Tickshift;
+		*hz = i8253.hz;
 
 	ilock(&i8253);
 	outb(Tmode, Latch2);
@@ -280,4 +315,79 @@ i8253read(uvlong *hz)
 	iunlock(&i8253);
 
 	return ticks<<Tickshift;
+}
+
+enum {
+	Maxaamloops = 2000*1000*1000,		/* must fit in an int */
+	Mstons = 1000 * 1000,
+};
+
+static vlong wdogloops;
+
+/* delay for at least loops cycles, avoiding the watchdog if necessary */
+static void
+indelay(vlong loops)
+{
+	int aamloops;
+
+	if (loops <= 0)
+		return;
+	if (loops > Maxaamloops)
+		aamloops = Maxaamloops;			/* cap to fit an int */
+	else
+		aamloops = loops;
+
+	/* when islo(), clock interrupts will restart the dog */
+	if (watchdogon && m->machno == 0 && !islo()) {
+		if (wdogloops == 0)
+			wdogloops = ((vlong)Wdogms - 50) * m->loopconst;
+		if (aamloops > wdogloops)		/* cap for wdog */
+			aamloops = wdogloops;
+		watchdog->restart();
+		for (; loops > aamloops; loops -= aamloops) {
+			aamloop(aamloops);
+			watchdog->restart();
+		}
+	} else
+		for (; loops > aamloops; loops -= aamloops)
+			aamloop(aamloops);
+	if(loops > 0)
+		aamloop(loops);
+}
+
+void
+delay(int millisecs)
+{
+	if (millisecs > 10*1000)
+		iprint("delay(%d) from %#p\n", millisecs,
+			getcallerpc(&millisecs));
+	indelay((vlong)millisecs * m->loopconst);	/* convert to cycles */
+}
+
+void
+microdelay(int microsecs)
+{
+	indelay((vlong)microsecs * m->loopconst / 1000); /* convert to cycles */
+}
+
+void
+nanodelay(uvlong nanosecs)
+{
+	indelay(nanosecs * m->loopconst / Mstons);	/* convert to cycles */
+}
+
+/*
+ *  performance measurement ticks.  must be low overhead.
+ *  doesn't have to count over a second.
+ */
+ulong
+perfticks(void)
+{
+	uvlong x;
+
+	if(conf.havetsc)
+		cycles(&x);
+	else
+		x = 0;
+	return x;
 }

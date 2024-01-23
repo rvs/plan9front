@@ -1,6 +1,6 @@
 .TH MEMORY 2
 .SH NAME
-memccpy, memchr, memcmp, memcpy, memmove, memset, tsmemcmp \- memory operations
+memccpy, memchr, memcmp, memcpy, memmove, memset \- memory operations
 .SH SYNOPSIS
 .B #include <u.h>
 .br
@@ -8,27 +8,22 @@ memccpy, memchr, memcmp, memcpy, memmove, memset, tsmemcmp \- memory operations
 .PP
 .ta \w'\fLvoid* 'u
 .B
-void*	memccpy(void *s1, void *s2, int c, usize n)
+void*	memccpy(void *s1, void *s2, int c, ulong n)
 .PP
 .B
-void*	memchr(void *s, int c, usize n)
+void*	memchr(void *s, int c, ulong n)
 .PP
 .B
-int	memcmp(void *s1, void *s2, usize n)
+int	memcmp(void *s1, void *s2, ulong n)
 .PP
 .B
-void*	memcpy(void *s1, void *s2, usize n)
+void*	memcpy(void *s1, void *s2, ulong n)
 .PP
 .B
-void*	memmove(void *s1, void *s2, usize n)
+void*	memmove(void *s1, void *s2, ulong n)
 .PP
 .B
-void*	memset(void *s, int c, usize n)
-.PP
-.B #include <libsec.h>
-.PP
-.B
-int	tsmemcmp(void *s1, void *s2, ulong n)
+void*	memset(void *s, int c, uintptr n)
 .SH DESCRIPTION
 These functions operate efficiently on memory areas
 (arrays of bytes bounded by a count, not terminated by a zero byte).
@@ -108,22 +103,11 @@ to the value of byte
 .IR c .
 It returns
 .IR s .
-.PP
-.I Tsmemcmp
-is a variant of
-.I memcmp
-that is safe against timing attacks.
-It does not stop when it sees a difference, this way it's runtime is function of
-.I n
-and not something that can lead clues to attackers.
 .SH SOURCE
 All these routines have portable C implementations in
 .BR /sys/src/libc/port .
 Most also have machine-dependent assembly language implementations in
 .BR /sys/src/libc/$objtype .
-.I Tsmemcmp
-is found on
-.BR /sys/src/libsec/port/tsmemcmp.c .
 .SH SEE ALSO
 .IR strcat (2)
 .SH BUGS
@@ -141,7 +125,19 @@ and
 .I memmove
 are handed a negative count, they abort.
 .PP
-.I Memcmp
-should not be used to compare sensitive data as it's vulnerable to timing attacks. Instead, 
-.I tsmemcmp
-should be used.
+The last argument to
+.I memset
+is traditionally
+.IR ulong ,
+but that isn't adequate on 64-bit systems.
+.PP
+All the
+.I ulong
+.I n
+arguments should be
+.I uintptr
+instead;
+.I memset
+is the critical one for zeroing
+.I malloc
+results.

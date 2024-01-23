@@ -1,0 +1,35 @@
+solidrun (nxp) honeycomb lx2
+16-core 2GHz nxp lx2160a arm a72 (v8-a)
+1g rj45 ether		(which controller?)
+4 x 10g sfp ethers	(which controller?)
+sata
+pci-e slot
+
+major tasks (borrow some from teg2?):
+• rewrite mmu.c for new pte formats
+• rewrite trap.c for gic
+• adjust to new FPU bits
+• new mch.s primitives
+• clock code
+• system call entry
+
+wtf is going on with ethers? add pci-e intel card?
+
+memory map
+0x01000000	240MB	ccsr (bunch of stuff)
++	0x01370000	64KB	clock
+	0x021c0000	256KB	4 uarts
+	0x023e0000	128KB	global reference timer
+	0x03100000	128KB	2 usb
+	0x03200000	256KB	4 satas
+	0x03400000	-	lots of pci-e stuff
+	0x06200000	-	lots 0f cpus stuff
+0x18000000	2MB	ocram
+0x80000000	2GB	gpp dram region 1
+0x700000000	1GB	dcsr
++	0x00108000	usbphy
+	0x04600000	usbphy1
+	0x04610000	usbphy2
+0x2080000000	126GB	gpp dram region 2
+0x6000000000	128GB	gpp dram region 3
+0x8000000000	192GB	pci express

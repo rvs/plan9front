@@ -11,11 +11,13 @@ enum {
 	IRQi2c		= 53,
 	IRQspi		= 54,
 	IRQsdhost	= 56,
-	IRQuart		= 57,
 	IRQmmc		= 62,
 
 	IRQbasic	= 64,
 	IRQtimerArm	= IRQbasic + 0,
+
+	IRQpci		= 84,
+	IRQether	= 93,
 
 	IRQlocal	= 96,
 	IRQcntps	= IRQlocal + 0,
@@ -62,9 +64,4 @@ enum {
 	ClkSdram,
 	ClkPixel,
 	ClkPwm,
-
-	/* bcm2711 */
-	ClkEmmc2	= 12,
 };
-
-#define BUSUNKNOWN (-1)

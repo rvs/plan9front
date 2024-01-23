@@ -14,15 +14,52 @@
 typedef struct Ipmuxrock  Ipmuxrock;
 typedef struct Ipmux      Ipmux;
 
+typedef struct Myip4hdr Myip4hdr;
+struct Myip4hdr
+{
+	uchar	vihl;		/* Version and header length */
+	uchar	tos;		/* Type of service */
+	uchar	length[2];	/* packet length */
+	uchar	id[2];		/* ip->identification */
+	uchar	frag[2];	/* Fragment information */
+	uchar	ttl;		/* Time to live */
+	uchar	proto;		/* Protocol */
+	uchar	cksum[2];	/* Header checksum */
+	uchar	src[4];		/* IP source */
+	uchar	dst[4];		/* IP destination */
+
+	uchar	data[1];	/* start of data */
+};
+Myip4hdr *ipoff = 0;
+
 enum
 {
-	Tver,
 	Tproto,
 	Tdata,
 	Tiph,
 	Tdst,
 	Tsrc,
 	Tifc,
+
+	Cother = 0,
+	Cbyte,		/* single byte */
+	Cmbyte,		/* single byte with mask */
+	Cshort,		/* single short */
+	Cmshort,	/* single short with mask */
+	Clong,		/* single long */
+	Cmlong,		/* single long with mask */
+	Cifc,
+	Cmifc,
+};
+
+char *ftname[] =
+{
+[Tproto]	"proto",
+[Tdata]		"data",
+[Tiph]		"iph",
+[Tdst]		"dst",
+[Tsrc]		"src",
+[Tifc]		"ifc",
 };
 
 /*
@@ -33,12 +70,16 @@ struct Ipmux
 	Ipmux	*yes;
 	Ipmux	*no;
 	uchar	type;		/* type of field(Txxxx) */
+	uchar	ctype;		/* tupe of comparison(Cxxxx) */
 	uchar	len;		/* length in bytes of item to compare */
 	uchar	n;		/* number of items val points to */
-	int	off;		/* offset of comparison */
+	short	off;		/* offset of comparison */
+	short	eoff;		/* end offset of comparison */
+	uchar	skiphdr;	/* should offset start after ipheader */
 	uchar	*val;
 	uchar	*mask;
 	uchar	*e;		/* val+n*len*/
+
 	int	ref;		/* so we can garbage collect */
 	Conv	*conv;
 };
@@ -53,7 +94,6 @@ struct Ipmuxrock
 
 static int	ipmuxsprint(Ipmux*, int, char*, int);
 static void	ipmuxkick(void *x);
-static void	ipmuxfree(Ipmux *f);
 
 static char*
 skipwhite(char *p)
@@ -86,33 +126,27 @@ parseop(char **pp)
 	Ipmux *f;
 
 	p = skipwhite(p);
-	if(strncmp(p, "ver", 3) == 0){
-		type = Tver;
-		off = 0;
-		len = 1;
-		p += 3;
-	}
-	else if(strncmp(p, "dst", 3) == 0){
+	if(strncmp(p, "dst", 3) == 0){
 		type = Tdst;
-		off = offsetof(Ip6hdr, dst[0]);
-		len = IPaddrlen;
+		off = (uintptr)(ipoff->dst);
+		len = IPv4addrlen;
 		p += 3;
 	}
 	else if(strncmp(p, "src", 3) == 0){
 		type = Tsrc;
-		off = offsetof(Ip6hdr, src[0]);
-		len = IPaddrlen;
+		off = (uintptr)(ipoff->src);
+		len = IPv4addrlen;
 		p += 3;
 	}
 	else if(strncmp(p, "ifc", 3) == 0){
 		type = Tifc;
-		off = -IPaddrlen;
-		len = IPaddrlen;
+		off = -IPv4addrlen;
+		len = IPv4addrlen;
 		p += 3;
 	}
 	else if(strncmp(p, "proto", 5) == 0){
 		type = Tproto;
-		off = offsetof(Ip6hdr, proto);
+		off = (uintptr)&(ipoff->proto);
 		len = 1;
 		p += 5;
 	}
@@ -130,7 +164,7 @@ parseop(char **pp)
 			return nil;
 		p++;
 		off = strtoul(p, &p, 0);
-		if(off < 0)
+		if(off < 0 || off > (64-IP4HDR))
 			return nil;
 		p = skipwhite(p);
 		if(*p != ':')
@@ -159,7 +193,12 @@ parseop(char **pp)
 	f->mask = nil;
 	f->n = 1;
 	f->ref = 1;
-	return f;	
+	if(type == Tdata)
+		f->skiphdr = 1;
+	else
+		f->skiphdr = 0;
+
+	return f;
 }
 
 static int
@@ -194,7 +233,7 @@ parseval(uchar *v, char *p, int len)
 static Ipmux*
 parsemux(char *p)
 {
-	int n;
+	int n, nomask;
 	Ipmux *f;
 	char *val;
 	char *mask;
@@ -219,7 +258,7 @@ parsemux(char *p)
 		case Tdst:
 		case Tifc:
 			f->mask = smalloc(f->len);
-			parseipmask(f->mask, mask, 0);
+			v4parseip(f->mask, mask);
 			break;
 		case Tdata:
 		case Tiph:
@@ -229,34 +268,25 @@ parsemux(char *p)
 		default:
 			goto parseerror;
 		}
-	} else if(f->type == Tver){
+		nomask = 0;
+	} else {
+		nomask = 1;
 		f->mask = smalloc(f->len);
-		f->mask[0] = 0xF0;
+		memset(f->mask, 0xff, f->len);
 	}
 
 	/* parse vals */
-	f->n = getfields(val, vals, nelem(vals), 1, "|");
+	f->n = getfields(val, vals, sizeof(vals)/sizeof(char*), 1, "|");
 	if(f->n == 0)
 		goto parseerror;
 	f->val = smalloc(f->n*f->len);
 	v = f->val;
 	for(n = 0; n < f->n; n++){
 		switch(f->type){
-		case Tver:
-			if(f->n != 1)
-				goto parseerror;
-			if(strcmp(vals[n], "6") == 0)
-				*v = IP_VER6;
-			else if(strcmp(vals[n], "4") == 0)
-				*v = IP_VER4;
-			else
-				goto parseerror;
-			break;
 		case Tsrc:
 		case Tdst:
 		case Tifc:
-			if(parseip(v, vals[n]) == -1)
-				goto parseerror;
+			v4parseip(v, vals[n]);
 			break;
 		case Tproto:
 		case Tdata:
@@ -266,17 +296,40 @@ parsemux(char *p)
 		}
 		v += f->len;
 	}
+
+	f->eoff = f->off + f->len;
 	f->e = f->val + f->n*f->len;
+	f->ctype = Cother;
+	if(f->n == 1){
+		switch(f->len){
+		case 1:
+			f->ctype = nomask ? Cbyte : Cmbyte;
+			break;
+		case 2:
+			f->ctype = nomask ? Cshort : Cmshort;
+			break;
+		case 4:
+			if(f->type == Tifc)
+				f->ctype = nomask ? Cifc : Cmifc;
+			else
+				f->ctype = nomask ? Clong : Cmlong;
+			break;
+		}
+	}
 	return f;
 
 parseerror:
-	ipmuxfree(f);
+	if(f->mask)
+		free(f->mask);
+	if(f->val)
+		free(f->val);
+	free(f);
 	return nil;
 }
 
 /*
  *  Compare relative ordering of two ipmuxs.  This doesn't compare the
- *  values, just the fields being looked at.  
+ *  values, just the fields being looked at.
  *
  *  returns:	<0 if a is a more specific match
  *		 0 if a and b are matching on the same fields
@@ -293,7 +346,8 @@ ipmuxcmp(Ipmux *a, Ipmux *b)
 		return n;
 
 	/* compare offsets, call earlier ones more specific */
-	n = a->off - b->off;
+	n = (a->off+((int)a->skiphdr)*(uintptr)ipoff->data) -
+		(b->off+((int)b->skiphdr)*(uintptr)ipoff->data);
 	if(n != 0)
 		return n;
 
@@ -333,7 +387,7 @@ ipmuxvalcmp(Ipmux *a, Ipmux *b)
 	if(n != 0)
 		return n;
 	return memcmp(a->val, b->val, a->len*a->n);
-} 
+}
 
 /*
  *  add onto an existing ipmux chain in the canonical comparison
@@ -363,10 +417,6 @@ ipmuxcopy(Ipmux *f)
 	*nf = *f;
 	nf->no = ipmuxcopy(f->no);
 	nf->yes = ipmuxcopy(f->yes);
-	if(f->mask != nil){
-		nf->mask = smalloc(f->len);
-		memmove(nf->mask, f->mask, f->len);
-	}
 	nf->val = smalloc(f->n*f->len);
 	nf->e = nf->val + f->len*f->n;
 	memmove(nf->val, f->val, f->n*f->len);
@@ -376,10 +426,8 @@ ipmuxcopy(Ipmux *f)
 static void
 ipmuxfree(Ipmux *f)
 {
-	if(f == nil)
-		return;
-	free(f->val);
-	free(f->mask);
+	if(f->val != nil)
+		free(f->val);
 	free(f);
 }
 
@@ -388,8 +436,10 @@ ipmuxtreefree(Ipmux *f)
 {
 	if(f == nil)
 		return;
-	ipmuxfree(f->no);
-	ipmuxfree(f->yes);
+	if(f->no != nil)
+		ipmuxfree(f->no);
+	if(f->yes != nil)
+		ipmuxfree(f->yes);
 	ipmuxfree(f);
 }
 
@@ -464,8 +514,6 @@ ipmuxremove(Ipmux **l, Ipmux *f)
 		return ipmuxremove(&ft->no, f);
 	}
 
-	ipmuxremove(&ft->no, f->no);
-
 	/* we found a match */
 	if(--(ft->ref) == 0){
 		/*
@@ -487,55 +535,8 @@ ipmuxremove(Ipmux **l, Ipmux *f)
 }
 
 /*
- * convert to ipv4 filter
- */
-static Ipmux*
-ipmuxconv4(Ipmux *f)
-{
-	int i, n;
-
-	if(f == nil)
-		return nil;
-
-	switch(f->type){
-	case Tproto:
-		f->off = offsetof(Ip4hdr, proto);
-		break;
-	case Tdst:
-		f->off = offsetof(Ip4hdr, dst[0]);
-		if(0){
-	case Tsrc:
-		f->off = offsetof(Ip4hdr, src[0]);
-		}
-		if(f->len != IPaddrlen)
-			break;
-		n = 0;
-		for(i = 0; i < f->n; i++){
-			if(isv4(f->val + i*IPaddrlen)){
-				memmove(f->val + n*IPv4addrlen, f->val + i*IPaddrlen + IPv4off, IPv4addrlen);
-				n++;
-			}
-		}
-		if(n == 0){
-			ipmuxtreefree(f);
-			return nil;
-		}
-		f->n = n;
-		f->len = IPv4addrlen;
-		if(f->mask != nil)
-			memmove(f->mask, f->mask+IPv4off, IPv4addrlen);
-	}
-	f->e = f->val + f->n*f->len;
-
-	f->yes = ipmuxconv4(f->yes);
-	f->no = ipmuxconv4(f->no);
-
-	return f;
-}
-
-/*
  *  connection request is a semi separated list of filters
- *  e.g. ver=4;proto=17;data[0:4]=11aa22bb;ifc=135.104.9.2&255.255.255.0
+ *  e.g. proto=17;data[0:4]=11aa22bb;ifc=135.104.9.2&255.255.255.0
  *
  *  there's no protection against overlapping specs.
  */
@@ -571,18 +572,6 @@ ipmuxconnect(Conv *c, char **argv, int argc)
 		return Ebadarg;
 	mux->conv = c;
 
-	if(chain->type != Tver) {
-		char ver6[] = "ver=6";
-		mux = parsemux(ver6);
-		mux->yes = chain;
-		mux->no = ipmuxcopy(chain);
-		chain = mux;
-	}
-	if(*chain->val == IP_VER4)
-		chain->yes = ipmuxconv4(chain->yes);
-	else
-		chain->no = ipmuxconv4(chain->no);
-
 	/* save a copy of the chain so we can later remove it */
 	mux = ipmuxcopy(chain);
 	r = (Ipmuxrock*)(c->ptcl);
@@ -601,7 +590,7 @@ static int
 ipmuxstate(Conv *c, char *state, int n)
 {
 	Ipmuxrock *r;
-	
+
 	r = (Ipmuxrock*)(c->ptcl);
 	return ipmuxsprint(r->chain, 0, state, n);
 }
@@ -658,83 +647,92 @@ ipmuxkick(void *x)
 
 	bp = qget(c->wq);
 	if(bp != nil) {
-		Ip4hdr *ih4 = (Ip4hdr*)(bp->rp);
+		Myip4hdr *ih4 = (Myip4hdr*)(bp->rp);
 
 		if((ih4->vihl & 0xF0) != IP_VER6)
-			ipoput4(c->p->f, bp, nil, ih4->ttl, ih4->tos, nil);
+			ipoput4(c->p->f, bp, 0, ih4->ttl, ih4->tos, nil);
 		else
-			ipoput6(c->p->f, bp, nil, ((Ip6hdr*)ih4)->ttl, 0, nil);
+			ipoput6(c->p->f, bp, 0, ((Ip6hdr*)ih4)->ttl, 0, nil);
 	}
-}
-
-static int
-maskmemcmp(uchar *m, uchar *v, uchar *c, int n)
-{
-	int i;
-
-	if(m == nil)
-		return memcmp(v, c, n) != 0;
-
-	for(i = 0; i < n; i++)
-		if((v[i] & m[i]) != c[i])
-			return 1;
-	return 0;
 }
 
 static void
 ipmuxiput(Proto *p, Ipifc *ifc, Block *bp)
 {
+	int len, hl;
 	Fs *f = p->f;
+	uchar *m, *h, *v, *e, *ve, *hp;
 	Conv *c;
-	Iplifc *lifc;
 	Ipmux *mux;
-	uchar *v;
-	Ip4hdr *ip4;
+	Myip4hdr *ip;
 	Ip6hdr *ip6;
-	int off, hl;
 
-	ip4 = (Ip4hdr*)bp->rp;
-	if((ip4->vihl & 0xF0) == IP_VER4) {
-		hl = (ip4->vihl&0x0F)<<2;
-		ip6 = nil;
-	} else {
-		hl = IP6HDR;
-		ip6 = (Ip6hdr*)ip4;
-	}
+	ip = (Myip4hdr*)bp->rp;
+	hl = (ip->vihl&0x0F)<<2;
 
 	if(p->priv == nil)
 		goto nomatch;
 
-	c = nil;
-	lifc = nil;
+	h = bp->rp;
+	len = BLEN(bp);
 
-	/* run the filter */
+	/* run the v4 filter */
 	rlock(f);
+	c = nil;
 	mux = f->ipmux->priv;
 	while(mux != nil){
-		switch(mux->type){
-		case Tifc:
-			if(mux->len != IPaddrlen)
-				goto no;
-			for(lifc = ifc->lifc; lifc != nil; lifc = lifc->next)
-				for(v = mux->val; v < mux->e; v += IPaddrlen)
-					if(maskmemcmp(mux->mask, lifc->local, v, IPaddrlen) == 0)
-						goto yes;
-			goto no;
-		case Tdata:
-			off = hl;
+		if(mux->eoff > len){
+			mux = mux->no;
+			continue;
+		}
+		hp = h + mux->off + ((int)mux->skiphdr)*hl;
+		switch(mux->ctype){
+		case Cbyte:
+			if(*mux->val == *hp)
+				goto yes;
+			break;
+		case Cmbyte:
+			if((*hp & *mux->mask) == *mux->val)
+				goto yes;
+			break;
+		case Cshort:
+			if(*((ushort*)mux->val) == *(ushort*)hp)
+				goto yes;
+			break;
+		case Cmshort:
+			if((*(ushort*)hp & (*((ushort*)mux->mask))) == *((ushort*)mux->val))
+				goto yes;
+			break;
+		case Clong:
+			if(*((ulong*)mux->val) == *(ulong*)hp)
+				goto yes;
+			break;
+		case Cmlong:
+			if((*(ulong*)hp & (*((ulong*)mux->mask))) == *((ulong*)mux->val))
+				goto yes;
+			break;
+		case Cifc:
+			if(*((ulong*)mux->val) == *(ulong*)(ifc->lifc->local + IPv4off))
+				goto yes;
+			break;
+		case Cmifc:
+			if((*(ulong*)(ifc->lifc->local + IPv4off) &
+			    *(ulong*)mux->mask) == *(ulong*)mux->val)
+				goto yes;
 			break;
 		default:
-			off = 0;
-			break;
+			v = mux->val;
+			for(e = mux->e; v < e; v = ve){
+				m = mux->mask;
+				hp = h + mux->off;
+				for(ve = v + mux->len; v < ve; v++){
+					if((*hp++ & *m++) != *v)
+						break;
+				}
+				if(v == ve)
+					goto yes;
+			}
 		}
-		off += mux->off;
-		if(off < 0 || off + mux->len > BLEN(bp))
-			goto no;
-		for(v = mux->val; v < mux->e; v += mux->len)
-			if(maskmemcmp(mux->mask, bp->rp + off, v, mux->len) == 0)
-				goto yes;
-no:
 		mux = mux->no;
 		continue;
 yes:
@@ -747,24 +745,28 @@ yes:
 	if(c != nil){
 		/* tack on interface address */
 		bp = padblock(bp, IPaddrlen);
-		if(lifc == nil)
-			lifc = ifc->lifc;
-		ipmove(bp->rp, lifc != nil ? lifc->local : IPnoaddr);
-		qpass(c->rq, concatblock(bp));
+		ipmove(bp->rp, ifc->lifc->local);
+		bp = concatblock(bp);
+		if(bp != nil)
+			if(qpass(c->rq, bp) < 0)
+				print("ipmuxiput: qpass failed\n");
 		return;
 	}
 
 nomatch:
 	/* doesn't match any filter, hand it to the specific protocol handler */
-	if(ip6 != nil)
+	ip = (Myip4hdr*)bp->rp;
+	if((ip->vihl & 0xF0) == IP_VER4) {
+		p = f->t2p[ip->proto];
+	} else {
+		ip6 = (Ip6hdr*)bp->rp;
 		p = f->t2p[ip6->proto];
-	else
-		p = f->t2p[ip4->proto];
-	if(p != nil && p->rcv != nil){
-		(*p->rcv)(p, ifc, bp);
-		return;
 	}
-	freeblist(bp);
+	if(p && p->rcv)
+		(*p->rcv)(p, ifc, bp);
+	else
+		freeblist(bp);
+	return;
 }
 
 static int
@@ -780,14 +782,12 @@ ipmuxsprint(Ipmux *mux, int level, char *buf, int len)
 		n += snprint(buf+n, len-n, "\n");
 		return n;
 	}
-	n += snprint(buf+n, len-n, "%s[%d:%d]", 
-		mux->type == Tdata ? "data": "iph",
-		mux->off, mux->off+mux->len-1);
-	if(mux->mask != nil){
-		n += snprint(buf+n, len-n, "&");
-		for(i = 0; i < mux->len; i++)
-			n += snprint(buf+n, len - n, "%2.2ux", mux->mask[i]);
-	}
+	n += snprint(buf+n, len-n, "h[%lld:%lld]&",
+               (vlong)(mux->off+((int)mux->skiphdr)*((uintptr)ipoff->data)),
+               (vlong)(mux->off+(((int)mux->skiphdr)*((uintptr)ipoff->data)) +
+			mux->len-1));
+	for(i = 0; i < mux->len; i++)
+		n += snprint(buf+n, len - n, "%2.2ux", mux->mask[i]);
 	n += snprint(buf+n, len-n, "=");
 	v = mux->val;
 	for(j = 0; j < mux->n; j++){

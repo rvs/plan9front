@@ -4,10 +4,8 @@
 #include "dat.h"
 #include "fns.h"
 #include "../port/error.h"
-
 #include <tos.h>
 #include "ureg.h"
-
 #include "arm.h"
 
 /*
@@ -24,19 +22,52 @@ setkernur(Ureg* ureg, Proc* p)
 {
 	ureg->pc = p->sched.pc;
 	ureg->sp = p->sched.sp+4;
-	ureg->r14 = (uintptr)sched;
+	ureg->r14 = PTR2UINT(sched);
 }
 
 /*
- * called in sysfile.c
+ * called in sysfile.c (and FP emulation)
  */
 void
-evenaddr(uintptr addr)
+validalign(ulong addr, ulong align)
 {
-	if(addr & 3){
-		postnote(up, 1, "sys: odd address", NDebug);
-		error(Ebadarg);
-	}
+	/*
+	 * Plan 9 is a 32-bit O/S, and the hardware it runs on
+	 * does not usually have instructions which move 64-bit
+	 * quantities directly, synthesizing the operations
+	 * with 32-bit move instructions. Therefore, the compiler
+	 * (and hardware) usually only enforce 32-bit alignment,
+	 * if at all.
+	 *
+	 * Take this out if the architecture warrants it.
+	 */
+	if(align == sizeof(vlong))
+		align = sizeof(long);
+
+	/*
+	 * Check align is a power of 2, then addr alignment.
+	 */
+	if((align != 0 && !(align & (align-1))) && !(addr & (align-1)))
+		return;
+	postnote(up, 1, "sys: odd address", NDebug);
+	error(Ebadarg);
+	/*NOTREACHED*/
+}
+
+/* prepare to return to user space */
+void
+kexit(Ureg*)
+{
+	uvlong t;
+	Tos *tos;
+
+	/* precise time accounting, kernel exit */
+	tos = (Tos*)(USTKTOP-sizeof(Tos));
+	cycles(&t);
+	tos->kcycles += t - up->kentry;
+	tos->pcycles = up->pcycles;
+	tos->cyclefreq = m->cpuhz;
+	tos->pid = up->pid;
 }
 
 /*
@@ -55,9 +86,18 @@ userpc(void)
 void
 setregisters(Ureg* ureg, char* pureg, char* uva, int n)
 {
-	ulong v = ureg->psr;
-	memmove(pureg, uva, n);
-	ureg->psr = ureg->psr & ~(PsrMask|PsrDfiq|PsrDirq) | v & (PsrMask|PsrDfiq|PsrDirq);
+	USED(ureg, pureg, uva, n);
+}
+
+/*
+ *  this is the body for all kproc's
+ */
+static void
+linkproc(void)
+{
+	spllo();
+	up->kpfun(up->kparg);
+	pexit("kproc exiting", 0);
 }
 
 /*
@@ -65,10 +105,13 @@ setregisters(Ureg* ureg, char* pureg, char* uva, int n)
  *  dependent because of the starting stack location
  */
 void
-kprocchild(Proc *p, void (*entry)(void))
+kprocchild(Proc *p, void (*func)(void*), void *arg)
 {
-	p->sched.pc = (uintptr)entry;
-	p->sched.sp = (uintptr)p;
+	p->sched.pc = PTR2UINT(linkproc);
+	p->sched.sp = PTR2UINT(p->kstack+KSTACK);
+
+	p->kpfun = func;
+	p->kparg = arg;
 }
 
 /*
@@ -101,27 +144,27 @@ procsetup(Proc* p)
 void
 procsave(Proc* p)
 {
-	fpuprocsave(p);
-	l1cache->wbse(p, sizeof *p);		/* is this needed? */
-	l1cache->wb();				/* is this needed? */
-}
+	uvlong t;
 
-void
-procfork(Proc* p)
-{
-	fpuprocfork(p);
+	cycles(&t);
+	p->pcycles += t;
+
+	fpuprocsave(p);
 }
 
 void
 procrestore(Proc* p)
 {
+	uvlong t;
+
 	if(p->kp)
 		return;
+	cycles(&t);
+	p->pcycles -= t;
 	wakewfi();		/* in case there's another runnable proc */
+	clrex();
 
-	/* let it fault in at first use */
-//	fpuprocrestore(p);
-	l1cache->wb();			/* system is more stable with this */
+	/* don't call fpuprocrestore; let it fault in at first use */
 }
 
 int

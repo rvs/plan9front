@@ -46,34 +46,34 @@ TEXT armstart(SB), 1, $-4
 	BARRIERS
 
 	/*
-	 * turn SMP off
-	 */
-	MRC	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
-	BIC	$CpACsmp, R1
-	MCR	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
-	BARRIERS
-
-	/*
 	 * clear mach and page tables
 	 */
 	MOVW	$PADDR(MACHADDR), R1
 	MOVW	$PADDR(KTZERO), R2
-	MOVW	$0, R0
 _ramZ:
 	MOVW	R0, (R1)
 	ADD	$4, R1
 	CMP	R1, R2
-	BNE	_ramZ	
+	BNE	_ramZ
+
+	/*
+	 * turn SMP on
+	 * invalidate tlb
+	 */
+	MRC	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
+	ORR	$CpACsmp, R1		/* turn SMP on */
+	MCR	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
+	BARRIERS
+	MCR	CpSC, 0, R0, C(CpTLB), C(CpTLBinvu), CpTLBinv
+	BARRIERS
 
 	/*
 	 * start stack at top of mach (physical addr)
 	 * set up page tables for kernel
 	 */
 	MOVW	$PADDR(MACHADDR+MACHSIZE-4), R13
-
 	MOVW	$PADDR(L1), R0
 	BL	mmuinit(SB)
-	BL	mmuinvalidate(SB)
 
 	/*
 	 * set up domain access control and page table base
@@ -94,16 +94,9 @@ _ramZ:
 	BARRIERS
 
 	/*
-	 * turn SMP on
-	 */
-	MRC	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
-	ORR	$CpACsmp, R1
-	MCR	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
-	BARRIERS
-
-	/*
 	 * enable caches, mmu, and high vectors
 	 */
+
 	MRC	CpSC, 0, R0, C(CpCONTROL), C(0), CpMainctl
 	ORR	$(CpChv|CpCdcache|CpCicache|CpCmmu), R0
 	MCR	CpSC, 0, R0, C(CpCONTROL), C(0), CpMainctl
@@ -126,9 +119,6 @@ TEXT _startpg(SB), 1, $-4
 	MOVW	$1, R1
 	MCR	CpSC, 0, R1, C(CpCLD), C(CpCLDena), CpCLDenapmnc
 
-	/* first arg to main is saved R2 */
-	MOVW	R10, R0
-
 	/*
 	 * call main and loop forever if it returns
 	 */
@@ -144,10 +134,12 @@ TEXT cpureset(SB), 1, $-4
 reset:
 	/*
 	 * load physical base for SB addressing while mmu is off
+	 * keep a handy zero in R0 until first function call
 	 */
 	MOVW	$setR12(SB), R12
 	SUB	$KZERO, R12
 	ADD	$PHYSDRAM, R12
+	MOVW	$0, R0
 
 	/*
 	 * SVC mode, interrupts disabled
@@ -165,11 +157,14 @@ reset:
 	BARRIERS
 
 	/*
-	 * turn SMP off
+	 * turn SMP on
+	 * invalidate tlb
 	 */
 	MRC	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
-	BIC	$CpACsmp, R1
+	ORR	$CpACsmp, R1		/* turn SMP on */
 	MCR	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
+	BARRIERS
+	MCR	CpSC, 0, R0, C(CpTLB), C(CpTLBinvu), CpTLBinv
 	BARRIERS
 
 	/*
@@ -180,7 +175,6 @@ reset:
 	SLL	$2, R2			/* convert to word index */
 	MOVW	$machaddr(SB), R0
 	BIC	$KSEGM, R0
-	ORR	$PHYSDRAM, R0
 	ADD	R2, R0			/* R0 = &machaddr[cpuid] */
 	MOVW	(R0), R0		/* R0 = machaddr[cpuid] */
 	CMP	$0, R0
@@ -191,8 +185,6 @@ reset:
 	 * start stack at top of local Mach
 	 */
 	ADD	$(MACHSIZE-4), R(MACH), R13
-
-	BL	mmuinvalidate(SB)
 
 	/*
 	 * set up domain access control and page table base
@@ -210,14 +202,6 @@ reset:
 	 */
 	BL	cachedinv(SB)
 	BL	cacheiinv(SB)
-	BARRIERS
-
-	/*
-	 * turn SMP on
-	 */
-	MRC	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
-	ORR	$CpACsmp, R1
-	MCR	CpSC, 0, R1, C(CpCONTROL), C(0), CpAuxctl
 	BARRIERS
 
 	/*
@@ -296,14 +280,6 @@ TEXT lcycles(SB), 1, $-4
 	MRC	CpSC, 0, R0, C(CpCLD), C(CpCLDcyc), 0
 	RET
 
-TEXT splhi(SB), 1, $-4
-	MOVW	R14, 4(R(MACH))		/* save caller pc in m->splpc */
-
-	MOVW	CPSR, R0			/* turn off irqs (but not fiqs) */
-	ORR	$(PsrDirq), R0, R1
-	MOVW	R1, CPSR
-	RET
-
 TEXT splfhi(SB), 1, $-4
 	MOVW	R14, 4(R(MACH))		/* save caller pc in m->splpc */
 
@@ -315,6 +291,20 @@ TEXT splfhi(SB), 1, $-4
 TEXT splflo(SB), 1, $-4
 	MOVW	CPSR, R0			/* turn on fiqs */
 	BIC	$(PsrDfiq), R0, R1
+	MOVW	R1, CPSR
+	RET
+
+ARG=0
+LINK=14
+
+#define	MILLER_SPL
+
+#ifdef	MILLER_SPL
+TEXT splhi(SB), 1, $-4
+	MOVW	R14, 4(R(MACH))		/* save caller pc in m->splpc */
+
+	MOVW	CPSR, R0			/* turn off irqs (but not fiqs) */
+	ORR	$(PsrDirq), R0, R1
 	MOVW	R1, CPSR
 	RET
 
@@ -334,6 +324,46 @@ TEXT splx(SB), 1, $-4
 	MOVW	CPSR, R0
 	MOVW	R1, CPSR
 	RET
+#else				/* MILLER_SPL */
+TEXT splhi(SB), 1, $-4
+	MOVW	CPSR, R(ARG)
+	CPSID				/* turn off irqs (but not fiqs) */
+
+	MOVW	R(LINK), 4(R(MACH))	/* save caller pc in m->splpc */
+	AND	$(PsrDirq|PsrDfiq), R(ARG)	/* return old disable bits */
+	RET
+
+TEXT spllo(SB), 1, $-4
+	MOVW	CPSR, R(ARG)
+	BIC	$(PsrDirq|PsrDfiq), R(ARG), R1
+	MOVW	R1, CPSR		/* turn on irqs and fiqs */
+
+	MOVW	$0, R1
+	CMP.S	R1, R(MACH)
+	MOVW.NE	R1, 4(R(MACH))		/* clear m->splpc */
+
+	AND	$(PsrDirq|PsrDfiq), R(ARG)	/* return old disable bits */
+	RET
+
+TEXT splx(SB), 1, $-4
+	MOVW	CPSR, R3		/* save old CPSR */
+
+	AND	$(PsrDirq|PsrDfiq), R(ARG), R2
+	BIC	$(PsrDirq|PsrDfiq), R3
+	ORR	R2, R3
+	MOVW	R3, CPSR		/* reset interrupt level */
+
+	MOVW	$0, R4			/* assume going low */
+	AND	$(PsrDirq|PsrDfiq), R(ARG), R2
+	CMP.S	$0, R2
+	BEQ	goinglow
+	MOVW	R(LINK), R4		/* save caller pc in m->splpc */
+goinglow:
+	MOVW	R4, 4(R(MACH))		/* set or clear m->splpc */
+
+	MOVW	R3, R(ARG)
+	RET
+#endif				/* MILLER_SPL */
 
 TEXT spldone(SB), 1, $0				/* end marker for devkprof.c */
 	RET
@@ -342,25 +372,6 @@ TEXT islo(SB), 1, $-4
 	MOVW	CPSR, R0
 	AND	$(PsrDirq), R0
 	EOR	$(PsrDirq), R0
-	RET
-
-TEXT cas(SB), $0
-TEXT cmpswap(SB), $0
-	MOVW	ov+4(FP), R1
-	MOVW	nv+8(FP), R2
-spincas:
-	LDREX	(R0), R3
-	CMP.S	R3, R1
-	BNE	fail
-	STREX	R2, (R0), R4
-	CMP.S	$0, R4
-	BNE	spincas
-	MOVW	$1, R0
-	DMB
-	RET
-fail:
-	CLREX
-	MOVW	$0, R0
 	RET
 
 TEXT	tas(SB), $-4
@@ -372,12 +383,12 @@ TEXT	_tas(SB), $-4			/* _tas(ulong *) */
 	MOVW	$1,R2		/* new value of (R0) */
 	MOVW	$MAXSC, R8
 tas1:
-	LDREX (R5), R7
+	LDREX(5,7)		/* LDREX 0(R5),R7 */
 	CMP.S	$0, R7		/* old value non-zero (lock taken)? */
 	BNE	lockbusy	/* we lose */
 	SUB.S	$1, R8
 	BEQ	lockloop2
-	STREX R2,(R5),R4
+	STREX(2,5,4)		/* STREX R2,(R5),R4 */
 	CMP.S	$0, R4
 	BNE	tas1		/* strex failed? try again */
 	DMB
@@ -406,6 +417,12 @@ TEXT getcallerpc(SB), 1, $-4
 	MOVW	0(R13), R0
 	RET
 
+/*
+ * we need to use WFI here to avoid overheating the cpu(s), but without
+ * lockwake issuing IPIs (see ../teg2), we waste elapsed time here when other
+ * cpus have made work available.  this is why old mp kernels did nothing
+ * in idlehands.
+ */
 TEXT idlehands(SB), $-4
 	MOVW	CPSR, R3
 	ORR	$(PsrDirq|PsrDfiq), R3, R1		/* splfhi */
@@ -420,8 +437,7 @@ TEXT idlehands(SB), $-4
 	MOVW	R3, CPSR			/* splx */
 	RET
 
-
-TEXT coherence(SB), $-4
+TEXT coherence(SB), 1, $-4
 	BARRIERS
 	RET
 

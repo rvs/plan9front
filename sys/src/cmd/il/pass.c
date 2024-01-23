@@ -54,7 +54,8 @@ dodata(void)
 			continue;
 		v = s->value;
 		if(v == 0) {
-			diag("%s: no size", s->name);
+			// omit diag for _fltused
+			// TODO diag("%s: no size", s->name);
 			v = 1;
 		}
 		while(v & 3)
@@ -142,10 +143,10 @@ dodata(void)
 			v = s->value + p->from.offset;
 			if(v >= 0 && v <= 2*BIG)
 				continue;
-			if(!strcmp(s->name, "setSB"))
+			if(strcmp(s->name, "setSB") == 0)
 				continue;
 			/* size should be 19 max */
-			if(strlen(s->name) >= 10)	/* has loader address */ 
+			if(strlen(s->name) >= 10)	/* has loader address */
 				sprint(literal, "$%p.%lux", s, p->from.offset);
 			else
 				sprint(literal, "$%s.%d.%lux", s->name, s->version, p->from.offset);
@@ -174,7 +175,7 @@ dodata(void)
 					p->link = p1;
 					continue;
 				}
-				sprint(literal, "$%llux", vv);
+				sprint(literal, "$%#llux", vv);
 			} else {
 				if(!debug['r'])
 					continue;
@@ -187,8 +188,8 @@ dodata(void)
 					continue;
 				if((v & (BIG-1)) == 0)
 					continue;
-				/* size should be 9 max */
-				sprint(literal, "$%lux", v);
+				/* size should be 11 max */
+				sprint(literal, "$%#lux", v);
 			}
 		}
 		s = lookup(literal, 0);

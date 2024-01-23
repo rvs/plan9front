@@ -1,0 +1,10 @@
+You'll need this fix to APE:
+
+diff /n/dump/2020/0908/sys/src/ape/lib/ap/plan9/_buf.c .
+61c60
+< 		mux = (Muxseg*)_SEGATTACH(0, "shared", MUXADDR, sizeof(Muxseg));
+---
+> 		mux = (Muxseg*)_SEGATTACH(0, "shared", 0, sizeof(Muxseg));
+
+MUXADDR is ~100MB, so it would collide with the allocation
+of memory for the emulated system.

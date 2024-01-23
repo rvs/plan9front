@@ -1,0 +1,15 @@
+working:
+visionfive 2	works
+polarfire icicle works well except no pxe autoboot.  fix: newer u-boot.
+tinyemu		works, single core, sv48 or sv39, M mode, no sbi, no u-boot.
+
+discontinued:
+beagle v	works, modulo hw bugs.
+unmatched	may work, if sbi doesn't lie about hart status.
+
+broken:
+rvb-ice		wedges or ill. inst. after starting paging.  u-boot "go"
+		starts in M mode.  can't find how linux works.
+
+hopeless:
+nezha		can't pxe boot.  abandoned.  fix: better u-boot.

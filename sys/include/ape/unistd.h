@@ -1,7 +1,7 @@
 #ifndef	__UNISTD_H
 #define	__UNISTD_H
 #ifndef _POSIX_SOURCE
-#error  This header file is not defined in pure ANSI
+   This header file is not defined in pure ANSI
 #endif
 #pragma lib "/$M/lib/ape/libap.a"
 
@@ -13,14 +13,26 @@
 #define _POSIX_SYNC_IO -1
 #define _POSIX_VDISABLE -1
 
+#include "_apetypes.h"
+
 #ifndef _SIZE_T
 #define _SIZE_T
+#ifdef _BITS64
+typedef unsigned long long size_t;
+#else
 typedef unsigned long size_t;
 #endif
+#endif
+
 #ifndef _SSIZE_T
 #define _SSIZE_T
+#ifdef _BITS64
+typedef long long ssize_t;
+#else
 typedef long ssize_t;
 #endif
+#endif
+
 #ifndef NULL
 #ifndef NULL
 #ifdef __cplusplus
@@ -121,7 +133,6 @@ extern pid_t setsid(void);
 
 /* files and directories */
 extern int chdir(const char *);
-extern int chroot(const char *);
 extern int link(const char *, const char *);
 extern char *getcwd(char *, size_t);
 extern int unlink(const char *);

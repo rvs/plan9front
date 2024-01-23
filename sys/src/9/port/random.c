@@ -5,143 +5,139 @@
 #include	"fns.h"
 #include	"../port/error.h"
 
-#include	<libsec.h>
 
-/* machine specific hardware random number generator */
-void (*hwrandbuf)(void*, ulong) = nil;
-
-static struct
+struct Rb
 {
 	QLock;
-	Chachastate;
-} *rs;
+	Rendez	producer;
+	Rendez	consumer;
+	ulong	randomcount;
+	uchar	buf[1024];
+	uchar	*ep;
+	uchar	*rp;
+	uchar	*wp;
+	uchar	next;
+	uchar	wakeme;
+	ushort	bits;
+	ulong	randn;
+} rb;
 
-typedef struct Seedbuf Seedbuf;
-struct Seedbuf
+static int
+rbnotfull(void*)
 {
-	ulong		randomcount;
-	uchar		buf[64];
-	uchar		nbuf;
-	uchar		next;
-	ushort		bits;
+	int i;
 
-	SHA2_512state	ds;
-};
+	if (active.exiting)
+		return 1;		/* don't sleep */
+	i = rb.rp - rb.wp;
+	return i != 1 && i != (1 - sizeof(rb.buf));
+}
 
-static void
-randomsample(Ureg*, Timer *t)
+static int
+rbnotempty(void*)
 {
-	Seedbuf *s = t->ta;
-
-	if(s->randomcount == 0 || s->nbuf >= sizeof(s->buf))
-		return;
-	s->bits = (s->bits<<2) ^ s->randomcount;
-	s->randomcount = 0;
-	if(++s->next < 8/2)
-		return;
-	s->next = 0;
-	s->buf[s->nbuf++] ^= s->bits;
+	return rb.wp != rb.rp;
 }
 
 static void
-randomseed(void*)
+genrandom(void*)
 {
-	Seedbuf *s;
+	up->basepri = 2;		/* don't hog the cpu at start-up */
+	up->priority = up->basepri;
 
-	s = secalloc(sizeof(Seedbuf));
-
-	if(hwrandbuf != nil)
-		(*hwrandbuf)(s->buf, sizeof(s->buf));
-
-	/* Frequency close but not equal to HZ */
-	up->tns = (vlong)(MS2HZ+3)*1000000LL;
-	up->tmode = Tperiodic;
-	up->tt = nil;
-	up->ta = s;
-	up->tf = randomsample;
-	timeradd(up);
-	while(s->nbuf < sizeof(s->buf)){
-		if(++s->randomcount <= 100000)
-			continue;
-		if(anyhigher())
+	while (!active.exiting){
+		while (++rb.randomcount <= 100000)
+			;
+		if (active.exiting)
+			break;
+		if(up && anyhigher())
 			sched();
+		if(!rbnotfull(0))
+			sleep(&rb.producer, rbnotfull, 0);
 	}
-	timerdel(up);
-
-	sha2_512(s->buf, sizeof(s->buf), s->buf, &s->ds);
-	setupChachastate(rs, s->buf, 32, s->buf+32, 12, 20);
-	qunlock(rs);
-
-	secfree(s);
-
 	pexit("", 1);
+}
+
+/*
+ *  produce random bits in a circular buffer
+ */
+static void
+randomclock(void)
+{
+	if(rb.randomcount == 0 || !rbnotfull(0))
+		return;
+
+	rb.bits = (rb.bits<<2) ^ rb.randomcount;
+	rb.randomcount = 0;
+
+	rb.next++;
+	if(rb.next != 8/2)
+		return;
+	rb.next = 0;
+
+	*rb.wp ^= rb.bits;
+	if(rb.wp+1 == rb.ep)
+		rb.wp = rb.buf;
+	else
+		rb.wp = rb.wp+1;
+
+	if(rb.wakeme)
+		wakeup(&rb.consumer);
 }
 
 void
 randominit(void)
 {
-	rs = secalloc(sizeof(*rs));
-	qlock(rs);	/* randomseed() unlocks once seeded */
-	kproc("randomseed", randomseed, nil);
+	/* Frequency close but not equal to HZ */
+	addclock0link(randomclock, 13);
+	rb.ep = rb.buf + sizeof(rb.buf);
+	rb.rp = rb.wp = rb.buf;
+	kproc("genrandom", genrandom, 0);
 }
 
+/*
+ *  consume random bytes from a circular buffer
+ */
 ulong
-randomread(void *p, ulong n)
+randomread(void *xp, ulong n)
 {
-	Chachastate c;
+	uchar *e, *p;
+	ulong x;
 
-	if(n == 0)
-		return 0;
+	p = xp;
 
-	if(hwrandbuf != nil)
-		(*hwrandbuf)(p, n);
-
-	/* copy chacha state, rekey and increment iv */
-	qlock(rs);
-	c = *rs;
-	chacha_encrypt((uchar*)&rs->input[4], 32, &c);
-	if(++rs->input[13] == 0)
-		if(++rs->input[14] == 0)
-			++rs->input[15];
-	qunlock(rs);
-
-	/* encrypt the buffer, can fault */
-	chacha_encrypt((uchar*)p, n, &c);
-
-	/* prevent state leakage */
-	memset(&c, 0, sizeof(c));
-
-	return n;
-}
-
-/* used by fastrand() */
-void
-genrandom(uchar *p, int n)
-{
-	randomread(p, n);
-}
-
-/* used by rand(),nrand() */
-long
-lrand(void)
-{
-	/* xoroshiro128+ algorithm */
-	static int seeded = 0;
-	static uvlong s[2];
-	static Lock lk;
-	ulong r;
-
-	if(seeded == 0){
-		randomread(s, sizeof(s));
-		seeded = (s[0] | s[1]) != 0;
+	if(waserror()){
+		qunlock(&rb);
+		nexterror();
 	}
 
-	lock(&lk);
-	r = (s[0] + s[1]) >> 33;
-	s[1] ^= s[0];
- 	s[0] = (s[0] << 55 | s[0] >> 9) ^ s[1] ^ (s[1] << 14);
- 	s[1] = (s[1] << 36 | s[1] >> 28);
-	unlock(&lk);
+	qlock(&rb);
+	for(e = p + n; p < e; ){
+		if(rb.wp == rb.rp){
+			rb.wakeme = 1;
+			wakeup(&rb.producer);
+			sleep(&rb.consumer, rbnotempty, 0);
+			rb.wakeme = 0;
+			continue;
+		}
 
- 	return r;
+		/*
+		 *  beating clocks will be predictable if
+		 *  they are synchronized.  Use a cheap pseudo-
+		 *  random number generator to obscure any cycles.
+		 */
+		x = rb.randn*1103515245 ^ *rb.rp;
+		*p++ = rb.randn = x;
+
+		if(rb.rp+1 == rb.ep)
+			rb.rp = rb.buf;
+		else
+			rb.rp = rb.rp+1;
+	}
+	qunlock(&rb);
+	poperror();
+
+	wakeup(&rb.producer);
+
+	return n;
 }

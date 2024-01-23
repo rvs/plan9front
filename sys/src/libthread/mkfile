@@ -8,6 +8,7 @@ OFILES=\
 	chanprint.$O\
 	create.$O\
 	debug.$O\
+	dial.$O\
 	exec.$O\
 	exit.$O\
 	id.$O\
@@ -20,7 +21,6 @@ OFILES=\
 	ioreadn.$O\
 	iosleep.$O\
 	iowrite.$O\
-	ioflush.$O\
 	kill.$O\
 	lib.$O\
 	main.$O\
@@ -71,10 +71,7 @@ UPDATE=mkfile\
 	$CFILES\
 	$SFILES\
 
-all:V:	$LIB sched.$objtype.acid channel.$objtype.acid
-
-spim.$O:	mips.c
-	$CC $CFLAGS -o $target mips.c
+all:V:	$LIB sched.acid channel.acid
 
 </sys/src/cmd/mksyslib
 

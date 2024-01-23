@@ -725,8 +725,8 @@ Machdata riscvmach =
 	riscframe,		/* Frame finder */
 	riscvexcep,		/* print exception */
 	0,				/* breakpoint fixup */
-	0,				/* single precision float printer */
-	0,				/* double precisioin float printer */
+	leieeesftos,		/* single precision float printer */
+	leieeedftos,		/* double precision float printer */
 	riscvfoll,		/* following addresses */
 	riscvdas,		/* symbolic disassembly */
 	riscvhexinst,	/* hex disassembly */
@@ -745,8 +745,8 @@ Machdata riscv64mach =
 	riscframe,		/* Frame finder */
 	riscvexcep,		/* print exception */
 	0,				/* breakpoint fixup */
-	0,				/* single precision float printer */
-	0,				/* double precisioin float printer */
+	leieeesftos,		/* single precision float printer */
+	leieeedftos,		/* double precision float printer */
 	riscvfoll,		/* following addresses */
 	riscv64das,		/* symbolic disassembly */
 	riscvhexinst,	/* hex disassembly */

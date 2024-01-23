@@ -6,8 +6,8 @@
 #include "io.h"
 #include "../port/error.h"
 #include "../port/netif.h"
-#include "../port/etherif.h"
 
+#include "etherif.h"
 #include "ether8390.h"
 
 /*
@@ -27,7 +27,7 @@ enum {					/* 83C584 Bus Interface Controller */
 	Ijr		= 0x06,		/* Initialisation Jumpers */
 	Gp2		= 0x07,		/* General Purpose Data Register */
 	Lar		= 0x08,		/* LAN Address Registers */
-	Id		= 0x0E,		/* Card ID byte */
+	Cid		= 0x0E,		/* Card ID byte */
 	Cksum		= 0x0F,		/* Checksum */
 };
 
@@ -38,7 +38,7 @@ enum {					/* Msr */
 
 enum {					/* Icr */
 	Bit16		= 0x01,		/* 16-bit bus */
-	Other		= 0x02,		/* other register access */
+//	Other		= 0x02,		/* other register access (unused) */
 	Ir2		= 0x04,		/* IR2 */
 	Msz		= 0x08,		/* SRAM size */
 	Rla		= 0x10,		/* recall LAN address */
@@ -88,7 +88,7 @@ reset8003(Ether* ether, uchar ea[Eaddrlen], uchar ic[8])
 	 */
 	if(memcmp(&ea[1], &ic[1], 5) == 0){
 		memset(ic, 0, sizeof(ic));
-		ic[Msr] = (ether->mem>>13) & 0x3F;
+		ic[Msr] = (((ulong)ether->mem)>>13) & 0x3F;
 	}
 	else{
 		/*
@@ -100,7 +100,7 @@ reset8003(Ether* ether, uchar ea[Eaddrlen], uchar ic[8])
 		inb(port+Msr);				/* wiggle bus */
 		if(inb(port+Gp2) != 0xAA){
 			memset(ic, 0, sizeof(ic));
-			ic[Msr] = (ether->mem>>13) & 0x3F;
+			ic[Msr] = (((ulong)ether->mem)>>13) & 0x3F;
 		}
 		else
 			ether->irq = irq8003[((ic[Irr]>>5) & 0x3)|(ic[Icr] & 0x4)];
@@ -122,7 +122,7 @@ reset8003(Ether* ether, uchar ea[Eaddrlen], uchar ic[8])
 			ctlr->width = 1;
 	}
 
-	ether->mem = (ic[Msr] & 0x3F)<<13;
+	ether->mem = (ulong)KADDR((ic[Msr] & 0x3F)<<13);
 	if(ctlr->width == 2)
 		ether->mem |= (ic[Laar] & 0x1F)<<19;
 	else
@@ -163,7 +163,7 @@ reset8216(Ether* ether, uchar[8])
 	irq = inb(port+0x0D);
 	outb(port+Hcr, hcr);
 
-	ether->mem = 0xC0000+((((addr>>2) & 0x30)|(addr & 0x0F))<<13);
+	ether->mem = (ulong)KADDR(0xC0000+((((addr>>2) & 0x30)|(addr & 0x0F))<<13));
 	ether->size = 8192*(1<<((addr>>4) & 0x03));
 	ether->irq = irq8216[((irq>>4) & 0x04)|((irq>>2) & 0x03)];
 
@@ -220,7 +220,7 @@ reset(Ether* ether)
 		sum += ea[i];
 		ic[i] = inb(port+i);
 	}
-	id = inb(port+Id);
+	id = inb(port+Cid);
 	sum += id;
 	sum += inb(port+Cksum);
 	if(sum != 0xFF){
@@ -228,13 +228,10 @@ reset(Ether* ether)
 		return -1;
 	}
 
-	ctlr = malloc(sizeof(Dp8390));
-	if(ctlr == nil){
-		print("ether8003: can't allocate memory\n");
-		iofree(ether->port);
-		return -1;
-	}
-	ether->ctlr = ctlr;
+	ether->ctlr = malloc(sizeof(Dp8390));
+	ctlr = ether->ctlr;
+	if(ctlr == nil)
+		error(Enomem);
 	ctlr->ram = 1;
 
 	if((id & 0xFE) == 0x2A)
@@ -262,8 +259,9 @@ reset(Ether* ether)
 	}
 	dp8390setea(ether);
 
-	if(umballoc(ether->mem, ether->size, 0) == -1)
-		print("ether8003: warning - 0x%luX unavailable\n", ether->mem);
+	if(umbrwmalloc(PADDR(ether->mem), ether->size, 0) == 0)
+		print("ether8003: warning - 0x%luX unavailable\n",
+			PADDR(ether->mem));
 
 	return 0;
 }

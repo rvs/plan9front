@@ -121,19 +121,18 @@ loopbackattach(char *spec)
 	Queue *q;
 	Chan *c;
 	int chan;
-	ulong dev;
+	int dev;
 
-	dev = strtoul(spec, nil, 10);
-	if(dev >= Nloopbacks)
-		error(Enodev);
-
-	c = devattach(loopbackdevtab.dc, spec);
-	if(waserror()){
-		chanfree(c);
-		nexterror();
+	dev = 0;
+	if(spec != nil){
+		dev = atoi(spec);
+		if(dev >= Nloopbacks)
+			error(Ebadspec);
 	}
 
+	c = devattach('X', spec);
 	lb = &loopbacks[dev];
+
 	qlock(lb);
 	if(waserror()){
 		lb->ref--;
@@ -169,8 +168,6 @@ loopbackattach(char *spec)
 	poperror();
 	qunlock(lb);
 
-	poperror();
-
 	mkqid(&c->qid, QID(0, Qtopdir), 0, QTDIR);
 	c->aux = lb;
 	c->dev = dev;
@@ -189,7 +186,7 @@ loopbackgen(Chan *c, char*, Dirtab*, int, int i, Dir *dp)
 		switch(type){
 		case Qtopdir:
 		case Qloopdir:
-			snprint(up->genbuf, sizeof(up->genbuf), "#λ%ld", c->dev);
+			snprint(up->genbuf, sizeof(up->genbuf), "#X%ld", c->dev);
 			mkqid(&qid, QID(0, Qtopdir), 0, QTDIR);
 			devdir(c, qid, up->genbuf, 0, eve, 0555, dp);
 			break;
@@ -546,13 +543,23 @@ loopbackwrite(Chan *c, void *va, long n, vlong off)
 }
 
 static long
-loopoput(Loop *lb, Link *link, Block *bp)
+loopoput(Loop *lb, Link *link, Block *volatile bp)
 {
-	long n = BLEN(bp);
+	long n;
 
+	n = BLEN(bp);
+
+	/* make it a single block with space for the loopback timing header */
+	if(waserror()){
+		freeb(bp);
+		nexterror();
+	}
 	bp = padblock(bp, Tmsize);
+	if(bp->next)
+		bp = concatblock(bp);
 	if(BLEN(bp) < lb->minmtu)
 		bp = adjustblock(bp, lb->minmtu);
+	poperror();
 	ptime(bp->rp, todget(nil));
 
 	link->packets++;
@@ -715,7 +722,7 @@ gtime(uchar *p)
 }
 
 Dev loopbackdevtab = {
-	L'λ',
+	'X',
 	"loopback",
 
 	devreset,

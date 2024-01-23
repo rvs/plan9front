@@ -17,13 +17,25 @@
 #define PsrMsys		0x0000001F	/* `privileged user mode for OS' (trustzone) */
 #define PsrMask		0x0000001F
 
+#define PsrThumb	0x00000020		/* beware hammers */
 #define PsrDfiq		0x00000040		/* disable FIQ interrupts */
 #define PsrDirq		0x00000080		/* disable IRQ interrupts */
+#define PsrDasabt	0x00000100		/* disable asynch aborts */
+#define PsrBigend	0x00000200		/* E: big-endian data */
+
+#define PsrGe		0x000f0000		/* `>=' bits */
+#define PsrMbz20	0x00f00000		/* MBZ: 20 - 23 */
+#define PsrJaz		0x01000000		/* java mode */
+#define PsrIT		0x0600fc00		/* IT: if-then thumb state */
+#define PsrQ		0x08000000		/* cumulative saturation */
 
 #define PsrV		0x10000000		/* overflow */
 #define PsrC		0x20000000		/* carry/borrow/extend */
 #define PsrZ		0x40000000		/* zero */
 #define PsrN		0x80000000		/* negative/less than */
+
+/* these bits must be 0 */
+#define PsrMbz		(PsrQ|PsrJaz|PsrMbz20|PsrThumb|PsrBigend|PsrDasabt)
 
 /* instruction decoding */
 #define ISCPOP(op)	((op) == 0xE || ((op) & ~1) == 0xC)
@@ -123,7 +135,6 @@
 #define CpCha		(1<<17)		/* HA: hw access flag enable */
 #define CpCdz		(1<<19)		/* DZ: divide by zero fault enable */
 #define CpCfi		(1<<21)		/* FI: fast intrs */
-#define CpCxp		(1<<23)		/* XP: subpage AP bits disabled */
 #define CpCve		(1<<24)		/* VE: intr vectors enable */
 #define CpCee		(1<<25)		/* EE: exception endianness */
 #define CpCnmfi		(1<<27)		/* NMFI: non-maskable fast intrs. */
@@ -281,6 +292,7 @@
 #define Coarse		(Mbz|1)			/* L1 */
 #define Section		(Mbz|2)			/* L1 1MB */
 #define Fine		(Mbz|3)			/* L1 */
+#define Super		(1<<18)			/* L1 16MB */
 
 #define Large		0x00000001		/* L2 64KB */
 #define Small		0x00000002		/* L2 4KB */
@@ -291,10 +303,9 @@
 
 #define L1wralloc	(1<<12)			/* L1 TEX */
 #define L1sharable	(1<<16)
-#define L1noexec	(1<<4)
+#define	L1noexec	(1<<4)
 #define L2wralloc	(1<<6)			/* L2 TEX (small pages) */
 #define L2sharable	(1<<10)
-#define L2noexec	(1<<0)			/* L2 XN (small pages) */
 
 /* attributes for memory containing locks -- differs between armv6 and armv7 */
 //#define L1ptedramattrs	(Cached | Buffered | L1wralloc | L1sharable)
@@ -310,8 +321,11 @@
 
 #define F(v, o, w)	(((v) & ((1<<(w))-1))<<(o))
 #define AP(n, v)	F((v), ((n)*2)+4, 2)
-#define L1AP(ap)	AP(3, (ap))
-#define L2AP(ap)	AP(0, (ap))
+#define L1AP(ap)	(AP(3, (ap)))
+/* L2AP differs between armv6 and armv7 -- see l2ap in arch*.c */
 #define DAC(n, v)	F((v), (n)*2, 2)
 
 #define HVECTORS	0xffff0000
+#define NREGS		15	/* general-purpose regs, R0 through R14 */
+#define RFEV7W(r)   WORD $(0xf8900a00 | (r) << 16 | OP_WB)	/* RFE.W */
+#define OP_WB 0x00200000	/* .W: `write-back updated register' bit */

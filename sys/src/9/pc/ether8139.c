@@ -9,10 +9,10 @@
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "../port/pci.h"
 #include "../port/error.h"
 #include "../port/netif.h"
-#include "../port/etherif.h"
+
+#include "etherif.h"
 
 enum {					/* registers */
 	Idr0		= 0x0000,	/* MAC address */
@@ -171,7 +171,7 @@ enum {					/* Tsd0 */
 
 enum {
 	Rblen		= Rblen64K,	/* Receive Buffer Length */
-	Ntd		= 4,		/* Number of Transmit Descriptors */
+	Ntd		= 32,		/* Number of Transmit Descriptors */
 	Tdbsz		= ROUNDUP(sizeof(Etherpkt), 4),
 };
 
@@ -310,7 +310,9 @@ rtl8139ifstat(Ether* edev, void* a, long n, ulong offset)
 	Ctlr *ctlr;
 
 	ctlr = edev->ctlr;
-	p = smalloc(READSTR);
+	p = malloc(READSTR);
+	if(p == nil)
+		error(Enomem);
 	l = snprint(p, READSTR, "rcr %#8.8ux\n", ctlr->rcr);
 	l += snprint(p+l, READSTR-l, "multicast %ud\n", ctlr->mcast);
 	l += snprint(p+l, READSTR-l, "ierrs %d\n", ctlr->ierrs);
@@ -349,6 +351,11 @@ rtl8139reset(Ctlr* ctlr)
 {
 	int timeo;
 
+	/* stop interrupts */
+	csr16w(ctlr, Imr, 0);
+	csr16w(ctlr, Isr, ~0);
+	csr32w(ctlr, TimerInt, 0);
+
 	/*
 	 * Soft reset the controller.
 	 */
@@ -370,6 +377,7 @@ rtl8139halt(Ctlr* ctlr)
 	csr8w(ctlr, Cr, 0);
 	csr16w(ctlr, Imr, 0);
 	csr16w(ctlr, Isr, ~0);
+	csr32w(ctlr, TimerInt, 0);
 
 	for(i = 0; i < Ntd; i++){
 		if(ctlr->td[i].bp == nil)
@@ -377,6 +385,18 @@ rtl8139halt(Ctlr* ctlr)
 		freeb(ctlr->td[i].bp);
 		ctlr->td[i].bp = nil;
 	}
+}
+
+static void
+rtl8139shutdown(Ether *edev)
+{
+	Ctlr *ctlr;
+
+	ctlr = edev->ctlr;
+	ilock(&ctlr->ilock);
+	rtl8139halt(ctlr);
+	rtl8139reset(ctlr);
+	iunlock(&ctlr->ilock);
 }
 
 static void
@@ -403,7 +423,7 @@ rtl8139init(Ether* edev)
 	/*
 	 * Receiver
 	 */
-	alloc = ctlr->alloc;
+	alloc = (uchar*)ROUNDUP((ulong)ctlr->alloc, 32);
 	ctlr->rbstart = alloc;
 	alloc += ctlr->rblen+16;
 	memset(ctlr->rbstart, 0, ctlr->rblen+16);
@@ -424,13 +444,6 @@ rtl8139init(Ether* edev)
 	ctlr->etxth = 128/32;
 
 	/*
-	 * Interrupts.
-	 */
-	csr32w(ctlr, TimerInt, 0);
-	csr16w(ctlr, Imr, Serr|Timerbit|Fovw|PunLc|Rxovw|Ter|Tok|Rer|Rok);
-	csr32w(ctlr, Mpc, 0);
-
-	/*
 	 * Enable receiver/transmitter.
 	 * Need to enable before writing the Rcr or it won't take.
 	 */
@@ -441,6 +454,13 @@ rtl8139init(Ether* edev)
 	csr32w(ctlr, Mar0+4, 0);
 	ctlr->mchash = 0;
 
+	/*
+	 * Interrupts.
+	 */
+	csr32w(ctlr, TimerInt, 0);
+	csr16w(ctlr, Imr, Serr|Timerbit|Fovw|PunLc|Rxovw|Ter|Tok|Rer|Rok);
+	csr32w(ctlr, Mpc, 0);
+
 	iunlock(&ctlr->ilock);
 }
 
@@ -449,12 +469,20 @@ rtl8139attach(Ether* edev)
 {
 	Ctlr *ctlr;
 
+	if(edev == nil) {
+		print("rtl8139attach: nil edev\n");
+		return;
+	}
 	ctlr = edev->ctlr;
+	if(ctlr == nil) {
+		print("rtl8139attach: nil ctlr for Ether %#p\n", edev);
+		return;
+	}
 	qlock(&ctlr->alock);
 	if(ctlr->alloc == nil){
 		ctlr->rblen = 1<<((Rblen>>RblenSHIFT)+13);
-		ctlr->alloc = mallocalign(ctlr->rblen+16 + Ntd*Tdbsz, 32, 0, 0);
-		if(ctlr->alloc == nil){
+		ctlr->alloc = malloc(ctlr->rblen+16 + Ntd*Tdbsz + 32);
+		if(ctlr->alloc == nil) {
 			qunlock(&ctlr->alock);
 			error(Enomem);
 		}
@@ -479,7 +507,7 @@ rtl8139txstart(Ether* edev)
 		size = BLEN(bp);
 
 		td = &ctlr->td[ctlr->tdh];
-		if(((uintptr)bp->rp) & 0x03){
+		if(((int)bp->rp) & 0x03){
 			memmove(td->data, bp->rp, size);
 			freeb(bp);
 			csr32w(ctlr, td->tsad, PCIWADDR(td->data));
@@ -523,6 +551,8 @@ rtl8139receive(Ether* edev)
 	 * Capr is where the host is reading from,
 	 * Cbr is where the NIC is currently writing.
 	 */
+	if(ctlr->rblen == 0)
+		return;		/* not attached yet (shouldn't happen) */
 	capr = (csr16r(ctlr, Capr)+16) % ctlr->rblen;
 	while(!(csr8r(ctlr, Cr) & Bufe)){
 		p = ctlr->rbstart+capr;
@@ -584,7 +614,7 @@ rtl8139receive(Ether* edev)
 				bp->wp += length;
 			}
 			bp->wp -= 4;
-			etheriq(edev, bp);
+			etheriq(edev, bp, 1);
 		}
 
 		capr = ROUNDUP(capr, 4);
@@ -592,7 +622,7 @@ rtl8139receive(Ether* edev)
 	}
 }
 
-static void
+static int
 rtl8139interrupt(Ureg*, void* arg)
 {
 	Td *td;
@@ -602,9 +632,20 @@ rtl8139interrupt(Ureg*, void* arg)
 
 	edev = arg;
 	ctlr = edev->ctlr;
+	if(ctlr == nil) {	/* not attached yet? (shouldn't happen) */
+		print("rtl8139interrupt: interrupt for unattached Ether %#p\n",
+			edev);
+		return Intrnotforme;
+	}
 
 	while((isr = csr16r(ctlr, Isr)) != 0){
 		csr16w(ctlr, Isr, isr);
+		if(ctlr->alloc == nil) {
+			print("rtl8139interrupt: interrupt for unattached Ctlr "
+				"%#p port %#p\n", ctlr, (void *)ctlr->port);
+			/* not attached yet (shouldn't happen) */
+			return Intrnotforme;
+		}
 		if(isr & (Fovw|PunLc|Rxovw|Rer|Rok)){
 			rtl8139receive(edev);
 			if(!(isr & Rok))
@@ -675,6 +716,7 @@ rtl8139interrupt(Ureg*, void* arg)
 				rtl8139init(edev);
 		}
 	}
+	return Intrunconverted;
 }
 
 static Ctlr*
@@ -682,7 +724,7 @@ rtl8139match(Ether* edev, int id)
 {
 	Pcidev *p;
 	Ctlr *ctlr;
-	int port;
+	int i, port;
 
 	/*
 	 * Any adapter matches if no edev->port is supplied,
@@ -694,7 +736,7 @@ rtl8139match(Ether* edev, int id)
 		p = ctlr->pcidev;
 		if(((p->did<<16)|p->vid) != id)
 			continue;
-		port = p->mem[0].bar & ~3;
+		port = p->mem[0].bar & ~0x01;
 		if(edev->port != 0 && edev->port != port)
 			continue;
 
@@ -702,10 +744,20 @@ rtl8139match(Ether* edev, int id)
 			print("rtl8139: port %#ux in use\n", port);
 			continue;
 		}
-		pcienable(p);
+
+		if(pcigetpms(p) > 0){
+			pcisetpms(p, 0);
+	
+			for(i = 0; i < 6; i++)
+				pcicfgw32(p, PciBAR0+i*4, p->mem[i].bar);
+			pcicfgw8(p, PciINTL, p->intl);
+			pcicfgw8(p, PciLTR, p->ltr);
+			pcicfgw8(p, PciCLS, p->cls);
+			pcicfgw16(p, PciPCR, p->pcr);
+		}
+
 		ctlr->port = port;
 		if(rtl8139reset(ctlr)) {
-			pcidisable(p);
 			iofree(port);
 			continue;
 		}
@@ -746,10 +798,8 @@ rtl8139pnp(Ether* edev)
 			if(p->ccrb != 0x02 || p->ccru != 0)
 				continue;
 			ctlr = malloc(sizeof(Ctlr));
-			if(ctlr == nil){
-				print("rtl8139: can't allocate memory\n");
-				continue;
-			}
+			if(ctlr == nil)
+				error(Enomem);
 			ctlr->pcidev = p;
 			ctlr->id = (p->did<<16)|p->vid;
 
@@ -805,16 +855,15 @@ rtl8139pnp(Ether* edev)
 		edev->ea[5] = i>>8;
 	}
 
+	edev->arg = edev;
 	edev->attach = rtl8139attach;
 	edev->transmit = rtl8139transmit;
+	edev->interrupt = rtl8139interrupt;
 	edev->ifstat = rtl8139ifstat;
 
-	edev->arg = edev;
 	edev->promiscuous = rtl8139promiscuous;
 	edev->multicast = rtl8139multicast;
-//	edev->shutdown = rtl8139shutdown;
-
-	intrenable(edev->irq, rtl8139interrupt, edev, edev->tbdf, edev->name);
+	edev->shutdown = rtl8139shutdown;
 
 	/*
 	 * This should be much more dynamic but will do for now.

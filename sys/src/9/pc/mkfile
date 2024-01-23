@@ -1,16 +1,16 @@
-CONF=pc
-CONFLIST=pc pcf pccpuf
-EXTRACOPIES=
-#EXTRACOPIES=lookout boundary	# copy to these servers on install
+CONF=pccpu
+CONFLIST=pc pccpu pcfs pccpuf
+CRAPLIST=pccd pcflop
+VENTILIST=pccpuf pcf pcfs
+EXTRACOPIES=fsstand
 
 objtype=386
 </$objtype/mkfile
 p=9
 
-# must match mem.h
-KTZERO=0xF0100020
-APBOOTSTRAP=0xF0007000
-REBOOTADDR=0x11000
+# KZERO & APBOOTSTRAP must match def'ns in mem.h
+KZERO=0xE0000000
+KTZEROP=0x100020
 
 DEVS=`{rc ../port/mkdevlist $CONF}
 
@@ -19,13 +19,15 @@ PORT=\
 	alloc.$O\
 	allocb.$O\
 	auth.$O\
+	awaitbit.$O\
+	byteserial.$O\
 	cache.$O\
 	chan.$O\
 	dev.$O\
 	edf.$O\
 	fault.$O\
-	iomap.$O\
-	memmap.$O\
+	latin1.$O\
+	logpow.$O\
 	page.$O\
 	parse.$O\
 	pgrp.$O\
@@ -34,59 +36,64 @@ PORT=\
 	proc.$O\
 	qio.$O\
 	qlock.$O\
-	random.$O\
 	rdb.$O\
 	rebootcmd.$O\
 	segment.$O\
-	syscallfmt.$O\
+	sum.$O\
+	swap.$O\
 	sysfile.$O\
 	sysproc.$O\
 	taslock.$O\
 	tod.$O\
+	watermarks.$O\
 	xalloc.$O\
-	userinit.$O\
 
 OBJ=\
 	l.$O\
+	plan9l.$O\
+	apu.$O\
 	cga.$O\
-	fpu.$O\
+	fp.$O\
 	i8253.$O\
 	i8259.$O\
+	kbd.$O\
 	main.$O\
+	memmap.$O\
 	memory.$O\
 	mmu.$O\
-	irq.$O\
+	mmudebug.$O\
+	mtrr.$O\
+	multiboot.$O\
+	random.$O\
+	syscall.$O\
+	syscallfmt.$O\
 	trap.$O\
-	bootargs.$O\
 	$CONF.root.$O\
 	$CONF.rootc.$O\
 	$DEVS\
 	$PORT\
 
-LIB=\
-	/$objtype/lib/libmemlayer.a\
-	/$objtype/lib/libmemdraw.a\
-	/$objtype/lib/libdraw.a\
-	/$objtype/lib/libip.a\
-	/$objtype/lib/libc.a\
-	/$objtype/lib/libsec.a\
-	/$objtype/lib/libmp.a\
-	/$objtype/lib/libfis.a\
-	/$objtype/lib/libaml.a\
-	/$objtype/lib/libdtracy.a\
-
 ETHER=`{echo devether.c ether*.c | sed 's/\.c/.'$O'/g'}
-AUDIO=`{echo devaudio.c audio*.c | sed 's/\.c/.'$O'/g'}
 VGA=`{echo devvga.c screen.c vga*.c | sed 's/\.c/.'$O'/g'}
-SDEV=`{echo sd*.c | sed 's/\.c/.'$O'/g'}
+SDEV=`{echo devsd.c sd*.c | sed 's/\.c/.'$O'/g'}
 
-$p$CONF:	$OBJ $CONF.$O $LIB
-	$LD -o $target -T$KTZERO -l $prereq
+#	echo -n elf kernel...
+#	$LD -o $target.elf -PH5 -R4096 -T$KTZERO -F$KTZEROP $OBJ $CONF.$O
+$p$CONF: $CONF.c $OBJ $LIB /$objtype/expand-pxe /$objtype/expand-pbs acid
+	$CC $CFLAGS '-DKERNDATE='`{date -n} $CONF.c
+	# this KTZERO sits after the a.out header, unlike mem.h's
+	KTZERO=`{echo $KZERO+$KTZEROP'=X' | dbcalc}
+	$LD -o $target -T$KTZERO $OBJ $CONF.$O
 	size $target
+	echo -n self-decompressing kernel...
+	{ cat /$objtype/expand-pxe; strzip <$target } >$target^lz
+	echo
 
 # don't strip the gzipped kernels -- too frustrating when that's all you have!
 $p%.gz:D:	$p%
 	gzip -9 <$p$stem >$p$stem.gz
+$p%.lz:D:	$p%
+	lzip -9 <$p$stem >$p$stem.lz
 
 
 # pcflop and pccd need all the space they can get
@@ -96,76 +103,84 @@ $p%.gz:D:	$p%
 9pccd.gz:D: 9pccd
 	strip -o /fd/1 9pccd | gzip -9 >9pccd.gz
 
+/$objtype/expand-pxe /$objtype/expand-pbs: ../pcexp/expand.c ../pcexp/expand.l.s \
+	../pcexp/mem.h ../pcexp/a20.c ../pcexp/bios.s ../pcexp/cga.c ../pcexp/print.c
+	@ { cd ../pcexp && mk install}
 
-install:V:	$p$CONF
-	cp $p$CONF /$objtype/
+# we don't need gzipped kernels otherwise, so don't make them
+install:V:	$p$CONF	# $p$CONF^lz
+	cp -x $p$CONF /$objtype/ &
+	if (test `{ls -s $p$CONF^lz | awk '{print $1}'} -lt 640)
+		cp -x $p$CONF^lz /$objtype/ &
 	for(i in $EXTRACOPIES)
-		import $i / /n/$i && cp $p$CONF $p$CONF.gz /n/$i/$objtype/
+		{ 9fs $i && cp -x $p$CONF $p$CONF^lz /n/$i/$objtype && echo -n $i... & }
+	wait
+	echo
 
 <../boot/bootmkfile
 <../port/portmkfile
 <|../port/mkbootrules $CONF
 
-$ETHER: 			../port/etherif.h ../port/netif.h
-$AUDIO:				../port/audioif.h
+l.$O:				lreal.s
+$ETHER: 			etherif.h ../port/netif.h
 ether8003.$O ether8390.$O:	ether8390.h
-etheryuk.$O:			yukdump.h
 $VGA mouse.$O:			screen.h /sys/include/memdraw.h
-vgavesa.$O:			/386/include/ureg.h
-devfloppy.$O: 			floppy.h
-mp.$O:				apbootstrap.i
+
+#devfloppy.$O: 			floppy.h
+archmp.$O mp.$O:		apbootstrap.h
 apic.$O archmp.$O mp.$O:	mp.h
-squidboy.$O:			mp.h
-$SDEV pmmc.$O:			../port/sd.h
-sd53c8xx.$O:			sd53c8xx.i
-sdiahci.$O:			ahci.h ../port/led.h
+$SDEV:				../port/sd.h
+sd53c8xx.$O:			sd53c8xx-fw.h
 devaoe.$O sdaoe.$O:		../port/aoe.h
-main.$O:			rebootcode.i
+main.$O:			init.h reboot.h
+memory.$O memmap.$O multiboot.$O: memmap.h multiboot.h
 wavelan.$O:			wavelan.c ../pc/wavelan.c ../pc/wavelan.h
 etherwavelan.$O:		etherwavelan.c ../pc/wavelan.h
-devusb.$O usbuhci.$O usbohci.$O usbehci.$O usbehcipc.$O usbxhci.$O: ../port/usb.h
-usbehci.$O usbehcipc.$O:	usbehci.h
-trap.$O main.$O:		/sys/include/tos.h
-uartaxp.$O:			uartaxp.i
-ether8169.$O:			../port/ethermii.h
-etherdp83820.$O:		../port/ethermii.h
-etherigbe.$O:			../port/ethermii.h
-ethervgbe.$O:			../port/ethermii.h
-ethervt6102.$O:			../port/ethermii.h
-ethervt6105m.$O:		../port/ethermii.h
-etherm10g.$O:			etherm10g2k.i etherm10g4k.i
-etherwpi.$O:			../port/wifi.h
-etherrt2860.$O: 		../port/wifi.h
-l.$O rebootcode.$O apbootstrap.$O:	mem.h
+devusb.$O usb*.$O:		../port/usb.h ../port/portusbehci.h ../pc/usbehci.h
+trap.$O:			/sys/include/tos.h
+uartaxp.$O:			uartaxp-fw.h
+etherm10g.$O:			etherm10g2k-fw.h etherm10g4k-fw.h
 
-initcode.out:		init9.$O initcode.$O /$objtype/lib/libc.a
-	$LD -l -R1 -s -o $target $prereq
+init.h:D:		../port/initcode.c init9.c
+	$CC ../port/initcode.c
+	$CC init9.c
+	$LD -l -R1 -s -o init.out init9.$O initcode.$O /386/lib/libc.a
+	{echo 'uchar initcode[]={'
+	 xd -1x <init.out |
+		sed -e 's/^[0-9a-f]+ //' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
+	 echo '};'} > init.h
 
-rebootcode.out:		rebootcode.$O
-	$LD -l -R4 -s -o $target -T$REBOOTADDR -H3 $prereq
+# -T argument must match REBOOTADDR in mem.h
+reboot.h:D:	rebootcode.s
+	$AS rebootcode.s
+	$LD -l -s -T0x11000 -R4 -o reboot.out rebootcode.$O
+	{echo 'uchar rebootcode[]={'
+	 xd -1x reboot.out |
+		sed -e '1,2d' -e 's/^[0-9a-f]+ //' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
+	 echo '};'} > reboot.h
 
-apbootstrap.out:	apbootstrap.$O
-	$LD -l -R4 -s -o $target -T$APBOOTSTRAP -H3 $prereq
+apbootstrap.h:	apbootstrap.s mem.h
+	$AS $prereq
+	APBOOTSTRAP=`{echo $KZERO+0x3000'=X' | dbcalc}
+	$LD -o apbootstrap.out -T$APBOOTSTRAP -R4 -l -s apbootstrap.$O
+	{echo 'uchar apbootstrap[]={'
+	 xd -1x apbootstrap.out |
+		sed -e '1,2d' -e 's/^[0-9a-f]+ //' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
+	 echo '};'} > $target
 
-sd53c8xx.i:	sd53c8xx.n
+# convert firmware to C for inclusion
+sd53c8xx-fw.h:	sd53c8xx.n
 	aux/na $prereq > $target
 
-uartaxp.i:	a100p.cp
+uartaxp-fw.h:	a100p.cp
 	{echo 'static uchar uartaxpcp[] = {'
 	 xd -1x $prereq |
 		sed -e 's/^[0-9a-f]+ //' -e '/^$/d' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
 	 echo '};'
 	} > $target
 
-etherm10g%.i:	etherm10g%.fw
-	{echo 'static char fw'^$stem^'[] = {'
-	 xd -1x $prereq |
-		sed -e 's/^[0-9a-f]+ //' -e '/^$/d' -e 's/ ([0-9a-f][0-9a-f])/0x\1,/g'
-	 echo '};'
-	} > $target
-
-acid:V:
-	8c -a -w -I. i8253.c>acid
+acid:V: init.h reboot.h
+	8c -a -w -I. main.c >acid
 
 %.checkether:VQ:
 	for (i in ether*.c){
@@ -187,3 +202,6 @@ checkdist:VQ:
 	for(i in pcdisk pcflop)
 	for(j in checkvga checkether)
 		mk $i.$j
+
+%.clean:V:
+	rm -f $stem.c [9bz]$stem [9bz]$stem.gz [9bz]$stem^lz boot$stem.* reboot.h apbootstrap.h init.h [9bz]$stem.elf

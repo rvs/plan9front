@@ -88,8 +88,8 @@ enum {
 	V6nd_home	= 8,
 	V6nd_srcaddrs	= 9,		/* rfc3122 */
 	V6nd_ip		= 17,
-	V6nd_rdns	= 25,		/* rfc6106 */
-	V6nd_rdnssl	= 31,
+	/* /lib/rfc/drafts/draft-jeong-dnsop-ipv6-dns-discovery-12.txt */
+	V6nd_rdns	= 25,
 	/* plan 9 extensions */
 	V6nd_9fs	= 250,
 	V6nd_9auth	= 251,
@@ -116,6 +116,7 @@ enum {
 	V6initprobedelay= 5000,
 };
 
+/* this is packet layout, so can't tolerate bogus padding */
 /* V6 header on the wire */
 typedef struct Ip6hdr Ip6hdr;
 struct Ip6hdr {
@@ -161,9 +162,9 @@ void	maskip(uchar*, uchar*, uchar*);
 int	eipfmt(Fmt*);
 int	isv4(uchar*);
 vlong	parseip(uchar*, char*);
-vlong	parseipmask(uchar*, char*, int);
-vlong	parseipandmask(uchar*, uchar*, char*, char*);
+vlong	parseipmask(uchar*, char*);
 char*	v4parseip(uchar*, char*);
+char*	v4parsecidr(uchar*, uchar*, char*);
 int	parseether(uchar*, char*);
 int	myipaddr(uchar*, char*);
 int	myetheraddr(uchar*, char*);
@@ -171,8 +172,6 @@ int	equivip4(uchar*, uchar*);
 int	equivip6(uchar*, uchar*);
 
 Ipifc*	readipifc(char*, Ipifc*, int);
-Iplifc*	iplocalonifc(Ipifc *, uchar *);
-Iplifc*	ipremoteonifc(Ipifc *, uchar *);
 
 void	hnputv(void*, uvlong);
 void	hnputl(void*, uint);

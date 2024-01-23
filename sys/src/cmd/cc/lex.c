@@ -7,62 +7,42 @@
 
 /*
  * known debug flags
- * flags without a description may be exclusive to certain architectures
- *	-.		Inhibit search for includes in source directory
- *	-0		R0ISZERO - qc
- *	-4
- *	-8
- *	-<
-
+ *	-a		acid declaration output
  *	-A		!B
  *	-B		non ANSI
- *	-C
+ *	-d		print declarations
  *	-D name		define
+ *	-f		print pragma settings
  *	-F		format specification check
- *	-G
- *	-H
+ *	-i		print initialization
  *	-I path		include
+ *	-l		generate little-endian code
  *	-L		print every NAME symbol
  *	-M		constant multiplication
- *	-N
- *	-P		peephole
- *	-Q
- *	-R		print registerization
- *	-S		print assembly
- *	-T
- *	-V		enable void* conversion warnings
- *	-W
- *	-X		abort on error
- *	-Y
- *	-Z		pickle
-
- *	-a		acid declaration output
- *	-c		print const if
- *	-d		print declarations
- *	-e
- *	-f
- *	-g
- *	-h
- *	-i		print initialization
- *	-l		generate little-endian code
  *	-m		print add/sub/mul trees
  *	-n		print acid to file (%.c=%.acid) (with -a or -aa)
  *	-o file		output file
  *	-p		use standard cpp ANSI preprocessor (not on windows)
+ *	-R		print registerization
  *	-s		print structure offsets (with -a or -aa)
+ *	-S		print assembly
+ *	-T		pass type signatures on all external & global entities
  *	-t		print type trees
+ *	-V		enable void* conversion warnings
  *	-v		verbose printing
  *	-w		print warnings
- *	-x
- *	-y
+ *	-X		abort on error
+ *	-Z		emit pickling goo to file (%.c=%_pickle.c) with -n
+ *	-.		Inhibit search for includes in source directory
  */
 
 void
 main(int argc, char *argv[])
 {
-	char **defs, *p;
-	int nproc, nout, status, i, c, ndef;
+	char **defs, **np, *p;
+	int nproc, nout, status, i, c, ndef, maxdef;
 
+	Binit(&diagbuf, 1, OWRITE);
 	memset(debug, 0, sizeof(debug));
 	tinit();
 	cinit();
@@ -71,10 +51,11 @@ main(int argc, char *argv[])
 
 	profileflg = 1;	/* #pragma can turn it off */
 	tufield = simplet((1L<<tfield->etype) | BUNSIGNED);
-	defs = 0;
+	maxdef = 0;
 	ndef = 0;
 	outfile = 0;
-	include[ninclude++] = ".";
+	defs = nil;
+	setinclude(".");
 	ARGBEGIN {
 	default:
 		c = ARGC();
@@ -98,8 +79,13 @@ main(int argc, char *argv[])
 	case 'D':
 		p = ARGF();
 		if(p) {
-			if((ndef & 15) == 0)
-				defs = allocn(defs, ndef*sizeof(defs[0]), 16*sizeof(defs[0]));
+			if(ndef >= maxdef){
+				maxdef += 50;
+				np = alloc(maxdef * sizeof *np);
+				if(defs != nil)
+					memmove(np, defs, (maxdef - 50) * sizeof *np);
+				defs = np;
+			}
 			defs[ndef++] = p;
 			dodefine(p);
 		}
@@ -112,7 +98,8 @@ main(int argc, char *argv[])
 		break;
 	} ARGEND
 	if(argc < 1 && outfile == 0) {
-		print("usage: %Cc [-options] files\n", thechar);
+		print("usage: %cc [-o obj] [-Iinc ...] [-Ddef=val ...] "
+			"[-options] file.c [...]\n", thechar);
 		errorexit();
 	}
 	if(argc > 1 && systemtype(Windows)){
@@ -176,14 +163,19 @@ main(int argc, char *argv[])
 	exits(0);
 }
 
+/*
+ * compile may be executed concurrently (once per separate process), but
+ * is not currently called repeatedly within a single process.
+ */
 int
 compile(char *file, char **defs, int ndef)
 {
-	char *ofile, *p, **av;
-	int i, c, fd[2], status;
+	char ofile[400], incfile[200];
+	char *p, **av, opt[256];
+	int i, c, fd[2];
 	static int first = 1;
 
-	ofile = strdup(file);
+	strcpy(ofile, file);
 	p = utfrrune(ofile, pathchar());
 	if(p) {
 		*p++ = 0;
@@ -193,17 +185,21 @@ compile(char *file, char **defs, int ndef)
 		p = ofile;
 
 	if(outfile == 0) {
-		if(p) {
-			outfile = p;
+		outfile = p;
+		if(outfile) {
 			if(p = utfrrune(outfile, '.'))
 				if(p[1] == 'c' && p[2] == 0)
 					p[0] = 0;
+			p = utfrune(outfile, 0);
 			if(debug['a'] && debug['n'])
-				outfile = smprint("%s.acid", outfile);
+				strcat(p, ".acid");
 			else if(debug['Z'] && debug['n'])
-				outfile = smprint("%s_pickle.c", outfile);
-			else
-				outfile = smprint("%s.%C", outfile, thechar);
+				strcat(p, "_pickle.c");
+			else {
+				p[0] = '.';
+				p[1] = thechar;
+				p[2] = 0;
+			}
 		} else
 			outfile = "/dev/null";
 	}
@@ -212,15 +208,23 @@ compile(char *file, char **defs, int ndef)
 		setinclude(p);
 	} else {
 		if(systemtype(Plan9)) {
-			setinclude(smprint("/%s/include", thestring));
-			setinclude("/sys/include");
+			p = getenv("ccroot");
+			if(p == nil)
+				p = "";
+			snprint(incfile, sizeof(incfile), "%s/%s/include", p, thestring);
+			setinclude(strdup(incfile));
+			snprint(incfile, sizeof(incfile), "%s/sys/include", p);
+			setinclude(strdup(incfile));
+			if(*p != '\0') {
+				snprint(incfile, sizeof(incfile), "%s/include", p);
+				if(myaccess(incfile) >= 0)
+					setinclude(strdup(incfile));
+			}
 		}
 	}
-	if (first)
-		Binit(&diagbuf, 1, OWRITE);
 	/*
 	 * if we're writing acid to standard output, don't keep scratching
-	 * outbuf.
+	 * outbuf, since we may compile multiple source files.
 	 */
 	if((debug['a'] || debug['Z']) && !debug['n']) {
 		if (first) {
@@ -229,7 +233,7 @@ compile(char *file, char **defs, int ndef)
 			dup(2, 1);
 		}
 	} else {
-		c = mycreat(outfile, 0664 | DMTMP);
+		c = mycreat(outfile, 0664);
 		if(c < 0) {
 			diag(Z, "cannot open %s - %r", outfile);
 			outfile = 0;
@@ -262,19 +266,21 @@ compile(char *file, char **defs, int ndef)
 			close(fd[0]);
 			mydup(fd[1], 1);
 			close(fd[1]);
-
-			i = 8+ndef+ninclude;
-			av = alloc(i*sizeof(av[0]));
-
-			i = 0;
-			av[i++] = CPP;
-			av[i++] = "-+";
+			av = alloc((3 + ndef + ninclude + 2) * sizeof *av);
+			av[0] = CPP;
+			i = 1;
 			if(debug['.'])
-				av[i++] = "-.";
-			for(c = 0; c < ndef; c++)
-				av[i++] = smprint("-D%s", defs[c]);
-			for(c = 0; c < ninclude; c++)
-				av[i++] = smprint("-I%s", include[c]);
+				av[i++] = strdup("-.");
+			/* 1999 ANSI C requires recognising // comments */
+			av[i++] = strdup("-+");
+			for(c = 0; c < ndef; c++) {
+				snprint(opt, sizeof opt, "-D%s", defs[c]);
+				av[i++] = strdup(opt);
+			}
+			for(c = 0; c < ninclude; c++) {
+				snprint(opt, sizeof opt, "-I%s", include[c]);
+				av[i++] = strdup(opt);
+			}
 			if(strcmp(file, "stdin") != 0)
 				av[i++] = file;
 			av[i] = 0;
@@ -298,16 +304,31 @@ compile(char *file, char **defs, int ndef)
 			newfile(file, -1);
 	}
 	yyparse();
+	if (0 && fpused) {	/* TODO */
+		/*
+		 * arrange to load fp printing library code.
+		 * emit "_fltused" & have loader search -lnofp if no fp uses.
+		 */
+		Sym *fltused;
+		Type *t;
+
+		t = typ(TARRAY, types[TCHAR]);
+		fltused = slookup("_fltused");
+		fltused->class = CGLOBL;
+		fltused->type = t;
+	}
 	if(!debug['a'] && !debug['Z'])
 		gclean();
-	if(nerrors == 0 && mywait(&status) > 0 && status != 0)
-		nerrors++;
+	Bflush(&outbuf);
+	Bflush(&diagbuf);
 	return nerrors;
 }
 
 void
 errorexit(void)
 {
+	Bflush(&outbuf);
+	Bflush(&diagbuf);
 	if(outfile)
 		remove(outfile);
 	exits("error");
@@ -363,7 +384,7 @@ newfile(char *s, int f)
 	if(f < 0)
 		i->f = open(s, 0);
 	if(i->f < 0) {
-		yyerror("%Cc: %r: %s", thechar, s);
+		yyerror("%cc: %r: %s", thechar, s);
 		errorexit();
 	}
 	fi.c = 0;
@@ -373,11 +394,8 @@ newfile(char *s, int f)
 Sym*
 slookup(char *s)
 {
-	strncpy(symb, s, NSYMB);
-	if(symb[NSYMB-1] != '\0'){
-		yyerror("symbol too long: %s", s);
-		errorexit();
-	}
+
+	strcpy(symb, s);
 	return lookup();
 }
 
@@ -409,6 +427,7 @@ lookup(void)
 	s->name = alloc(n);
 	memmove(s->name, symb, n);
 
+	strcpy(s->name, symb);
 	s->link = hash[h];
 	hash[h] = s;
 	syminit(s);
@@ -431,7 +450,8 @@ syminit(Sym *s)
 
 #define	EOF	(-1)
 #define	IGN	(-2)
-#define	ESC	(1<<20)
+#define	ESC	(Runemask+1)		/* Rune flag: a literal byte */
+#define	GETC()	((--fi.c < 0)? filbuf(): (*fi.p++ & 0xff))
 
 enum
 {
@@ -446,7 +466,7 @@ long
 yylex(void)
 {
 	vlong vv;
-	long c, c1, t, w;
+	long c, c1, t;
 	char *cp;
 	Rune rune;
 	Sym *s;
@@ -563,15 +583,15 @@ l1:
 			c = escchar('"', 1, 0);
 			if(c == EOF)
 				break;
-			cp = allocn(cp, c1, sizeof(Rune));
-			*(Rune*)(cp + c1) = c;
-			c1 += sizeof(Rune);
+			cp = allocn(cp, c1, sizeof(TRune));
+			*(TRune*)(cp + c1) = c;
+			c1 += sizeof(TRune);
 		}
 		yylval.sval.l = c1;
 		do {
-			cp = allocn(cp, c1, sizeof(Rune));
-			*(Rune*)(cp + c1) = 0;
-			c1 += sizeof(Rune);
+			cp = allocn(cp, c1, sizeof(TRune));
+			*(TRune*)(cp + c1) = 0;
+			c1 += sizeof(TRune);
 		} while(c1 & MAXALIGN);
 		yylval.sval.s = cp;
 		return LLSTRING;
@@ -757,22 +777,18 @@ talph:
 	if(s->macro) {
 		newio();
 		cp = ionext->b;
-		if(macexpand(s, cp, sizeof(ionext->b)-1)){
-			pushio();
-			ionext->link = iostack;
-			iostack = ionext;
-			fi.p = cp;
-			fi.c = strlen(cp);
-			if(peekc != IGN) {
-				cp[fi.c++] = peekc;
-				cp[fi.c] = 0;
-				peekc = IGN;
-			}
-			goto l0;
-		} else {
-			ionext->link = iofree;
-			iofree = ionext;
+		macexpand(s, cp);
+		pushio();
+		ionext->link = iostack;
+		iostack = ionext;
+		fi.p = cp;
+		fi.c = strlen(cp);
+		if(peekc != IGN) {
+			cp[fi.c++] = peekc;
+			cp[fi.c] = 0;
+			peekc = IGN;
 		}
+		goto l0;
 	}
 	yylval.sym = s;
 	if(s->class == CTYPEDEF || s->class == CTYPESTR)
@@ -782,18 +798,16 @@ talph:
 tnum:
 	c1 = 0;
 	cp = symb;
-	vv = 0;
 	if(c != '0') {
 		c1 |= Numdec;
 		for(;;) {
-			if(!isdigit(c))
-				goto dc;
-
-			vv = vv*10 + c-'0';
 			if(cp >= &symb[NSYMB-1])
 				goto toolong;
 			*cp++ = c;
 			c = GETC();
+			if(isdigit(c))
+				continue;
+			goto dc;
 		}
 	}
 	*cp++ = c;
@@ -804,47 +818,27 @@ tnum:
 				goto toolong;
 			*cp++ = c;
 			c = GETC();
-			if(isdigit(c)){
-				vv = vv*16 + c-'0';
+			if(isdigit(c))
 				continue;
-			}
-			if(c >= 'a' && c <= 'f'){
-				vv = vv*16 + c + 10 - 'a';
+			if(c >= 'a' && c <= 'f')
 				continue;
-			}
-			if(c >= 'A' && c <= 'F'){
-				vv = vv*16 + c + 10 - 'A';
+			if(c >= 'A' && c <= 'F')
 				continue;
-			}
 			if(cp == symb+2)
 				yyerror("malformed hex constant");
-			goto ncu;
-		}
-	if(c == 'b' || c == 'B')
-		for(;;) {
-			if(cp >= &symb[NSYMB-1])
-				goto toolong;
-			*cp++ = c;
-			c = GETC();
-			if(c == '0' || c == '1'){
-				vv = vv*2 + c-'0';
-				continue;
-			}
-			if(cp == symb+2)
-				yyerror("malformed binary constant");
 			goto ncu;
 		}
 	if(c < '0' || c > '7')
 		goto dc;
 	for(;;) {
-		if(c < '0' || c > '7')
-			goto ncu;
-
-		vv = vv*8 + c-'0';
-		if(cp >= &symb[NSYMB-1])
-			goto toolong;
-		*cp++ = c;
-		c = GETC();
+		if(c >= '0' && c <= '7') {
+			if(cp >= &symb[NSYMB-1])
+				goto toolong;
+			*cp++ = c;
+			c = GETC();
+			continue;
+		}
+		goto ncu;
 	}
 
 dc:
@@ -868,17 +862,11 @@ ncu:
 	}
 	*cp = 0;
 	peekc = c;
+	if(mpatov(symb, &yylval.vval))
+		yyerror("overflow in constant");
 
-	/*
-	 * c99 is silly: decimal constants stay signed,
-	 * hex and octal go unsigned before widening.
-	 */
-	w = 32;
-	if((c1 & (Numdec|Numuns)) == Numdec)
-		w = 31;
-	if(c1 & Numvlong || (c1 & Numlong) == 0 && (uvlong)vv >= 1ULL<<w){
-		if((c1&(Numdec|Numvlong)) == Numdec && vv < 1ULL<<32)
-			warn(Z, "int constant widened to vlong: %s", symb);
+	vv = yylval.vval;
+	if(c1 & Numvlong) {
 		if((c1 & Numuns) || convvtox(vv, TVLONG) < 0) {
 			c = LUVLCONST;
 			t = TUVLONG;
@@ -969,6 +957,75 @@ toolong:
 	yyerror("token too long: %.*s...", utfnlen(symb, cp-symb), symb);
 	errorexit();
 	return -1;
+}
+
+/*
+ * convert a string, s, to vlong in *v
+ * return conversion overflow.
+ * required syntax is [0[x]]d*
+ */
+int
+mpatov(char *s, vlong *v)
+{
+	vlong n, nn;
+	int c;
+
+	n = 0;
+	c = *s;
+	if(c == '0')
+		goto oct;
+	while(c = *s++) {
+		if(c >= '0' && c <= '9')
+			nn = n*10 + c-'0';
+		else
+			goto bad;
+		if(n < 0 && nn >= 0)
+			goto bad;
+		n = nn;
+	}
+	goto out;
+
+oct:
+	s++;
+	c = *s;
+	if(c == 'x' || c == 'X')
+		goto hex;
+	while(c = *s++) {
+		if(c >= '0' || c <= '7')
+			nn = n*8 + c-'0';
+		else
+			goto bad;
+		if(n < 0 && nn >= 0)
+			goto bad;
+		n = nn;
+	}
+	goto out;
+
+hex:
+	s++;
+	while(c = *s++) {
+		if(c >= '0' && c <= '9')
+			c += 0-'0';
+		else
+		if(c >= 'a' && c <= 'f')
+			c += 10-'a';
+		else
+		if(c >= 'A' && c <= 'F')
+			c += 10-'A';
+		else
+			goto bad;
+		nn = n*16 + c;
+		if(n < 0 && nn >= 0)
+			goto bad;
+		n = nn;
+	}
+out:
+	*v = n;
+	return 0;
+
+bad:
+	*v = ~0;
+	return 1;
 }
 
 int
@@ -1140,6 +1197,7 @@ struct
 	ushort	type;
 } itab[] =
 {
+	"_Noreturn",	LNORETURN,	0,
 	"auto",		LAUTO,		0,
 	"break",	LBREAK,		0,
 	"case",		LCASE,		0,
@@ -1159,7 +1217,6 @@ struct
 	"inline",	LINLINE,	0,
 	"int",		LINT,		TINT,
 	"long",		LLONG,		TLONG,
-	"_Noreturn",	LNORET,		0,
 	"register",	LREGISTER,	0,
 	"restrict",	LRESTRICT,	0,
 	"return",	LRETURN,	0,
@@ -1194,6 +1251,7 @@ cinit(void)
 	iostack = I;
 	iofree = I;
 	peekc = IGN;
+	nhunk = 0;
 
 	types[TXXX] = T;
 	types[TCHAR] = typ(TCHAR, T);
@@ -1301,6 +1359,7 @@ Oconv(Fmt *fp)
 int
 Lconv(Fmt *fp)
 {
+	char str[STRINGSZ], s[STRINGSZ];
 	Hist *h;
 	struct
 	{
@@ -1342,62 +1401,87 @@ Lconv(Fmt *fp)
 	}
 	if(n > HISTSZ)
 		n = HISTSZ;
-	if(n == 0)
-		return fmtprint(fp, "<eof>");
+	str[0] = 0;
 	for(i=n-1; i>=0; i--) {
 		if(i != n-1) {
 			if(fp->flags & ~(FmtWidth|FmtPrec))	/* BUG ROB - was f3 */
 				break;
-			fmtrune(fp, ' ');
+			strcat(str, " ");
 		}
 		if(a[i].line)
-			fmtprint(fp, "%s:%ld[%s:%ld]",
+			snprint(s, STRINGSZ, "%s:%ld[%s:%ld]",
 				a[i].line->name, l-a[i].ldel+1,
 				a[i].incl->name, l-a[i].idel+1);
 		else
-			fmtprint(fp, "%s:%ld",
+			snprint(s, STRINGSZ, "%s:%ld",
 				a[i].incl->name, l-a[i].idel+1);
+		if(strlen(s)+strlen(str) >= STRINGSZ-10)
+			break;
+		strcat(str, s);
 		l = a[i].incl->line - 1;	/* now print out start of this file */
 	}
-	return 0;
+	if(n == 0)
+		strcat(str, "<eof>");
+	return fmtstrcpy(fp, str);
 }
 
 int
 Tconv(Fmt *fp)
 {
+	char str[STRINGSZ+20], s[STRINGSZ+20];
 	Type *t, *t1;
 	int et;
 	long n;
 
-	t = va_arg(fp->args, Type*);
-	while(t != T) {
-		if(t->garb&~GINCOMPLETE)
-			fmtprint(fp, "%s ", gnames[t->garb&~GINCOMPLETE]);
+	str[0] = 0;
+	for(t = va_arg(fp->args, Type*); t != T; t = t->link) {
 		et = t->etype;
-		fmtprint(fp, "%s", tnames[et]);
-		if(et == TFUNC && (t1 = t->down) != T) {
-			fmtprint(fp, "(%T", t1);
-			while((t1 = t1->down) != T)
-				fmtprint(fp, ", %T", t1);
-			fmtprint(fp, ")");
+		if(str[0])
+			strcat(str, " ");
+		if(t->garb&~GINCOMPLETE) {
+			snprint(s, sizeof s, "%s ", gnames[t->garb&~GINCOMPLETE]);
+			if(strlen(str) + strlen(s) < STRINGSZ)
+				strcat(str, s);
+		}
+		snprint(s, sizeof s, "%s", tnames[et]);
+		if(strlen(str) + strlen(s) < STRINGSZ)
+			strcat(str, s);
+		if(et == TFUNC && (t1 = t->down)) {
+			snprint(s, sizeof s, "(%T", t1);
+			if(strlen(str) + strlen(s) < STRINGSZ)
+				strcat(str, s);
+			while(t1 = t1->down) {
+				snprint(s, sizeof s, ", %T", t1);
+				if(strlen(str) + strlen(s) < STRINGSZ)
+					strcat(str, s);
+			}
+			if(strlen(str) + strlen(s) < STRINGSZ)
+				strcat(str, ")");
 		}
 		if(et == TARRAY) {
 			n = t->width;
-			if(t->link != T && t->link->width)
+			if(t->link && t->link->width)
 				n /= t->link->width;
-			fmtprint(fp, "[%ld]", n);
+			snprint(s, sizeof s, "[%ld]", n);
+			if(strlen(str) + strlen(s) < STRINGSZ)
+				strcat(str, s);
 		}
-		if(t->nbits)
-			fmtprint(fp, " %d:%d", t->shift, t->nbits);
+		if(t->nbits) {
+			snprint(s, sizeof s, " %d:%d", t->shift, t->nbits);
+			if(strlen(str) + strlen(s) < STRINGSZ)
+				strcat(str, s);
+		}
 		if(typesu[et]) {
-			fmtprint(fp, " %s", t->tag? t->tag->name: "{}");
+			if(t->tag) {
+				strcat(str, " ");
+				if(strlen(str) + strlen(t->tag->name) < STRINGSZ)
+					strcat(str, t->tag->name);
+			} else
+				strcat(str, " {}");
 			break;
 		}
-		if((t = t->link) == T)
-			break;
-		fmtrune(fp, ' ');
 	}
-	return 0;
+	return fmtstrcpy(fp, str);
 }
 
 int
@@ -1416,57 +1500,109 @@ FNconv(Fmt *fp)
 int
 Qconv(Fmt *fp)
 {
+	char str[STRINGSZ+20], *s;
 	long b;
 	int i;
 
-	b = va_arg(fp->args, long);
-	while(b) {
+	str[0] = 0;
+	for(b = va_arg(fp->args, long); b;) {
 		i = bitno(b);
+		if(str[0])
+			strcat(str, " ");
+		s = qnames[i];
+		if(strlen(str) + strlen(s) >= STRINGSZ)
+			break;
+		strcat(str, s);
 		b &= ~(1L << i);
-		fmtprint(fp, "%s%s", qnames[i], b? " ": "");
 	}
-	return 0;
+	return fmtstrcpy(fp, str);
 }
 
 int
 VBconv(Fmt *fp)
 {
-	int n, t, pc;
+	char str[STRINGSZ];
+	int i, n, t, pc;
 
 	n = va_arg(fp->args, int);
 	pc = 0;	/* BUG: was printcol */
+	i = 0;
 	while(pc < n) {
 		t = (pc+4) & ~3;
 		if(t <= n) {
-			fmtrune(fp, '\t');
+			str[i++] = '\t';
 			pc = t;
-		} else {
-			fmtrune(fp, ' ');
-			pc++;
+			continue;
 		}
+		str[i++] = ' ';
+		pc++;
 	}
-	return 0;
+	str[i] = 0;
+
+	return fmtstrcpy(fp, str);
+}
+
+/*
+ * real allocs
+ */
+void*
+alloc(long n)
+{
+	void *p;
+
+	while((uintptr)hunk & MAXALIGN) {
+		hunk++;
+		nhunk--;
+	}
+	while(nhunk < n)
+		gethunk();
+	p = hunk;
+	nhunk -= n;
+	hunk += n;
+	return p;
+}
+
+void*
+allocn(void *p, long on, long n)
+{
+	void *q;
+
+	q = (uchar*)p + on;
+	if(q != hunk || nhunk < n) {
+		while(nhunk < on+n)
+			gethunk();
+		memmove(hunk, p, on);
+		p = hunk;
+		hunk += on;
+		nhunk -= on;
+	}
+	hunk += n;
+	nhunk -= n;
+	return p;
 }
 
 void
 setinclude(char *p)
 {
 	int i;
-	char *e;
+	char *e, **np;
 
 	while(*p != 0) {
 		e = strchr(p, ' ');
 		if(e != 0)
 			*e = '\0';
 
-		for(i=1; i < ninclude; i++)
+		for(i=0; i < ninclude; i++)
 			if(strcmp(p, include[i]) == 0)
 				break;
 
 		if(i >= ninclude){
-			if(ninclude >= nelem(include)) {
-				diag(Z, "ninclude too small %d", nelem(include));
-				exits("ninclude");
+			if(i >= maxinclude){
+				maxinclude += 20;
+				np = alloc(maxinclude * sizeof *np);
+				if(include != nil)
+					memmove(np, include, (maxinclude - 20) * sizeof *np);
+				include = np;
 			}
 			include[ninclude++] = p;
 		}

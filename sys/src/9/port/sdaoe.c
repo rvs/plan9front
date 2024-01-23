@@ -1,5 +1,5 @@
 /*
- * aoe sd driver, copyright © 2007-9 coraid
+ * aoe sd driver, copyright © 2007 coraid
  */
 
 #include "u.h"
@@ -7,12 +7,13 @@
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
-#include "io.h"
 #include "../port/error.h"
-#include "../port/sd.h"
+
 #include "../port/netif.h"
+#include "../port/sd.h"
+
+#include "etherif.h"
 #include "../port/aoe.h"
-#include <fis.h>
 
 extern	char	Echange[];
 extern	char	Enotup[];
@@ -20,14 +21,34 @@ extern	char	Enotup[];
 #define uprint(...)	snprint(up->genbuf, sizeof up->genbuf, __VA_ARGS__);
 
 enum {
-	Maxpath		= 128,
+	Nctlr	= 32,
+	Maxpath	= 128,
 
 	Probeintvl	= 100,		/* ms. between probes */
-	Probemax	= 10*1000,	/* max ms. to wait */
+	Probemax	= 20,		/* max probes */
+};
+
+enum {
+	/* sync with ahci.h */
+	Dllba 	= 1<<0,
+	Dsmart	= 1<<1,
+	Dpower	= 1<<2,
+	Dnop	= 1<<3,
+	Datapi	= 1<<4,
+	Datapi16= 1<<5,
+};
+
+static char *flagname[] = {
+	"llba",
+	"smart",
+	"power",
+	"nop",
+	"atapi",
+	"atapi16",
 };
 
 typedef struct Ctlr Ctlr;
-struct Ctlr {
+struct Ctlr{
 	QLock;
 
 	Ctlr	*next;
@@ -37,8 +58,11 @@ struct Ctlr {
 	Chan	*c;
 
 	ulong	vers;
-	uchar	drivechange;
-	Sfis;
+	uchar	mediachange;
+	uchar	flag;
+	uchar	smart;
+	uchar	smartrs;
+	uchar	feat;
 
 	uvlong	sectors;
 	char	serial[20+1];
@@ -47,54 +71,86 @@ struct Ctlr {
 	char	ident[0x100];
 };
 
+void	aoeidmove(char *p, ushort *a, unsigned n);
+
 static	Lock	ctlrlock;
 static	Ctlr	*head;
 static	Ctlr	*tail;
 
 SDifc sdaoeifc;
 
+static ushort
+gbit16(void *a)
+{
+	uchar *i;
+
+	i = a;
+	return i[1] << 8 | i[0];
+}
+
+static ulong
+gbit32(void *a)
+{
+	ulong j;
+	uchar *i;
+
+	i = a;
+	j  = i[3] << 24;
+	j |= i[2] << 16;
+	j |= i[1] << 8;
+	j |= i[0];
+	return j;
+}
+
+static uvlong
+gbit64(void *a)
+{
+	uchar *i;
+
+	i = a;
+	return (uvlong)gbit32(i+4)<<32 | gbit32(i);
+}
+
 static int
 identify(Ctlr *c, ushort *id)
 {
-	uchar oserial[21];
-	vlong osectors, s;
+	int i;
+	uchar oserial[sizeof c->serial];
+	uvlong osectors, s;
 
 	osectors = c->sectors;
 	memmove(oserial, c->serial, sizeof c->serial);
-	s = idfeat(c, id);
-	if(s == -1){
-		uprint("%s: identify fails", c->unit->name);
-		print("%s\n", up->genbuf);
-		error(up->genbuf);
+
+	c->feat &= ~(Dllba|Dpower|Dsmart|Dnop);
+	i = gbit16(id+83) | gbit16(id+86);
+	if(i & (1<<10)){
+		c->feat |= Dllba;
+		s = gbit64(id+100);
+	}else
+		s = gbit32(id+60);
+
+	i = gbit16(id+83);
+	if((i>>14) == 1) {
+		if(i & (1<<3))
+			c->feat |= Dpower;
+		i = gbit16(id+82);
+		if(i & 1)
+			c->feat |= Dsmart;
+		if(i & (1<<14))
+			c->feat |= Dnop;
 	}
-	idmove(c->serial, id+10, 20);
-	idmove(c->firmware, id+23, 8);
-	idmove(c->model, id+27, 40);
+
+	aoeidmove(c->serial, id+10, 20);
+	aoeidmove(c->firmware, id+23, 8);
+	aoeidmove(c->model, id+27, 40);
 
 	if((osectors == 0 || osectors != s) &&
 	    memcmp(oserial, c->serial, sizeof oserial) != 0){
 		c->sectors = s;
-		c->drivechange = 1;
+		c->mediachange = 1;
 		c->vers++;
 	}
 	return 0;
-}
-
-static void
-aoectl(Ctlr *d, char *s)
-{
-	Chan *c;
-
-	uprint("%s/ctl", d->path);
-	c = namec(up->genbuf, Aopen, OWRITE, 0);
-	if(waserror()){
-		print("sdaoectl: %s\n", up->errstr);
-		cclose(c);
-		nexterror();
-	}
-	devtab[c->type]->write(c, s, strlen(s), 0);
-	cclose(c);
-	poperror();
 }
 
 /* must call with d qlocked */
@@ -103,18 +159,23 @@ aoeidentify(Ctlr *d, SDunit *u)
 {
 	Chan *c;
 
-	uprint("%s/ident", d->path);
-	c = namec(up->genbuf, Aopen, OREAD, 0);
+	c = nil;
 	if(waserror()){
+		if(c)
+			cclose(c);
 		iprint("aoeidentify: %s\n", up->errstr);
-		cclose(c);
 		nexterror();
 	}
+
+	uprint("%s/ident", d->path);
+	c = namec(up->genbuf, Aopen, OREAD, 0);
 	devtab[c->type]->read(c, d->ident, sizeof d->ident, 0);
-	cclose(c);
+
 	poperror();
+	cclose(c);
 
 	d->feat = 0;
+	d->smart = 0;
 	identify(d, (ushort*)d->ident);
 
 	memset(u->inquiry, 0, sizeof u->inquiry);
@@ -132,7 +193,7 @@ ctlrlookup(char *path)
 	Ctlr *c;
 
 	lock(&ctlrlock);
-	for(c = head; c != nil; c = c->next)
+	for(c = head; c; c = c->next)
 		if(strcmp(c->path, path) == 0)
 			break;
 	unlock(&ctlrlock);
@@ -144,6 +205,7 @@ newctlr(char *path)
 {
 	Ctlr *c;
 
+	/* race? */
 	if(ctlrlookup(path))
 		error(Eexist);
 
@@ -167,15 +229,15 @@ delctlr(Ctlr *c)
 
 	lock(&ctlrlock);
 
-	for(prev = 0, x = head; x != nil; prev = x, x = c->next)
+	for(prev = 0, x = head; x; prev = x, x = c->next)
 		if(strcmp(c->path, x->path) == 0)
 			break;
-	if(x == nil){
+	if(x == 0){
 		unlock(&ctlrlock);
 		error(Enonexist);
 	}
 
-	if(prev != nil)
+	if(prev)
 		prev->next = x->next;
 	else
 		head = x->next;
@@ -183,11 +245,12 @@ delctlr(Ctlr *c)
 		tail = prev;
 	unlock(&ctlrlock);
 
-	if(x->c != nil)
+	if(x->c)
 		cclose(x->c);
 	free(x);
 }
 
+/* don't call aoeprobe from within a loop; it loops internally retrying open. */
 static SDev*
 aoeprobe(char *path, SDev *s)
 {
@@ -196,11 +259,12 @@ aoeprobe(char *path, SDev *s)
 	Chan *c;
 	Ctlr *ctlr;
 
-	if((p = strrchr(path, '/')) == nil)
+	if((p = strrchr(path, '/')) == 0)
 		error(Ebadarg);
 	*p = 0;
 	uprint("%s/ctl", path);
 	*p = '/';
+
 	c = namec(up->genbuf, Aopen, OWRITE, 0);
 	if(waserror()) {
 		cclose(c);
@@ -208,27 +272,24 @@ aoeprobe(char *path, SDev *s)
 	}
 	n = uprint("discover %s", p+1);
 	devtab[c->type]->write(c, up->genbuf, n, 0);
-	cclose(c);
 	poperror();
+	cclose(c);
 
-	for(i = 0;; i += Probeintvl){
-		if(i > Probemax || waserror())
-			error(Etimedout);
+	for(i = 0; i < Probemax; i++){
 		tsleep(&up->sleep, return0, 0, Probeintvl);
-		poperror();
-
 		uprint("%s/ident", path);
-		if(waserror())
-			continue;
-		c = namec(up->genbuf, Aopen, OREAD, 0);
-		poperror();
-		cclose(c);
-
-		ctlr = newctlr(path);
-		break;
+		if(!waserror()) {
+			c = namec(up->genbuf, Aopen, OREAD, 0);
+			poperror();
+			cclose(c);
+			break;
+		}
 	}
-
-	if(s == nil && (s = malloc(sizeof *s)) == nil)
+	if(i >= Probemax)
+		error(Etimedout);
+	uprint("%s/ident", path);
+	ctlr = newctlr(path);
+	if(ctlr == nil || s == nil && (s = malloc(sizeof *s)) == nil)
 		return nil;
 	s->ctlr = ctlr;
 	s->ifc = &sdaoeifc;
@@ -237,8 +298,15 @@ aoeprobe(char *path, SDev *s)
 }
 
 static char 	*probef[32];
-static char	*probebuf;
 static int 	nprobe;
+
+static int
+pnpprobeid(char *s)
+{
+	if(strlen(s) < 2)
+		return 0;
+	return s[1] == '!'? s[0]: 'e';
+}
 
 static SDev*
 aoepnp(void)
@@ -247,32 +315,14 @@ aoepnp(void)
 	char *p;
 	SDev *h, *t, *s;
 
-	if((p = getconf("aoedev")) == nil)
+	if((p = getconf("aoedev")) == 0)
 		return 0;
-	kstrdup(&probebuf, p);
-	nprobe = tokenize(probebuf, probef, nelem(probef));
+	nprobe = tokenize(p, probef, nelem(probef));
 	h = t = 0;
 	for(i = 0; i < nprobe; i++){
-		p = probef[i];
-		if(strlen(p) < 2)
+		id = pnpprobeid(probef[i]);
+		if(id == 0)
 			continue;
-		id = 'e';
-		if(p[1] == '!'){
-			id = p[0];
-			p += 2;
-		}
-		/*
-		 * shorthand for: id!lun -> id!#æ/aoe/lun
-		 * because we cannot type æ in the bootloader console.
-		 */
-		if(strchr(p, '/') == nil){
-			char tmp[64];
-
-			snprint(tmp, sizeof(tmp), "%c!#æ/aoe/%s", (char)id, p);
-
-			probef[i] = nil;
-			kstrdup(&probef[i], tmp);
-		}
 		s = malloc(sizeof *s);
 		if(s == nil)
 			break;
@@ -293,7 +343,7 @@ aoepnp(void)
 static Ctlr*
 pnpprobe(SDev *sd)
 {
-	int j;
+	ulong start;
 	char *p;
 	static int i;
 
@@ -305,21 +355,17 @@ pnpprobe(SDev *sd)
 	if(p[1] == '!')
 		p += 2;
 
-	for(j = 0;; j += Probeintvl){
-		if(j > Probemax){
-			print("#æ: pnpprobe: %s: %s\n", probef[i-1], up->errstr);
-			return 0;
-		}
-		if(waserror()){
-			tsleep(&up->sleep, return0, 0, Probeintvl);
-			continue;
-		}
-		sd = aoeprobe(p, sd);
-		poperror();
-		break;
+	start = TK2MS(sys->ticks);
+	if(waserror()){
+		print("#æ: pnpprobe failed in %lud ms: %s: %s\n",
+			TK2MS(sys->ticks) - start, probef[i-1],
+			up->errstr);
+		return nil;
 	}
-	print("#æ: pnpprobe establishes %s in %dms\n", probef[i-1], j);
-	aoectl(sd->ctlr, "nofail on");
+	sd = aoeprobe(p, sd);			/* does a round of probing */
+	poperror();
+	print("#æ: pnpprobe established %s in %lud ms\n",
+		probef[i-1], TK2MS(sys->ticks) - start);
 	return sd->ctlr;
 }
 
@@ -334,7 +380,7 @@ aoeverify(SDunit *u)
 	c = s->ctlr;
 	if(c == nil && (s->ctlr = c = pnpprobe(s)) == nil)
 		return 0;
-	c->drivechange = 1;
+	c->mediachange = 1;
 	return 1;
 }
 
@@ -368,17 +414,17 @@ aoeonline(SDunit *u)
 	c = u->dev->ctlr;
 	r = 0;
 
-	if((c->feat&Datapi) && c->drivechange){
+	if((c->feat&Datapi) && c->mediachange){
 		if(aoeconnect(u, c) == 0 && (r = scsionline(u)) > 0)
-			c->drivechange = 0;
+			c->mediachange = 0;
 		return r;
 	}
 
-	if(c->drivechange){
+	if(c->mediachange){
 		if(aoeconnect(u, c) == -1)
 			return 0;
 		r = 2;
-		c->drivechange = 0;
+		c->mediachange = 0;
 		u->sectors = c->sectors;
 		u->secsize = Aoesectsz;
 	} else
@@ -387,87 +433,115 @@ aoeonline(SDunit *u)
 	return r;
 }
 
-static long
-aoebio(SDunit *u, int, int write, void *a, long count, uvlong lba)
+static int
+aoerio(SDreq *r)
 {
-	uchar *data;
-	int n;
+	int i;
+	ulong count;
+	uvlong lba;
+	char *name;
+	uchar *cmd;
 	long (*rio)(Chan*, void*, long, vlong);
 	Ctlr *c;
+	SDunit *unit;
 
-	c = u->dev->ctlr;
-//	if(c->feat & Datapi)
-//		return scsibio(u, lun, write, a, count, lba);
-	data = a;
-	if(write)
-		rio = devtab[c->c->type]->write;
-	else
+	unit = r->unit;
+	c = unit->dev->ctlr;
+
+	cmd = r->cmd;
+	name = unit->name;
+
+	if(*cmd == ScmdSynccache || *cmd == ScmdSynccache16)
+		return sdsetsense(r, SDcheck, 3, 0xc, 2);
+
+	if((i = sdfakescsi(r, c->ident, sizeof c->ident)) != SDnostatus){
+		r->status = i;
+		return i;
+	}
+
+	switch(*cmd){
+	case ScmdRead16:
+	case ScmdExtread:
 		rio = devtab[c->c->type]->read;
+		break;
+	case ScmdWrite16:
+	case ScmdExtwrite:
+		rio = devtab[c->c->type]->write;
+		break;
+	default:
+		print("%s: bad cmd %#.2ux\n", name, cmd[0]);
+		r->status = SDcheck;
+		return SDcheck;
+	}
+
+	if(r->data == nil)
+		return SDok;
+
+	if(r->clen == 16){
+		/* ata commands only go to 48-bit lba */
+		if(cmd[2] || cmd[3])
+			return sdsetsense(r, SDcheck, 3, 0xc, 2);
+	}
+	scsilbacount(cmd, r->clen, &lba, &count);
+	count *= Aoesectsz;
+
+	if(r->dlen < count)
+		count = r->dlen & ~MASK(9);
 
 	if(waserror()){
 		if(strcmp(up->errstr, Echange) == 0 ||
 		    strcmp(up->errstr, Enotup) == 0)
-			u->sectors = 0;
+			unit->sectors = 0;
 		nexterror();
 	}
-	n = rio(c->c, data, Aoesectsz * count, Aoesectsz * lba);
+	r->rlen = rio(c->c, r->data, count, Aoesectsz * lba);
 	poperror();
-	return n;
+	r->status = SDok;
+	return SDok;
+}
+
+static char *smarttab[] = {
+	"unset",
+	"error",
+	"threshold exceeded",
+	"normal"
+};
+
+static char *
+pflag(char *s, char *e, uchar f)
+{
+	uchar i;
+
+	for(i = 0; i < 8; i++)
+		if(f & (1 << i))
+			s = seprint(s, e, "%s ", flagname[i]);
+	return seprint(s, e, "\n");
 }
 
 static int
-flushcache(Ctlr *)
-{
-	return -1;
-}
-
-static int
-aoerio(SDreq *r)
-{
-	int i, count, rw;
-	uvlong lba;
-	Ctlr *c;
-	SDunit *u;
-
-	u = r->unit;
-	c = u->dev->ctlr;
-//	if(c->feat & Datapi)
-//		return aoeriopkt(r, d);
-
-	if(r->cmd[0] == 0x35 || r->cmd[0] == 0x91){
-		qlock(c);
-		i = flushcache(c);
-		qunlock(c);
-		if(i == 0)
-			return sdsetsense(r, SDok, 0, 0, 0);
-		return sdsetsense(r, SDcheck, 3, 0xc, 2);
-	}
-
-	if((i = sdfakescsi(r)) != SDnostatus){
-		r->status = i;
-		return i;
-	}
-	if((i = sdfakescsirw(r, &lba, &count, &rw)) != SDnostatus)
-		return i;
-	r->rlen = aoebio(u, r->lun, rw == SDwrite, r->data, count, lba);
-	return r->status = SDok;
-}
-
-static char*
-aoerctl(SDunit *u, char *p, char *e)
+aoerctl(SDunit *u, char *p, int l)
 {
 	Ctlr *c;
+	char *e, *op;
 
 	if((c = u->dev->ctlr) == nil)
-		return p;
+		return 0;
+	e = p+l;
+	op = p;
 
 	p = seprint(p, e, "model\t%s\n", c->model);
 	p = seprint(p, e, "serial\t%s\n", c->serial);
 	p = seprint(p, e, "firm	%s\n", c->firmware);
+	if(c->smartrs == 0xff)
+		p = seprint(p, e, "smart\tenable error\n");
+	else if(c->smartrs == 0)
+		p = seprint(p, e, "smart\tdisabled\n");
+	else
+		p = seprint(p, e, "smart\t%s\n", smarttab[c->smart]);
 	p = seprint(p, e, "flag	");
-	p = pflag(p, e, c);
+	p = pflag(p, e, c->feat);
 	p = seprint(p, e, "geometry %llud %d\n", c->sectors, Aoesectsz);
-	return p;
+	return p-op;
 }
 
 static int
@@ -503,8 +577,10 @@ aoertopctl(SDev *s, char *p, char *e)
 {
 	Ctlr *c;
 
-	c = s->ctlr;
-	return seprint(p, e, "%s aoe %s\n", s->name, c? c->path: "");
+	if(s == nil || (c = s->ctlr) == nil)
+		return p;
+
+	return seprint(p, e, "%s aoe %s\n", s->name, c->path);
 }
 
 static int
@@ -521,6 +597,7 @@ SDifc sdaoeifc = {
 	"aoe",
 
 	aoepnp,
+	nil,		/* legacy */
 	nil,		/* enable */
 	nil,		/* disable */
 
@@ -530,7 +607,7 @@ SDifc sdaoeifc = {
 	aoerctl,
 	aoewctl,
 
-	aoebio,
+	scsibio,
 	aoeprobew,	/* probe */
 	aoeclear,	/* clear */
 	aoertopctl,

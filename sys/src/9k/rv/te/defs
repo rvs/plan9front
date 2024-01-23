@@ -1,0 +1,9 @@
+# tinyemu in Sv48
+#KTZERO=0xffff800080000000	# sv48 at 2GB
+KTZERO=0xffffffc080000000	# sv39 at 2GB
+# increasing HZ increases interrupt polling frequency, which reduces real time
+CONFDEF= -DHZ=200 # -DSV48 -DTRAPDEBUG -DFILL_PT # -DDUMP_PTES
+LDFLAGS= # -c			# uncompressed runs faster on tinyemu
+BANK0SIZE='(512*MB)'
+RBKTZERO=0x9ff05000
+SFX=bin

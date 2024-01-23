@@ -37,6 +37,45 @@ pragincomplete(void)
 		;
 }
 
+/*
+ * real allocs
+ */
+void*
+alloc(long n)
+{
+	void *p;
+
+	while((uintptr)hunk & MAXALIGN) {
+		hunk++;
+		nhunk--;
+	}
+	while(nhunk < n)
+		gethunk();
+	p = hunk;
+	nhunk -= n;
+	hunk += n;
+	return p;
+}
+
+void*
+allocn(void *p, long on, long n)
+{
+	void *q;
+
+	q = (uchar*)p + on;
+	if(q != hunk || nhunk < n) {
+		while(nhunk < on+n)
+			gethunk();
+		memmove(hunk, p, on);
+		p = hunk;
+		hunk += on;
+		nhunk -= on;
+	}
+	hunk += n;
+	nhunk -= n;
+	return p;
+}
+
 void
 setinclude(char *p)
 {
@@ -111,7 +150,7 @@ newfile(char *s, int f)
 	if(f < 0)
 		i->f = open(s, 0);
 	if(i->f < 0) {
-		yyerror("%Ca: %r: %s", thechar, s);
+		yyerror("%ca: %r: %s", thechar, s);
 		errorexit();
 	}
 	fi.c = 0;
@@ -121,11 +160,8 @@ newfile(char *s, int f)
 Sym*
 slookup(char *s)
 {
-	strncpy(symb, s, NSYMB);
-	if(symb[NSYMB-1] != '\0'){
-		yyerror("symbol too long: %s", s);
-		errorexit();
-	}
+
+	strcpy(symb, s);
 	return lookup();
 }
 
@@ -133,34 +169,31 @@ Sym*
 lookup(void)
 {
 	Sym *s;
-	ulong h;
+	long h;
 	char *p;
-	int c, n;
+	int c, l;
 
 	h = 0;
-	for(p=symb; *p;) {
-		h = h * 3;
-		h += *p++;
-	}
-	n = (p - symb) + 1;
-	if((long)h < 0)
+	for(p=symb; c = *p; p++)
+		h = h+h+h + c;
+	l = (p - symb) + 1;
+	if(h < 0)
 		h = ~h;
 	h %= NHASH;
 	c = symb[0];
 	for(s = hash[h]; s != S; s = s->link) {
 		if(s->name[0] != c)
 			continue;
-		if(strcmp(s->name, symb) == 0)
+		if(memcmp(s->name, symb, l) == 0)
 			return s;
 	}
 	s = alloc(sizeof(*s));
-	s->name = alloc(n);
-	memmove(s->name, symb, n);
+	s->name = alloc(l);
+	memmove(s->name, symb, l);
 
 	s->link = hash[h];
 	hash[h] = s;
 	syminit(s);
-
 	return s;
 }
 
@@ -226,8 +259,6 @@ l1:
 		cp = symb;
 
 	aloop:
-		if(cp >= &symb[NSYMB-1])
-			goto toolong;
 		*cp++ = c;
 		c = GETC();
 		if(isalpha(c) || isdigit(c) || c == '_' || c == '$')
@@ -238,22 +269,18 @@ l1:
 		if(s->macro) {
 			newio();
 			cp = ionext->b;
-			if(macexpand(s, cp, sizeof(ionext->b)-1)){
-				pushio();
-				ionext->link = iostack;
-				iostack = ionext;
-				fi.p = cp;
-				fi.c = strlen(cp);
-				if(peekc != IGN) {
-					cp[fi.c++] = peekc;
-					cp[fi.c] = 0;
-					peekc = IGN;
-				}
-				goto l0;
-			} else {
-				ionext->link = iofree;
-				iofree = ionext;
+			macexpand(s, cp);
+			pushio();
+			ionext->link = iostack;
+			iostack = ionext;
+			fi.p = cp;
+			fi.c = strlen(cp);
+			if(peekc != IGN) {
+				cp[fi.c++] = peekc;
+				cp[fi.c] = 0;
+				peekc = IGN;
 			}
+			goto l0;
 		}
 		if(s->type == 0)
 			s->type = LNAME;
@@ -307,8 +334,6 @@ l1:
 		for(;;) {
 			if(!isdigit(c))
 				break;
-			if(cp >= &symb[NSYMB-1])
-				goto toolong;
 			*cp++ = c;
 			c = GETC();
 		}
@@ -330,8 +355,6 @@ l1:
 
 	casedot:
 		for(;;) {
-			if(cp >= &symb[NSYMB-1])
-				goto toolong;
 			*cp++ = c;
 			c = GETC();
 			if(!isdigit(c))
@@ -342,19 +365,13 @@ l1:
 		goto caseout;
 
 	casee:
-		if(cp >= &symb[NSYMB-1])
-			goto toolong;
 		*cp++ = 'e';
 		c = GETC();
 		if(c == '+' || c == '-') {
-			if(cp >= &symb[NSYMB-1])
-				goto toolong;
 			*cp++ = c;
 			c = GETC();
 		}
 		while(isdigit(c)) {
-			if(cp >= &symb[NSYMB-1])
-				goto toolong;
 			*cp++ = c;
 			c = GETC();
 		}
@@ -431,10 +448,6 @@ l1:
 	}
 	peekc = c1;
 	return c;
-toolong:
-	yyerror("token too long: %.*s...", utfnlen(symb, cp-symb), symb);
-	errorexit();
-	return -1;
 }
 
 int

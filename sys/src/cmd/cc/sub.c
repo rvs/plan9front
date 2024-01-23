@@ -85,7 +85,10 @@ prtree1(Node *n, int d, int f)
 		break;
 
 	case OLSTRING:
-		print(" \"%S\"", n->rstring);
+		if(sizeof(TRune) == sizeof(Rune))
+			print(" \"%S\"", (Rune*)n->rstring);
+		else
+			print(" \"...\"");
 		i = 0;
 		break;
 
@@ -168,8 +171,6 @@ simpleg(long b)
 		return GVOLATILE;
 	case BVOLATILE|BCONSTNT:
 		return GCONSTNT|GVOLATILE;
-	case BNORET:
-		return GNORET;
 	}
 	return GXXX;
 }
@@ -250,6 +251,8 @@ simplet(long b)
 	case BVLONG|BLONG|BINT|BSIGNED:
 		return types[TVLONG];
 
+	case BVLONG|BUNSIGNED:
+	case BVLONG|BINT|BUNSIGNED:
 	case BVLONG|BLONG|BUNSIGNED:
 	case BVLONG|BLONG|BINT|BUNSIGNED:
 		return types[TUVLONG];
@@ -688,8 +691,13 @@ arith(Node *n, int f)
 			k += 2;
 		n->type = types[k];
 	}
+	if (typefd[n->type->etype]) {
+		fpused = 1;
+		// warn(n, "fp used");
+	}
 	if(n->op == OSUB)
 	if(i == TIND && j == TIND) {
+		/* pointer subtraction */
 		w = n->right->type->link->width;
 		if(w < 1) {
 			snap(n->right->type->link);
@@ -706,7 +714,16 @@ arith(Node *n, int f)
 		if(w < 1 || x < 1)
 			goto bad;
 		n->type = types[ewidth[TIND] <= ewidth[TLONG]? TLONG: TVLONG];
+		if(ewidth[TIND] > ewidth[TLONG]){	/* 64-bit mach? */
+			n1 = new1(OXXX, Z, Z);
+			*n1 = *n;
+			n->op = OCAST;
+			n->left = n1;
+			n->right = Z;
+			n->type = types[TVLONG];  /* was TLONG, which seems wrong */
+		}
 		if(w > 1) {
+			/* scale down by width */
 			n1 = new1(OXXX, Z, Z);
 			*n1 = *n;
 			n->op = ODIV;
@@ -720,14 +737,6 @@ arith(Node *n, int f)
 				n->op = OASHR;
 				n1->vconst = w;
 			}
-		}
-		if(0 && ewidth[TIND] > ewidth[TLONG]){
-			n1 = new1(OXXX, Z, Z);
-			*n1 = *n;
-			n->op = OCAST;
-			n->left = n1;
-			n->right = Z;
-			n->type = types[TLONG];
 		}
 		return;
 	}
@@ -1028,21 +1037,6 @@ loop:
 }
 
 int
-zpconst(Node *n)
-{
-	while(n->op == OCAST){
-		if(n->type == T)
-			break;
-		if(n->type->etype != TIND)
-			break;
-		if(n->type->link->etype != TVOID)
-			break;
-		n = n->left;
-	}
-	return vconst(n) == 0;
-}
-
-int
 vconst(Node *n)
 {
 	int i;
@@ -1214,7 +1208,7 @@ bitno(long b)
 {
 	int i;
 
-	for(i=0; i<32; i++)
+	for(i=0; i < BI2LONG; i++)
 		if(b & (1L<<i))
 			return i;
 	diag(Z, "bad in bitno");
@@ -1267,12 +1261,15 @@ warn(Node *n, char *fmt, ...)
 	char buf[STRINGSZ];
 	va_list arg;
 
-	if(debug['w']) {
-		Bprint(&diagbuf, "warning: ");
+	if(debug['w'] || debug['W']) {
 		va_start(arg, fmt);
 		vseprint(buf, buf+sizeof(buf), fmt, arg);
 		va_end(arg);
-		Bprint(&diagbuf, "%L %s\n", (n==Z)? nearln: n->lineno, buf);
+		if(debug['W']) {
+			diag(n, "%s", buf);
+			return;
+		}
+		Bprint(&diagbuf, "warning: %L %s\n", (n==Z)? nearln: n->lineno, buf);
 
 		if(n != Z)
 		if(debug['v'])
@@ -1353,7 +1350,7 @@ Init	thashinit[] =
 	TSTRUCT,	0x7c2da3bf,	0,
 	TUNION,		0x3eb25e98,	0,
 	TENUM,		0x44b54f61,	0,
-	TNORET,		0x19242ac3,	0,
+	TFILE,		0x19242ac3,	0,
 	TOLD,		0x22b15988,	0,
 	TDOT,		0x0204f6b3,	0,
 	-1,		0,		0,
@@ -1396,7 +1393,7 @@ Init	tnamesinit[] =
 	TSTRUCT,	0,	"STRUCT",
 	TUNION,		0,	"UNION",
 	TENUM,		0,	"ENUM",
-	TNORET,		0,	"NORET",
+	TFILE,		0,	"FILE",
 	TOLD,		0,	"OLD",
 	TDOT,		0,	"DOT",
 	-1,		0,	0,
@@ -1409,7 +1406,6 @@ Init	gnamesinit[] =
 	GCONSTNT,		0,	"CONST",
 	GVOLATILE,		0,	"VOLATILE",
 	GVOLATILE|GCONSTNT,	0,	"CONST-VOLATILE",
-	GNORET,			0,	"NORET",
 	-1,			0,	0,
 };
 
@@ -1448,7 +1444,7 @@ Init	qnamesinit[] =
 	TUNSIGNED,	0,	"UNSIGNED",
 	TSIGNED,	0,	"SIGNED",
 	TDOT,		0,	"DOT",
-	TNORET,		0,	"NORET",
+	TFILE,		0,	"FILE",
 	TOLD,		0,	"OLD",
 	-1,		0,	0,
 };
@@ -2118,7 +2114,8 @@ castucom(Node *r)
 	Node *rl;
 
 	if(r->op == OCAST &&
-	   (rl = r->left)->op == OCOM &&
+	   ((rl = r->left)->op == OCOM ||
+	    rl->op == OXOR) &&			/* ||XOR experiment - geoff */
 	   (r->type->etype == TVLONG || r->type->etype == TUVLONG) &&
 	   typeu[rl->type->etype] && typechl[rl->type->etype])
 		return 1;

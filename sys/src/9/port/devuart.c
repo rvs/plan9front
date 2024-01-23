@@ -25,7 +25,7 @@ static Dirtab *uartdir;
 static int uartndir;
 static Timer *uarttimer;
 
-static struct Uartalloc {
+struct Uartalloc {
 	Lock;
 	Uart *elist;	/* list of enabled interfaces */
 } uartalloc;
@@ -36,7 +36,7 @@ static void	uartflow(void*);
 /*
  *  enable/disable uart and add/remove to list of enabled uarts
  */
-static Uart*
+Uart*
 uartenable(Uart *p)
 {
 	Uart **l;
@@ -44,7 +44,7 @@ uartenable(Uart *p)
 	if(p->enabled)
 		return p;
 	if(p->iq == nil){
-		if((p->iq = qopen(8*1024, Qcoalesce, uartflow, p)) == nil)
+		if((p->iq = qopen(8*1024, 0, uartflow, p)) == nil)
 			return nil;
 	}
 	else
@@ -70,7 +70,6 @@ uartenable(Uart *p)
 
 	/* assume we can send */
 	p->cts = 1;
-	p->blocked = 0;
 	p->ctsbackoff = 0;
 
 	if(p->bits == 0)
@@ -81,7 +80,8 @@ uartenable(Uart *p)
 		uartctl(p, "pn");
 	if(p->baud == 0)
 		uartctl(p, "b9600");
-	(*p->phys->enable)(p, 1);
+	if(p->phys->enable)
+		(*p->phys->enable)(p, 1);
 
 	/*
 	 * use ilock because uartclock can otherwise interrupt here
@@ -122,32 +122,14 @@ uartdisable(Uart *p)
 	iunlock(&uartalloc);
 }
 
-static Uart*
-uartport(char *which)
-{
-	int port;
-	char *p;
-
-	port = strtol(which, &p, 0);
-	if(p == which)
-		error(Ebadarg);
-	if(port < 0 || port >= uartnuart || uart[port] == nil)
-		error(Enodev);
-	return uart[port];
-}
-
 void
-uartmouse(char *which, int (*putc)(Queue*, int), int setb1200)
+uartmouse(Uart* p, int (*putc)(Queue*, int), int setb1200)
 {
-	Uart *p;
-
-	p = uartport(which);
 	qlock(p);
-	if(p->opens == 0 && uartenable(p) == nil){
+	if(p->opens++ == 0 && uartenable(p) == nil){
 		qunlock(p);
 		error(Enodev);
 	}
-	p->opens++;
 	if(setb1200)
 		uartctl(p, "b1200");
 	p->putc = putc;
@@ -156,11 +138,8 @@ uartmouse(char *which, int (*putc)(Queue*, int), int setb1200)
 }
 
 void
-uartsetmouseputc(char *which, int (*putc)(Queue*, int))
+uartsetmouseputc(Uart* p, int (*putc)(Queue*, int))
 {
-	Uart *p;
-
-	p = uartport(which);
 	qlock(p);
 	if(p->opens == 0 || p->special == 0){
 		qunlock(p);
@@ -213,11 +192,14 @@ uartreset(void)
 
 	if(uartnuart)
 		uart = xalloc(uartnuart*sizeof(Uart*));
-
+	else
+		uart = xalloc(sizeof(Uart*));		/* dummy */
+	if (uart == nil)
+		panic("uartreset: no memory for Uarts");
 	uartndir = 1 + 3*uartnuart;
 	uartdir = xalloc(uartndir * sizeof(Dirtab));
-	if(uartnuart && uart == nil || uartdir == nil)
-		panic("uartreset: no memory");
+	if (uartdir == nil)
+		panic("uartreset: no memory for Dirtabs");
 	dp = uartdir;
 	strcpy(dp->name, ".");
 	mkqid(&dp->qid, 0, 0, QTDIR);
@@ -242,30 +224,12 @@ uartreset(void)
 
 		uart[i] = p;
 		p->dev = i;
-
-		/*
-		 * enable serial console for uarts detected
-		 * late during boot (like pci card).
-		 */
-		if(consuart == nil){
-			char *s, *options;
-
-			if((s = getconf("console")) != nil
-			&& strtoul(s, &options, 0) == i
-			&& options > s){
-				p->console = 1;
-				if(*options != '\0')
-					uartctl(p, options);
-			}
-		}
-
 		if(p->console || p->special){
 			if(uartenable(p) != nil){
 				if(p->console){
-					if(consuart == nil){
-						consuart = p;
-						uartputs(kmesg.buf, kmesg.n);
-					}
+					kbdq = p->iq;
+					serialoq = p->oq;
+					p->putc = kbdcr2nl;
 				}
 				p->opens++;
 			}
@@ -282,13 +246,6 @@ uartreset(void)
 	}
 }
 
-static void
-uartinit(void)
-{
-	/* now that the timers are ticking, enable buffered uart */
-	if(serialoq == nil && consuart != nil && consuart->enabled)
-		serialoq = consuart->oq;
-}
 
 static Chan*
 uartattach(char *spec)
@@ -348,8 +305,10 @@ uartdrained(void* arg)
 static void
 uartdrainoutput(Uart *p)
 {
-	if(!p->enabled || up == nil || !islo())
+	/* can't use waserror nor sleep if up is nil */
+	if(!p->enabled || up == nil)
 		return;
+
 	p->drain = 1;
 	if(waserror()){
 		p->drain = 0;
@@ -523,10 +482,11 @@ uartctl(Uart *p, char *cmd)
 			break;
 		case 'X':
 		case 'x':
-			ilock(&p->tlock);
-			p->xonoff = n;
-			p->blocked = 0;
-			iunlock(&p->tlock);
+			if(p->enabled){
+				ilock(&p->tlock);
+				p->xonoff = n;
+				iunlock(&p->tlock);
+			}
 			break;
 		}
 	}
@@ -558,7 +518,9 @@ uartwrite(Chan *c, void *buf, long n, vlong)
 		poperror();
 		break;
 	case Nctlqid:
-		cmd = smalloc(n+1);
+		cmd = malloc(n+1);
+		if(cmd == nil)
+			error(Enomem);
 		memmove(cmd, buf, n);
 		cmd[n] = 0;
 		qlock(p);
@@ -603,7 +565,7 @@ uartwstat(Chan *c, uchar *dp, int n)
 	return n;
 }
 
-static void
+void
 uartpower(int on)
 {
 	Uart *p;
@@ -619,7 +581,7 @@ Dev uartdevtab = {
 	"uart",
 
 	uartreset,
-	uartinit,
+	devinit,
 	devshutdown,
 	uartattach,
 	uartwalk,
@@ -658,9 +620,6 @@ uartstageoutput(Uart *p)
 {
 	int n;
 
-	if(!p->enabled || p->blocked)
-		return 0;
-
 	n = qconsume(p->oq, p->ostage, Stagesize);
 	if(n <= 0)
 		return 0;
@@ -677,7 +636,7 @@ uartkick(void *v)
 {
 	Uart *p = v;
 
-	if(!p->enabled || p->blocked)
+	if(p->blocked)
 		return;
 
 	ilock(&p->tlock);
@@ -785,7 +744,7 @@ uartclock(void)
 		if(p->ctsbackoff){
 			ilock(&p->tlock);
 			if(p->ctsbackoff){
-				if(--(p->ctsbackoff) == 0 && !p->blocked)
+				if(--(p->ctsbackoff) == 0)
 					(*p->phys->kick)(p);
 			}
 			iunlock(&p->tlock);
@@ -811,8 +770,14 @@ uartgetc(void)
 void
 uartputc(int c)
 {
-	if(consuart == nil || consuart->phys->putc == nil)
+	char c2;
+
+	if(consuart == nil || consuart->phys->putc == nil) {
+		c2 = c;
+		if (lprint)
+			(*lprint)(&c2, 1);
 		return;
+	}
 	consuart->phys->putc(consuart, c);
 }
 
@@ -821,9 +786,11 @@ uartputs(char *s, int n)
 {
 	char *e;
 
-	if(consuart == nil || consuart->phys->putc == nil)
+	if(consuart == nil || consuart->phys->putc == nil) {
+		if (lprint)
+			(*lprint)(s, n);
 		return;
-
+	}
 	e = s+n;
 	for(; s<e; s++){
 		if(*s == '\n')

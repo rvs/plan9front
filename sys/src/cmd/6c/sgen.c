@@ -105,8 +105,7 @@ xcom(Node *n)
 	case OADD:
 		xcom(l);
 		xcom(r);
-		if(n->type->etype != TIND &&
-		   !(l->type->etype == TIND && r->type->etype == TIND))
+		if(n->type->etype != TIND)
 			break;
 
 		switch(r->addable) {
@@ -121,6 +120,7 @@ xcom(Node *n)
 				*l = *(n->left);
 				l->xoffset += r->vconst;
 				n->left = l;
+				r = n->right;
 				goto brk;
 			}
 			break;
@@ -162,8 +162,6 @@ xcom(Node *n)
 			l->scale = idx.scale;
 			l->addable = 9;
 			l->complex = l->right->complex;
-			if(l->complex == 0)
-				l->complex++;
 			l->type = l->left->type;
 			n->op = OADDR;
 			n->left = l;
@@ -214,6 +212,7 @@ xcom(Node *n)
 		if(g >= 0) {
 			n->left = r;
 			n->right = l;
+			l = r;
 			r = n->right;
 		}
 		g = vlog(r);
@@ -289,12 +288,6 @@ xcom(Node *n)
 		indexshift(n);
 		break;
 
-	case OOR:
-		xcom(l);
-		xcom(r);
-		rolor(n);
-		break;
-
 	default:
 		if(l != Z)
 			xcom(l);
@@ -305,8 +298,6 @@ xcom(Node *n)
 brk:
 	if(n->addable >= 10)
 		return;
-	l = n->left;
-	r = n->right;
 	if(l != Z)
 		n->complex = l->complex;
 	if(r != Z) {
@@ -326,7 +317,7 @@ brk:
 		break;
 
 	case OCAST:
-		if(l != Z && l->type->etype == TUVLONG && typefd[n->type->etype])
+		if(l && l->type && l->type->etype == TUVLONG && typefd[n->type->etype])
 			n->complex += 2;
 		break;
 
@@ -353,7 +344,6 @@ brk:
 		}
 		break;
 
-	case OROL:
 	case OLSHR:
 	case OASHL:
 	case OASHR:
